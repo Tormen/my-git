@@ -65,7 +65,9 @@ COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
 
 # ─── Privilege ──────────────────────────────────────────────────────────
-# 1 = escalate via 'sudo su <owner>' when repo owner differs from current user
+# 1 = switch user when repo owner differs from current user:
+#       running as root -> 'su <owner> -c ...'       (drop rights, no password)
+#       running as user -> 'sudo su <owner> -c ...'  (sudo prompt, then su)
 # 0 = refuse to touch cross-owner repos (hard error)
 ALLOW_SUDO_SU=1
 
@@ -165,9 +167,29 @@ need_sudo_for() {
   if [ -n "$_o" ] && [ "$_o" != "$ME" ]; then echo 1; else echo 0; fi
 }
 
+# _xuser_exec <target_user> <repo> <cmd...>
+#   Execute a command in <repo> as <target_user>, picking the right
+#   mechanism for the current user:
+#     root -> user      : 'su <user> -c ...'        (no password, no sudo)
+#     user -> other     : 'sudo su <user> -c ...'   (sudo prompts)
+#     user -> same user : direct exec in subshell   (handled by callers)
+_xuser_exec() {
+  _tgt=$1; _repo=$2; shift 2
+  _cmdstr=$(shell_escape "$@")
+  _repo_q=$(shell_escape "$_repo")
+  if [ "$ME" = "root" ]; then
+    log_dbg_med "su $_tgt -c \"cd $_repo && $_cmdstr\""
+    su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+  else
+    log_dbg_med "sudo su $_tgt -c \"cd $_repo && $_cmdstr\""
+    sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+  fi
+}
+
 run_as_owner() {
   # run_as_owner <repo_worktree> <cmd> [args...]
-  # Runs cmd in $repo. Uses sudo su <owner> only if owner != current user.
+  #   Runs cmd in $repo as the .git owner. If current user == owner: direct
+  #   exec. If differs: 'su' (from root) or 'sudo su' (from non-root).
   _repo=$1; shift
   _gitdir=$_repo/.git
   [ -e "$_gitdir" ] || { log_error "run_as_owner: no .git at $_repo"; return 1; }
@@ -181,13 +203,11 @@ run_as_owner() {
     log_error "$_repo: owned by $_owner, current user $ME — ALLOW_SUDO_SU=0 refuses"
     return 1
   fi
-  _cmdstr=$(shell_escape "$@")
-  log_dbg_med "sudo su $_owner -c \"cd $_repo && $_cmdstr\""
-  sudo -p "[sudo for $_owner @ $_repo] password: " su "$_owner" -c "cd $(shell_escape "$_repo") && $_cmdstr"
+  _xuser_exec "$_owner" "$_repo" "$@"
 }
 
 run_as_owner_capture() {
-  # As run_as_owner, but captures stdout. Trailing newline is stripped.
+  # As run_as_owner, but captures stdout. Trailing newline stripped by $().
   _repo=$1; shift
   _gitdir=$_repo/.git
   [ -e "$_gitdir" ] || return 1
@@ -197,8 +217,7 @@ run_as_owner_capture() {
     return $?
   fi
   [ "$ALLOW_SUDO_SU" = 1 ] || { log_error "$_repo: cross-owner + ALLOW_SUDO_SU=0"; return 1; }
-  _cmdstr=$(shell_escape "$@")
-  sudo -p "[sudo for $_owner @ $_repo] password: " su "$_owner" -c "cd $(shell_escape "$_repo") && $_cmdstr"
+  _xuser_exec "$_owner" "$_repo" "$@"
 }
 
 is_git_repo() {
@@ -477,7 +496,11 @@ commit_one() {
   # If we must run git as another user, msgfile needs readable perms + chown.
   _owner=$(file_owner "$_r/.git")
   if [ -n "$_owner" ] && [ "$_owner" != "$ME" ] && [ "$ALLOW_SUDO_SU" = 1 ]; then
-    sudo chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
+    if [ "$ME" = "root" ]; then
+      chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
+    else
+      sudo chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
+    fi
   fi
 
   run_as_owner "$_r" git commit -q -a -t "$_msgfile" || {

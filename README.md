@@ -108,12 +108,23 @@ my-git -DD st /LINKS/global/src
 2. **No paths + CWD is inside a git repo** — operate on that repo + its submodules.
 3. **No paths + not in a repo** — fall back to `$GIT_REPOS` from config.
 
-## Privilege (sudo)
+## Privilege (sudo / su)
 
-When a repo's `.git` is owned by a different user than you, `my-git` runs
-git subcommands via `sudo su <owner> -c ...` **only for that repo**. No
-sudo is requested for user-owned repos. Set `ALLOW_SUDO_SU=0` in the config
-to refuse cross-owner repos outright.
+When a repo's `.git` is owned by a different user than the caller,
+`my-git` switches user **only for that repo** using whichever mechanism
+makes sense:
+
+| Caller    | Repo owner    | Mechanism                             |
+|-----------|---------------|---------------------------------------|
+| user      | same user     | direct exec — no escalation           |
+| user A    | user B        | `sudo su B -c ...` (sudo prompts)     |
+| root      | user B        | `su B -c ...` — **drops rights**, no password |
+| root      | root          | direct exec                           |
+
+So running `my-git` as root on a tree where most repos are user-owned
+does **not** leave every git invocation running as root — each repo's
+commands run as its actual owner. Set `ALLOW_SUDO_SU=0` in the config to
+refuse cross-owner repos outright.
 
 ## `.claude` setup enforcement
 
