@@ -1,0 +1,2077 @@
+#!/bin/sh
+# my-git — multi-repo git dispatcher with recursive submodule support.
+#
+# Subcommands:  status|st|s   masscommits|mc|c   submodules|sub|sm   claude-check
+# Global opts:  -V|-VV   -D|-DD   --config FILE   --create-config   -h|--help
+#
+# See:  my-git --help   (or: my-git --help <subcommand>)
+
+US=${0##*/}
+ME=$(id -un 2>/dev/null || echo "$USER")
+
+# ─── Defaults (overridden by config file) ────────────────────────────────
+GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
+CHECK_CLAUDE_SETUP=1
+CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
+COMMIT_MSG_LAST_N=3
+COMMIT_MSG_DIFF_MAX_FILES=10
+ALLOW_SUDO_SU=1
+DEFAULT_VERBOSE=0
+DEFAULT_DEBUG=0
+SM_AUTO_SAFE_DIRECTORY=1
+
+# ─── Runtime flags ───────────────────────────────────────────────────────
+VRB=0; VERYVRB=0; DBG=0; DEEPDBG=0
+CONFIG_FILE=""
+CONFIG_SEARCH_ORDER="/LINKS/default/my-git.conf $HOME/.mygit.conf /etc/my-git.conf /usr/local/etc/my-git.conf"
+DRY_RUN=0
+INTERACTIVE=0
+
+# ─── Logging ─────────────────────────────────────────────────────────────
+log_major()     { printf ' >>> %s\n' "$*"; }
+log_medium()    { [ "$VRB"      = 1 ] && printf '  >> %s\n' "$*"; return 0; }
+log_minor()     { [ "$VERYVRB"  = 1 ] && printf '    > %s\n' "$*"; return 0; }
+log_dbg_major() { [ "$DBG"      = 1 ] && printf ' ~~~ %s\n' "$*" >&2; return 0; }
+log_dbg_med()   { [ "$DBG"      = 1 ] && printf '  ~~ %s\n' "$*" >&2; return 0; }
+log_dbg_minor() { [ "$DEEPDBG"  = 1 ] && printf '   ~ %s\n' "$*" >&2; return 0; }
+log_warn()      { printf 'WARN:  %s\n' "$*" >&2; }
+log_error()     { printf 'ERROR: %s\n' "$*" >&2; }
+
+fatal() {
+  _ec=${2:-1}
+  log_error "$1"
+  exit "$_ec"
+}
+
+# ─── Config file handling ────────────────────────────────────────────────
+_default_config_content() {
+  cat <<'EOF'
+# my-git.conf — configuration for the my-git CLI.
+# Shell-syntax; sourced by my-git at startup.
+
+# Space-delimited list of super-repos for fallback scope (used when my-git is
+# invoked outside of any tracked repo and without explicit path arguments).
+GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
+
+# ─── .claude setup enforcement (masscommits + claude-check) ──────────────
+# 1 = audit+auto-fix; 0 = disable entirely
+CHECK_CLAUDE_SETUP=1
+# Central repo where all <project>/.claude directories live as real dirs.
+# Each project's .claude must be a symlink into this tree.
+CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
+
+# ─── Auto-commit message template knobs ──────────────────────────────────
+COMMIT_MSG_LAST_N=3
+COMMIT_MSG_DIFF_MAX_FILES=10
+
+# ─── Privilege ──────────────────────────────────────────────────────────
+# 1 = escalate via 'sudo su <owner>' when repo owner differs from current user
+# 0 = refuse to touch cross-owner repos (hard error)
+ALLOW_SUDO_SU=1
+
+# ─── Default verbosity / debug ──────────────────────────────────────────
+# 1 = always behave as -V / -D (CLI flag can still raise the level)
+DEFAULT_VERBOSE=0
+DEFAULT_DEBUG=0
+
+# ─── Submodules (sm) subcommand ─────────────────────────────────────────
+SM_AUTO_SAFE_DIRECTORY=1
+EOF
+}
+
+load_config() {
+  # Honour --config / $MY_GIT_CONFIG / search order.
+  _cf=""
+  if [ -n "$CONFIG_FILE" ]; then
+    [ -f "$CONFIG_FILE" ] || fatal "--config: no such file: $CONFIG_FILE"
+    _cf=$CONFIG_FILE
+  elif [ -n "${MY_GIT_CONFIG:-}" ]; then
+    [ -f "$MY_GIT_CONFIG" ] || fatal "\$MY_GIT_CONFIG: no such file: $MY_GIT_CONFIG"
+    _cf=$MY_GIT_CONFIG
+  else
+    for _c in $CONFIG_SEARCH_ORDER; do
+      if [ -f "$_c" ]; then _cf=$_c; break; fi
+    done
+  fi
+  if [ -z "$_cf" ]; then
+    log_major "no config file found"
+    printf '  >> searched (in order):\n'
+    for _c in $CONFIG_SEARCH_ORDER; do
+      printf '    > %s\n' "$_c"
+    done
+    printf '  >> run:  my-git --create-config\n'
+    printf '  >> or:   my-git --config /path/to/your.conf <subcommand>\n'
+    exit 2
+  fi
+  log_dbg_med "config: $_cf"
+  # shellcheck disable=SC1090
+  . "$_cf"
+  # Apply defaults from config to runtime flags (CLI flags can still escalate).
+  [ "$DEFAULT_VERBOSE" = 1 ] && [ "$VRB" = 0 ] && VRB=1
+  [ "$DEFAULT_DEBUG"   = 1 ] && [ "$DBG" = 0 ] && DBG=1
+}
+
+create_config() {
+  # Pick first writable location.
+  _target=""
+  for _c in $CONFIG_SEARCH_ORDER; do
+    _dir=${_c%/*}
+    if [ -d "$_dir" ] && [ -w "$_dir" ] && [ ! -e "$_c" ]; then
+      _target=$_c; break
+    fi
+  done
+  if [ -z "$_target" ]; then
+    log_error "no writable location for config among:"
+    for _c in $CONFIG_SEARCH_ORDER; do
+      _dir=${_c%/*}
+      if [ -e "$_c" ]; then
+        printf '  %s  (already exists — will not overwrite)\n' "$_c" >&2
+      elif [ ! -d "$_dir" ]; then
+        printf '  %s  (parent %s does not exist)\n' "$_c" "$_dir" >&2
+      else
+        printf '  %s  (parent %s not writable)\n' "$_c" "$_dir" >&2
+      fi
+    done
+    exit 3
+  fi
+  _default_config_content > "$_target" || fatal "could not write $_target"
+  log_major "config written: $_target"
+  log_medium "edit it, then:  my-git <subcommand>"
+  exit 0
+}
+
+# ─── Generic helpers ────────────────────────────────────────────────────
+shell_escape() {
+  # Print argv as a single space-joined, single-quoted POSIX-safe string.
+  _esc=""
+  for _a in "$@"; do
+    _q=$(printf '%s' "$_a" | sed "s/'/'\\\\''/g")
+    _esc="$_esc '$_q'"
+  done
+  printf '%s' "${_esc# }"
+}
+
+file_owner() {
+  # macOS and GNU stat differ — try both.
+  stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1" 2>/dev/null
+}
+
+need_sudo_for() {
+  # Echo 1 if repo's .git is not owned by current user; 0 otherwise.
+  _r=$1
+  _gd=$_r/.git
+  [ -e "$_gd" ] || { echo 0; return; }
+  _o=$(file_owner "$_gd")
+  if [ -n "$_o" ] && [ "$_o" != "$ME" ]; then echo 1; else echo 0; fi
+}
+
+run_as_owner() {
+  # run_as_owner <repo_worktree> <cmd> [args...]
+  # Runs cmd in $repo. Uses sudo su <owner> only if owner != current user.
+  _repo=$1; shift
+  _gitdir=$_repo/.git
+  [ -e "$_gitdir" ] || { log_error "run_as_owner: no .git at $_repo"; return 1; }
+  _owner=$(file_owner "$_gitdir")
+  log_dbg_minor "run_as_owner: repo=$_repo owner=$_owner me=$ME cmd=$*"
+  if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
+    ( cd "$_repo" && "$@" )
+    return $?
+  fi
+  if [ "$ALLOW_SUDO_SU" != 1 ]; then
+    log_error "$_repo: owned by $_owner, current user $ME — ALLOW_SUDO_SU=0 refuses"
+    return 1
+  fi
+  _cmdstr=$(shell_escape "$@")
+  log_dbg_med "sudo su $_owner -c \"cd $_repo && $_cmdstr\""
+  sudo -p "[sudo for $_owner @ $_repo] password: " su "$_owner" -c "cd $(shell_escape "$_repo") && $_cmdstr"
+}
+
+run_as_owner_capture() {
+  # As run_as_owner, but captures stdout. Trailing newline is stripped.
+  _repo=$1; shift
+  _gitdir=$_repo/.git
+  [ -e "$_gitdir" ] || return 1
+  _owner=$(file_owner "$_gitdir")
+  if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
+    ( cd "$_repo" && "$@" )
+    return $?
+  fi
+  [ "$ALLOW_SUDO_SU" = 1 ] || { log_error "$_repo: cross-owner + ALLOW_SUDO_SU=0"; return 1; }
+  _cmdstr=$(shell_escape "$@")
+  sudo -p "[sudo for $_owner @ $_repo] password: " su "$_owner" -c "cd $(shell_escape "$_repo") && $_cmdstr"
+}
+
+is_git_repo() {
+  # True if $1 contains a readable .git dir or file.
+  [ -n "$1" ] && [ -e "$1/.git" ]
+}
+
+git_toplevel_of() {
+  # Print the top-level of the git worktree containing $1, or empty.
+  _p=$1
+  [ -d "$_p" ] || _p=${_p%/*}
+  ( cd "$_p" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )
+}
+
+# ─── Submodule discovery ────────────────────────────────────────────────
+# list_direct_submodules <repo>
+#   Print paths (relative to $repo) of registered submodules whose worktree
+#   exists at the expected location.
+list_direct_submodules() {
+  _r=$1
+  [ -f "$_r/.gitmodules" ] || return 0
+  run_as_owner_capture "$_r" git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{$1=""; sub(/^ /,""); print}' \
+    | while IFS= read -r _sub; do
+        [ -n "$_sub" ] || continue
+        [ -e "$_r/$_sub/.git" ] && printf '%s\n' "$_sub"
+      done
+}
+
+# walk_submodules <repo>
+#   Post-order DFS: prints absolute worktree paths, deepest first, root last.
+# Defined as a subshell function (using '( )' not '{ }') so every recursive
+# invocation runs in its own scope — otherwise _root/_subs/_sub leak across
+# calls (POSIX sh has no 'local'), producing bogus concatenated paths.
+walk_submodules() (
+  _root=$1
+  log_dbg_minor "walk_submodules: $_root"
+  _subs=$(list_direct_submodules "$_root")
+  if [ -n "$_subs" ]; then
+    printf '%s\n' "$_subs" | while IFS= read -r _sub; do
+      [ -n "$_sub" ] || continue
+      walk_submodules "$_root/$_sub"
+    done
+  fi
+  printf '%s\n' "$_root"
+)
+
+# depth_of <root> <node>  — relative depth (# of path components past root)
+depth_of() {
+  _root=$1; _node=$2
+  _rel=${_node#"$_root"}
+  _rel=${_rel#/}
+  [ -z "$_rel" ] && { echo 0; return; }
+  printf '%s\n' "$_rel" | awk -F/ '{print NF}'
+}
+
+indent_for() {
+  # Print $1 * 3 spaces.
+  _n=$1
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do printf '   '; _i=$((_i + 1)); done
+}
+
+# ─── Scope resolution ───────────────────────────────────────────────────
+# Echoes newline-separated list of super-repo roots to operate on.
+resolve_scope() {
+  # If explicit paths passed, use them.
+  if [ $# -gt 0 ]; then
+    for _p in "$@"; do
+      _abs=$(cd "$_p" 2>/dev/null && pwd -P) || { log_error "not a directory: $_p"; return 1; }
+      if ! is_git_repo "$_abs"; then
+        log_error "not a git repo (no .git): $_abs"
+        return 1
+      fi
+      printf '%s\n' "$_abs"
+    done
+    return 0
+  fi
+  # No args: try CWD.
+  _top=$(git_toplevel_of "$PWD")
+  if [ -n "$_top" ]; then
+    log_dbg_med "scope: CWD-inferred $_top"
+    printf '%s\n' "$_top"
+    return 0
+  fi
+  # Fallback to GIT_REPOS list.
+  log_dbg_med "scope: config fallback \$GIT_REPOS"
+  for _r in $GIT_REPOS; do
+    [ -d "$_r" ] || { log_warn "skipping missing repo from GIT_REPOS: $_r"; continue; }
+    is_git_repo "$_r" || { log_warn "skipping non-git path from GIT_REPOS: $_r"; continue; }
+    _abs=$(cd "$_r" && pwd -P)
+    printf '%s\n' "$_abs"
+  done
+}
+
+# ─── Status subcommand ──────────────────────────────────────────────────
+# Print porcelain status + branch divergence for a single repo, indented.
+# Error codes 021-034 preserved from the original script where applicable.
+status_one() {
+  _r=$1; _depth=$2
+  _ind=$(indent_for "$_depth")
+  # Only run if the repo's .git is accessible to this process (via run_as_owner).
+  is_git_repo "$_r" || { printf '%s > %s: [ERROR no .git]\n' "$_ind" "$_r"; return 1; }
+
+  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>&1)
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    printf '%s > %s:\n' "$_ind" "$_r"
+    printf '%s   [ERROR] git status failed:\n' "$_ind"
+    printf '%s\n' "$_porc" | sed -e "s|^|${_ind}     |"
+    return 1
+  fi
+
+  if [ -z "$_porc" ]; then
+    # Clean worktree — check divergence.
+    _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    _rem_ref=origin/$_branch
+    _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null | grep -E "^\s*remotes/$_rem_ref$" || true)
+    if [ -z "$_has_remote" ]; then
+      printf '%s > %s: CLEAN (no remote tracking for %s)\n' "$_ind" "$_r" "$_branch"
+      return 0
+    fi
+    _div=$(run_as_owner_capture "$_r" git log "${_rem_ref}...${_branch}" 2>/dev/null)
+    if [ -z "$_div" ]; then
+      printf '%s > %s: CLEAN :))\n' "$_ind" "$_r"
+    else
+      printf '%s > %s: Local <-> Remote out of sync!\n' "$_ind" "$_r"
+      printf '%s\n' "$_div" | sed -e "s|^|${_ind}        |"
+    fi
+  else
+    printf '%s > %s:\n' "$_ind" "$_r"
+    printf '%s\n' "$_porc" | sed -e "s|^|${_ind}        |"
+  fi
+}
+
+cmd_status() {
+  # Sub-option parse — accept global flags again and --help.
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help status; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "status: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "no repositories to inspect"; exit 1; }
+
+  printf '%s\n' "$_roots" | while IFS= read -r _root; do
+    [ -n "$_root" ] || continue
+    _nodes=$(walk_submodules "$_root")
+    # walk_submodules returns post-order (leaves first). For status we want
+    # top-down readability: super first, then its children. Reverse.
+    printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
+      | while IFS= read -r _node; do
+          [ -n "$_node" ] || continue
+          _d=$(depth_of "$_root" "$_node")
+          status_one "$_node" "$_d"
+        done
+  done
+}
+
+# ─── Masscommits subcommand ─────────────────────────────────────────────
+# Build auto-commit message body for a repo with changes.
+# Prints (to stdout) the complete commit message.
+# Args: <repo>
+build_commit_message() {
+  _r=$1
+  _files=$(run_as_owner_capture "$_r" git status --porcelain 2>/dev/null | cut -c4-)
+  _files_cnt=$(printf '%s\n' "$_files" | grep -c . || true)
+
+  # Intro line
+  if [ "$_files_cnt" -eq 1 ]; then
+    _intro="$_files: ..."
+  elif [ "$_files_cnt" -le 5 ]; then
+    _intro=$( printf '%s' "$_files" | paste -s - ; printf '\n\n'; printf '%s\n' "$_files" | sed -e 's/$/: .../' )
+  else
+    _intro="$_r: AUTOMATIC-MASS-COMMIT [my-git mc]"
+  fi
+
+  # Diff / files block
+  if [ "$_files_cnt" -gt "$COMMIT_MSG_DIFF_MAX_FILES" ]; then
+    _diffs="
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@ FILES @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+$(printf '%s\n' "$_files" | sed -e 's/^/    > /')
+"
+  else
+    _diffs="
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@ FILE DIFFS @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+$(printf '%s\n' "$_files" | sed -e 's/^/    > /')
+$(printf '%s\n' "$_files" | while IFS= read -r _f; do
+    [ -n "$_f" ] || continue
+    printf '\n:::: %s ::::::::::::::::::::::::::::::::::::::::::::::::::::::\n\n' "$_f"
+    run_as_owner_capture "$_r" git diff --cached -- "$_f" 2>/dev/null
+  done)
+"
+  fi
+
+  _cmtMsgs="
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@@@@ LAST $COMMIT_MSG_LAST_N COMMIT MESSAGES @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+$(run_as_owner_capture "$_r" git log "-${COMMIT_MSG_LAST_N}" 2>/dev/null)"
+
+  # Final message
+  printf '%s\n.\n' "$_intro"
+  printf '%s%s\n' "$_diffs" "$_cmtMsgs" | sed -e 's/^/#   /'
+}
+
+# commit_one <repo>  — if dirty, add -A + commit + push; if ahead, push.
+commit_one() {
+  _r=$1
+
+  # .claude setup audit (before staging so auto-fixes are part of the commit).
+  if [ "$CHECK_CLAUDE_SETUP" = 1 ]; then
+    ensure_claude_setup "$_r" || {
+      log_error "$_r: .claude setup check failed (see above)"
+      return 1
+    }
+  fi
+
+  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
+  if [ -z "$_porc" ]; then
+    # Clean — check ahead of remote?
+    _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    _rem_ref=origin/$_branch
+    _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null | grep -E "^\s*remotes/$_rem_ref$" || true)
+    if [ -z "$_has_remote" ]; then
+      log_major "$_r: CLEAN (no remote tracking for $_branch) — nothing to push"
+      return 0
+    fi
+    _div=$(run_as_owner_capture "$_r" git log "${_rem_ref}...${_branch}" 2>/dev/null)
+    if [ -z "$_div" ]; then
+      log_major "$_r: CLEAN :))"
+      return 0
+    fi
+    log_major "$_r: local ahead of remote — pushing"
+    log_minor "$_div"
+    if [ "$DRY_RUN" = 1 ]; then
+      log_medium "DRY: would push"
+      return 0
+    fi
+    run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+    log_major "$_r: DONE :)) (pushed)"
+    return 0
+  fi
+
+  # Dirty — add + commit + push.
+  log_major "$_r: uncommitted changes — add+commit+push"
+  printf '%s\n' "$_porc" | sed -e 's/^/        /' \
+    | while IFS= read -r _l; do log_medium "$_l"; done
+
+  if [ "$DRY_RUN" = 1 ]; then
+    log_medium "DRY: would git add -A && git commit && git push"
+    return 0
+  fi
+
+  run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; return 1; }
+
+  _msgfile=/tmp/$US.commit-msg.$$
+  build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; return 1; }
+
+  # If we must run git as another user, msgfile needs readable perms + chown.
+  _owner=$(file_owner "$_r/.git")
+  if [ -n "$_owner" ] && [ "$_owner" != "$ME" ] && [ "$ALLOW_SUDO_SU" = 1 ]; then
+    sudo chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
+  fi
+
+  run_as_owner "$_r" git commit -q -a -t "$_msgfile" || {
+    log_error "$_r: git commit failed"
+    rm -f "$_msgfile"
+    return 1
+  }
+  rm -f "$_msgfile"
+  run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+  log_major "$_r: DONE :)) (added, committed, pushed)"
+}
+
+cmd_masscommits() {
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help masscommits; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
+      -i|--interactive) INTERACTIVE=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "masscommits: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "no repositories to commit"; exit 1; }
+
+  _rc_total=0
+  printf '%s\n' "$_roots" | while IFS= read -r _root; do
+    [ -n "$_root" ] || continue
+    _nodes=$(walk_submodules "$_root")
+    # post-order: deepest first so parent gitlinks can bump.
+    printf '%s\n' "$_nodes" | while IFS= read -r _node; do
+      [ -n "$_node" ] || continue
+      commit_one "$_node" || _rc_total=1
+    done
+  done
+
+  # Final status snapshot (mirrors current script's behaviour).
+  echo
+  log_major "all done. final status:"
+  echo
+  cmd_status "$@"
+  return $_rc_total
+}
+
+# ─── .claude setup enforcement ──────────────────────────────────────────
+# Compute where in the central repo a project's .claude should live.
+claude_dest_for() {
+  _r=$1
+  # Match against known GIT_REPOS roots; keep relpath under that root.
+  for _base in $GIT_REPOS; do
+    case "$_r/" in
+      "$_base"/*)
+        _rel=${_r#"$_base"/}
+        [ "$_r" = "$_base" ] && { printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_base##*/}"; return; }
+        printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "$_rel"
+        return
+        ;;
+    esac
+  done
+  # Fallback — use the basename under misc/. User gets a warning.
+  printf '%s/misc/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_r##*/}"
+}
+
+# Ensure '.claude/' appears in <repo>/.gitignore (safe, idempotent).
+# Return 0 on success, 1 on failure.
+ensure_claude_gitignore() {
+  _r=$1
+  _gi=$_r/.gitignore
+  if [ -f "$_gi" ]; then
+    if grep -Eq '^/?\.claude/?$' "$_gi" 2>/dev/null; then
+      log_dbg_med ".gitignore already lists .claude/: $_gi"
+      return 0
+    fi
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    log_major ".claude/ missing from $_gi — DRY: would append"
+    return 0
+  fi
+  log_major ".claude/ added to $_gi"
+  # Preserve trailing newline; if file exists without final newline, fix that.
+  if [ -f "$_gi" ] && [ -s "$_gi" ]; then
+    _last=$(tail -c1 "$_gi" 2>/dev/null)
+    if [ "$_last" != "" ] && [ "$_last" != "
+" ]; then
+      printf '\n' >> "$_gi" 2>/dev/null \
+        || { sudo -n true 2>/dev/null || sudo true; echo "" | sudo tee -a "$_gi" >/dev/null; }
+    fi
+  fi
+  if ! printf '.claude/\n' >> "$_gi" 2>/dev/null; then
+    printf '.claude/\n' | sudo tee -a "$_gi" >/dev/null || return 1
+  fi
+  return 0
+}
+
+# Classify and (when safe) auto-migrate <repo>/.claude.
+# Return 0 on clean/fixed; 1 on unfixable problem (caller should fail).
+ensure_claude_setup() {
+  _r=$1
+
+  # Skip if this IS (or is inside) the central repo itself.
+  case "$_r/" in
+    "$CLAUDE_PROJECT_DIR_CENTRAL_REPO"/*|"$CLAUDE_PROJECT_DIR_CENTRAL_REPO"*/)
+      log_dbg_med "claude-check: $_r is inside central repo — skipping"
+      return 0 ;;
+  esac
+
+  # Always ensure .gitignore entry.
+  ensure_claude_gitignore "$_r" || { log_error "$_r: could not update .gitignore"; return 1; }
+
+  _cl=$_r/.claude
+  if [ -L "$_cl" ]; then
+    _tgt=$(readlink "$_cl")
+    # Resolve target to real absolute path (follows symlinks + resolves '..').
+    _tgt_real=$( cd -P -- "$_cl" 2>/dev/null && pwd -P ) || _tgt_real=
+    [ -z "$_tgt_real" ] && {
+      case "$_tgt" in /*) _tgt_real=$_tgt ;; *) _tgt_real=$_r/$_tgt ;; esac
+    }
+    # Also resolve the central repo (it may itself contain symlinks like /LINKS).
+    _ctr_real=$( cd -P -- "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" 2>/dev/null && pwd -P ) \
+      || _ctr_real=$CLAUDE_PROJECT_DIR_CENTRAL_REPO
+    case "$_tgt_real" in
+      "$_ctr_real"/*|"$_ctr_real")
+        log_medium "$_r/.claude -> $_tgt (in central repo)"
+        return 0
+        ;;
+      *)
+        log_major "$_r/.claude points OUTSIDE central repo: $_tgt"
+        log_medium "  resolved: $_tgt_real"
+        log_medium "  central:  $_ctr_real"
+        log_medium "not auto-correcting (user intent unclear)"
+        return 0
+        ;;
+    esac
+  fi
+
+  if [ ! -e "$_cl" ]; then
+    # Nothing there — fine.
+    return 0
+  fi
+
+  if [ ! -d "$_cl" ]; then
+    log_error "$_r/.claude exists but is not a symlink or directory"
+    return 1
+  fi
+
+  # Real directory — auto-migrate.
+  _dest=$(claude_dest_for "$_r")
+  log_major "$_r/.claude is a real directory — migrating to central repo"
+  log_medium "destination: $_dest"
+
+  # Refuse if destination exists and is non-empty.
+  if [ -e "$_dest" ]; then
+    if [ -n "$(ls -A "$_dest" 2>/dev/null)" ]; then
+      log_error "destination already exists and is non-empty: $_dest"
+      log_medium "resolve manually, then re-run  (see: my-git --help claude-check)"
+      return 1
+    fi
+  fi
+
+  # Refuse if settings.json is present — rule classification needs human judgement.
+  if [ -f "$_cl/settings.json" ]; then
+    log_error "$_r/.claude/settings.json present — manual migration required"
+    log_medium "per CLAUDE.md: split narrow/blanket/one-off rules by hand."
+    log_medium "skipping this project; nothing moved."
+    return 1
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    log_medium "DRY: would mkdir $_dest, move files, rmdir $_cl, symlink"
+    return 0
+  fi
+
+  if [ "$INTERACTIVE" = 1 ]; then
+    printf '    proceed with migration? [y/N]: ' >&2
+    read -r _ans </dev/tty || _ans=n
+    case "$_ans" in y|Y|yes) : ;; *) log_medium "skipped by user"; return 1 ;; esac
+  fi
+
+  mkdir -p "$_dest" || { log_error "mkdir failed: $_dest"; return 1; }
+  # Move everything except settings.json (which we refused above).
+  _moved=0
+  for _f in "$_cl"/* "$_cl"/.[!.]* "$_cl"/..?*; do
+    [ -e "$_f" ] || continue
+    mv -- "$_f" "$_dest/" || { log_error "mv failed: $_f"; return 1; }
+    _moved=$((_moved + 1))
+  done
+  log_medium "moved $_moved item(s)"
+
+  rmdir "$_cl" || { log_error "rmdir $_cl failed (not empty?)"; return 1; }
+
+  # Relative symlink.
+  _rel=$(python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$_dest" "$_r" 2>/dev/null)
+  if [ -z "$_rel" ]; then
+    _rel=$_dest
+    log_medium "(absolute link; python3 unavailable for relative calc)"
+  fi
+  ln -s "$_rel" "$_cl" || { log_error "ln -s failed"; return 1; }
+  log_major "$_r/.claude -> $_rel  (migration complete)"
+  return 0
+}
+
+cmd_claude_check() {
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help claude-check; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
+      -i|--interactive) INTERACTIVE=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "claude-check: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+
+  # Audit-only: force DRY_RUN by default. To actually apply, masscommits does it.
+  # claude-check is READ-ONLY unless user passes -i or explicit --apply.
+  _applied=0
+  for _a in "$@"; do
+    case "$_a" in --apply) _applied=1 ;; esac
+  done
+  [ "$_applied" = 1 ] || DRY_RUN=1
+
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "no repositories to audit"; exit 1; }
+
+  printf '%s\n' "$_roots" | while IFS= read -r _root; do
+    [ -n "$_root" ] || continue
+    _nodes=$(walk_submodules "$_root")
+    # Top-down reading order.
+    printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
+      | while IFS= read -r _node; do
+          [ -n "$_node" ] || continue
+          ensure_claude_setup "$_node" || true
+        done
+  done
+}
+
+# ─── Help pages ─────────────────────────────────────────────────────────
+show_help_top() {
+  cat <<EOF
+usage: $US [global-opts] <subcommand> [sub-opts] [paths...]
+
+Multi-repo git dispatcher with recursive submodule support.
+
+Subcommands:
+  status | st | s          List status of repo(s) + submodules (recursive)
+  masscommits | mc | c     Add + commit + push repo(s) + submodules (bottom-up)
+  submodules | sub | sm    Nested-repo registration tool
+  claude-check             Audit .claude/ setup (read-only by default)
+  help                     Show this help
+
+Global options:
+  -V, --verbose            Verbosity level 1
+  -VV                      Verbosity level 2
+  -D, --debug              Debug level 1  (implies -V)
+  -DD, --deepdbg           Debug level 2  (implies -VV; enables set -x)
+  --config <FILE>          Use specific config file
+  --create-config          Write default config to first writable location
+  -h, --help [TOPIC]       Show help (topic = subcommand or option)
+
+Scope (st / mc / claude-check):
+  explicit paths           operate on each given repo (+submodules, recursive)
+  none + inside git repo   operate on that repo + submodules (CWD-aware)
+  none + outside any repo  fallback to \$GIT_REPOS from config
+
+Run 'my-git --help <topic>' for details on any subcommand or option.
+Config file search order and variables:  my-git --help config
+EOF
+}
+
+show_help_status() {
+  cat <<EOF
+my-git status  (aliases: st, s)
+
+usage: $US [-V|-D] status [paths...]
+
+Recursively lists git status of the scoped repos and all their submodules.
+Uses  git status --porcelain --ignore-submodules  at each level (submodules
+are traversed manually so we can show nested structure).
+
+Output is indented by submodule depth. Clean/ahead/dirty states:
+  CLEAN :))                     — working tree clean, in sync with origin
+  Local <-> Remote out of sync  — clean but diverged from origin/<branch>
+  <porcelain lines>             — uncommitted changes
+
+Options: -V / -VV / -D / -DD, --help
+Scope:   see  $US --help
+EOF
+}
+
+show_help_masscommits() {
+  cat <<EOF
+my-git masscommits  (aliases: mc, c, go)
+
+usage: $US [-V|-D] mc [-n|--dry-run] [-i|--interactive] [paths...]
+
+For each repo in scope, recurses bottom-up through submodules and:
+  1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
+  2. If dirty  — git add -A, auto-generate commit message, git commit, git push
+  3. If clean  — checks local-vs-remote; pushes if ahead; else DONE
+
+Bottom-up is required so each parent's gitlink bumps onto the freshly-pushed
+child commit in the same run.
+
+Commit-message template:
+  line 1: intro (filename / short file list / 'AUTOMATIC-MASS-COMMIT')
+  body:   #-commented block with file list or diffs + last-N commit messages
+          (tunables: COMMIT_MSG_LAST_N, COMMIT_MSG_DIFF_MAX_FILES)
+
+Options:
+  -n, -T, --try, --dry, --dry-run   Preview; no writes, no commits, no pushes
+  -i, --interactive                  Prompt before destructive .claude migration
+  -V, -VV, -D, -DD                   Verbosity / debug
+  --help
+
+Compat:  'go' is accepted as an alias.
+Scope:   see  $US --help
+EOF
+}
+
+show_help_claude_check() {
+  cat <<EOF
+my-git claude-check
+
+usage: $US claude-check [--apply] [-i] [paths...]
+
+Audits each repo in scope to enforce the .claude-symlink convention:
+  1. .gitignore must contain '.claude/'               (auto-added on --apply)
+  2. <repo>/.claude must be a symlink into \$CLAUDE_PROJECT_DIR_CENTRAL_REPO
+  3. If it is a real dir:
+     - settings.json present → HARD ERROR (manual split required)
+     - no settings.json      → auto-migrate:
+                               mv files → central, rmdir, create symlink
+
+Default is read-only (shows what WOULD happen). Pass --apply to commit
+changes. 'my-git mc' applies these same checks before each commit.
+
+Options:
+  --apply            Actually make the changes (default: dry)
+  -i, --interactive  Prompt before each migration
+  -V, -VV, -D, -DD   Verbosity / debug
+  --help
+
+Config:
+  CHECK_CLAUDE_SETUP=0 disables the check entirely in 'mc'.
+  CLAUDE_PROJECT_DIR_CENTRAL_REPO = $CLAUDE_PROJECT_DIR_CENTRAL_REPO
+EOF
+}
+
+show_help_submodules() {
+  _sm_usage 2>/dev/null || cat <<EOF
+my-git submodules  (aliases: sub, sm)
+
+usage: $US sm [opts]                     (analyze; compact one-line output)
+       $US sm [-T|--dry|--try]           (preview)
+       $US sm go [--force]               (apply)
+       $US sm --list-ignored             (audit ignored nested repos)
+       $US sm --clean-leftovers          (resolve .preexisting.* leftovers)
+       $US sm --sync-gitignore           (write ignored paths to .git/info/exclude)
+       $US sm --emit-gitignore           (print ignore patterns to stdout)
+       $US sm --unstage-embedded         (remove mis-staged embedded repos)
+
+Merged from the standalone my-git-submodules.sh tool. Run from the top of a
+super-repo to register nested .git trees as proper submodules.
+
+Options:
+  -D, --debug        set -x plus extra diagnostics
+  -V, --verbose      Full multi-line block per candidate
+  -i, --interactive  Prompt on failures / missing info
+  --force            With 'go', ignore per-repo ignore markers
+  --help             Show extended help
+
+Ignore marker:  writes '<nested>/.git/my-git-submodules.ignore' (delete to un-ignore).
+See also:      $US --help                (top-level)
+EOF
+}
+
+show_help_config() {
+  cat <<EOF
+my-git configuration
+
+Search order (first existing wins):
+  1.  \$MY_GIT_CONFIG env var, if set
+  2.  --config <FILE>
+  3.  /LINKS/default/my-git.conf
+  4.  ~/.mygit.conf
+  5.  /etc/my-git.conf
+  6.  /usr/local/etc/my-git.conf
+
+Commands:
+  $US --create-config     Write default config to first writable location
+  $US --config FILE ...   Use specific file (overrides search)
+
+Variables (all optional; defaults shown):
+  GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
+                              Fallback repo list (used when no CWD repo).
+  CHECK_CLAUDE_SETUP=1        Audit .claude/ during 'mc'; 0 disables.
+  CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
+                              Central tree where .claude dirs live.
+  COMMIT_MSG_LAST_N=3         # of recent log entries in auto-commit body.
+  COMMIT_MSG_DIFF_MAX_FILES=10  Switch to file-list block above this count.
+  ALLOW_SUDO_SU=1             Permit 'sudo su <owner>' for cross-owner repos.
+  DEFAULT_VERBOSE=0           Set 1 to behave as -V always.
+  DEFAULT_DEBUG=0             Set 1 to behave as -D always.
+  SM_AUTO_SAFE_DIRECTORY=1    In 'sm', auto-add safe.directory on errors.
+
+Missing config file triggers guidance + exit 2 on any subcommand.
+EOF
+}
+
+show_help_verbose() {
+  cat <<EOF
+my-git verbosity: -V / -VV
+
+-V / --verbose    Verbosity level 1. Enables '>>' medium info lines and
+                  per-repo narration.
+-VV               Verbosity level 2. Adds '>' minor detail lines.
+
+Output prefix legend:
+   >>> MAJOR     Always shown. Milestone / headline. First in each block.
+    >> medium    Shown at -V, -VV, -D, -DD.
+     > minor     Shown at -VV, -DD.
+   ~~~ debug     Shown at -D, -DD. On stderr.
+    ~~ debug     Shown at -D, -DD. On stderr.
+     ~ debug     Shown at -DD only. On stderr.
+
+Verbose and debug are independent axes. Debug implies verbose (-D enables -V;
+-DD enables -VV). No single output block may be gated across both axes.
+EOF
+}
+
+show_help_debug() {
+  cat <<EOF
+my-git debug: -D / -DD
+
+-D  / --debug     Debug level 1. Extra diagnostic lines (prefix '~~~' / '~~'
+                  on stderr). Implies -V.
+-DD / --deepdbg   Debug level 2. Adds '~' lines. Enables 'set -x' trace with
+                  'PS4=+ [LINE] '. Implies -VV.
+
+Use -D when inspecting my-git's own behaviour; use -V for more user-level
+detail about repo state. The two axes are kept independent intentionally.
+EOF
+}
+
+show_help() {
+  case "${1:-}" in
+    ''|top)              show_help_top ;;
+    status|st|s)         show_help_status ;;
+    masscommits|mc|c|go) show_help_masscommits ;;
+    submodules|sub|sm)   show_help_submodules ;;
+    claude-check)        show_help_claude_check ;;
+    config|--config|--create-config) show_help_config ;;
+    verbose|-V|--verbose|-VV)        show_help_verbose ;;
+    debug|-D|--debug|-DD|--deepdbg)  show_help_debug ;;
+    *) log_error "no help topic: $1"; echo >&2; show_help_top; return 1 ;;
+  esac
+}
+
+# ════════════════════════════════════════════════════════════════════════
+# ═══ SUBMODULES (sm) — merged from my-git-submodules.sh ════════════════
+# ════════════════════════════════════════════════════════════════════════
+# Helpers prefixed _sm_ where they would clash with my-git-level names.
+# Everything else retains its original name.
+
+_sm_IGNORE_MARKER='my-git-submodules.ignore'
+_sm_PREEXISTING_SUFFIX='.preexisting.'
+
+_sm_ask() {
+  _prompt=$1
+  if [ -r /dev/tty ]; then
+    printf '%s' "$_prompt" >/dev/tty
+    IFS= read -r _ans </dev/tty || _ans=''
+    printf '%s' "$_ans"
+  else
+    printf 'error: interactive prompt needed but no TTY available: %s\n' \
+      "$_prompt" >&2
+    exit 4
+  fi
+}
+
+_sm_normalize_url() {
+  _u=$1
+  _u=$(printf '%s' "$_u" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$_u" in
+    https://github.com/*/*)
+      _rest=${_u#https://github.com/}
+      _owner=${_rest%%/*}
+      _rest=${_rest#*/}
+      _repo=${_rest%%/*}
+      _repo=${_repo%.git}
+      printf 'git@github.com:%s/%s.git' "$_owner" "$_repo"
+      ;;
+    *) printf '%s' "$_u" ;;
+  esac
+}
+
+_sm_url_is_suspicious() {
+  case "$1" in
+    git+ssh://*|git+https://*|ssh+git://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_sm_resolve_gitdir() {
+  _gp=$1; _sp=$2
+  if [ -d "$_gp" ]; then
+    printf '%s' "$_gp"
+  else
+    _gd=$(sed -n 's/^gitdir: //p' "$_gp")
+    case "$_gd" in
+      /*) printf '%s' "$_gd" ;;
+      *)  printf '%s/%s' "$_sp" "$_gd" ;;
+    esac
+  fi
+}
+
+_sm_resolve_cfg() {
+  _gd=$(_sm_resolve_gitdir "$1" "$2")
+  printf '%s/config' "$_gd"
+}
+
+_sm_ignore_marker_path() {
+  _gd=$(_sm_resolve_gitdir "$1" "$2")
+  printf '%s/%s' "$_gd" "$_sm_IGNORE_MARKER"
+}
+
+_sm_is_ignored() {
+  [ -e "$(_sm_ignore_marker_path "$1" "$2")" ]
+}
+
+_sm_mark_ignored() {
+  _m=$(_sm_ignore_marker_path "$1" "$2")
+  : > "$_m" 2>/dev/null || {
+    printf 'WARN  could not create ignore marker at %s\n' "$_m" >&2
+    return 1
+  }
+  printf 'IGNORE   marker written: %s\n' "$_m"
+}
+
+_sm_safe_git() {
+  _repo=$1; shift
+  _sg_log=$(mktemp "${TMPDIR:-/tmp}/safegit.XXXXXX")
+  git "$@" 2>"$_sg_log"
+  _sg_rc=$?
+  if [ "$_sg_rc" -ne 0 ] && [ "$SM_AUTO_SAFE_DIRECTORY" -eq 1 ] \
+     && grep -q 'detected dubious ownership' "$_sg_log" 2>/dev/null; then
+    _abs=$(cd "$_repo" 2>/dev/null && pwd -P) || _abs=$_repo
+    printf 'INFO   registering safe.directory exception for %s\n' "$_abs" >&2
+    if git config --global --add safe.directory "$_abs" >/dev/null 2>&1; then
+      git "$@" 2>"$_sg_log"
+      _sg_rc=$?
+    else
+      printf 'WARN   could not add safe.directory exception\n' >&2
+    fi
+  fi
+  cat "$_sg_log" >&2
+  rm -f "$_sg_log"
+  return "$_sg_rc"
+}
+
+_sm_find_leftovers() {
+  find . -mindepth 1 -type d -name "*${_sm_PREEXISTING_SUFFIX}*" \
+       -not -path '*/.git/*' 2>/dev/null | sed 's|^\./||' | sort
+}
+
+_sm_is_registered_submodule() {
+  _sp=$1
+  [ -f .gitmodules ] || return 1
+  git config -f .gitmodules --get-regexp "^submodule\..*\.path$" 2>/dev/null \
+      | sed 's/^[^ ]* //' | grep -Fxq "$_sp"
+}
+
+_sm_is_tracked_in_index() {
+  git ls-files --error-unmatch -- "$1" >/dev/null 2>&1
+}
+
+_sm_enclosing_submodule() {
+  _sp=$1
+  [ -f .gitmodules ] || return 1
+  git config -f .gitmodules --get-regexp "^submodule\..*\.path$" 2>/dev/null \
+      | sed 's/^[^ ]* //' \
+      | while IFS= read -r _p; do
+          case "$_sp" in
+            "$_p"/*) printf '%s\n' "$_p" ;;
+          esac
+        done \
+      | awk '{ if (length($0) > length(best)) best=$0 } END { if (best != "") print best }'
+}
+
+_sm_find_moved_submodule() {
+  _url_match=$1
+  [ -f .gitmodules ] || return 1
+  [ -z "$_url_match" ] && return 1
+  git config -f .gitmodules --get-regexp "^submodule\..*\.url$" 2>/dev/null \
+      | while IFS= read -r _line; do
+          _key=${_line%% *}
+          _val=${_line#* }
+          [ "$_val" = "$_url_match" ] || continue
+          _name=${_key#submodule.}
+          _name=${_name%.url}
+          _path=$(git config -f .gitmodules --get "submodule.${_name}.path" 2>/dev/null || true)
+          [ -z "$_path" ] && continue
+          if [ ! -e "$_path" ]; then
+            printf '%s\n' "$_path"
+            return 0
+          fi
+        done
+}
+
+_sm_nested_is_clean() {
+  _sp=$1
+  _out=$(_sm_safe_git "$_sp" -C "$_sp" status --porcelain 2>/dev/null || true)
+  [ -z "$_out" ]
+}
+_sm_nested_head()   { _sm_safe_git "$1" -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?'; }
+_sm_nested_branch() { _sm_safe_git "$1" -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached)'; }
+
+_sm_emit_compact() {
+  _st=$1; _fl=$2; _sp=$3; _info=$4
+  printf '%-8s %-2s  %-52s %s\n' "$_st" "$_fl" "$_sp" "$_info"
+}
+
+_sm_gitpath_for() {
+  _sp=$1
+  if [ -d "$_sp/.git" ] || [ -f "$_sp/.git" ]; then
+    printf '%s/.git' "$_sp"
+  fi
+}
+
+_sm_persist_url_change() {
+  _pc_cfg=$1; _pc_new=$2; _pc_orig=$3
+  [ -f "$_pc_cfg" ] || {
+    printf 'WARN  could not persist URL (config not found: %s)\n' "$_pc_cfg" >&2
+    return 1
+  }
+  _pc_cur=$(git config -f "$_pc_cfg" --get remote.origin.url 2>/dev/null || true)
+  if [ "$_pc_cur" = "$_pc_new" ]; then
+    return 0
+  fi
+  if ! git config -f "$_pc_cfg" remote.origin.url "$_pc_new" 2>/dev/null; then
+    git config -f "$_pc_cfg" --add remote.origin.url "$_pc_new" 2>/dev/null || {
+      printf 'WARN  could not write remote.origin.url to %s\n' "$_pc_cfg" >&2
+      return 1
+    }
+  fi
+  if [ -n "$_pc_orig" ] && ! grep -Fq "# my-git-submodules: previous remote.origin.url =" "$_pc_cfg" 2>/dev/null; then
+    {
+      printf '\n# my-git-submodules: previous remote.origin.url = %s (changed %s)\n' \
+        "$_pc_orig" "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+    } >> "$_pc_cfg"
+  fi
+  printf 'CONFIG   updated %s: remote.origin.url = %s\n' "$_pc_cfg" "$_pc_new"
+}
+
+_sm_remove_gitmodules_entry() {
+  _rge_name=$1
+  [ -f .gitmodules ] || return 0
+  _rge_tmp=$(mktemp "${TMPDIR:-/tmp}/gitmodules.XXXXXX")
+  if awk -v want="[submodule \"$_rge_name\"]" '
+      /^\[/ { skip = ($0 == want) ? 1 : 0 }
+      skip == 0 { print }
+  ' .gitmodules > "$_rge_tmp"; then
+    mv -- "$_rge_tmp" .gitmodules
+  else
+    rm -f "$_rge_tmp"
+    return 1
+  fi
+}
+
+_sm_rebind_has_risky_state() {
+  _rhs_sp=$1
+  [ -d "$_rhs_sp/.git" ] || [ -f "$_rhs_sp/.git" ] || return 1
+  _risk=''
+  _out=$(_sm_safe_git "$_rhs_sp" -C "$_rhs_sp" status --porcelain 2>/dev/null || true)
+  [ -n "$_out" ] && _risk="${_risk}uncommitted changes; "
+  _out=$(_sm_safe_git "$_rhs_sp" -C "$_rhs_sp" log --branches --not --remotes --oneline 2>/dev/null || true)
+  [ -n "$_out" ] && _risk="${_risk}unpushed commits on local branches; "
+  _out=$(_sm_safe_git "$_rhs_sp" -C "$_rhs_sp" stash list 2>/dev/null || true)
+  [ -n "$_out" ] && _risk="${_risk}stashes; "
+  if [ -n "$_risk" ]; then
+    printf '%s' "${_risk%; }"
+    return 0
+  fi
+  return 1
+}
+
+# ─── cmd_submodules: top-level flow from my-git-submodules.sh ───────────
+cmd_submodules() {
+  # Re-parse sm's argv (passed as $@).
+  _sm_mode=analyze
+  _sm_mode_set=0
+  _sm_interactive=$INTERACTIVE
+  _sm_verbose=$VRB
+  _sm_force=0
+  _sm_list_ignored=0
+  _sm_clean_leftovers=0
+  _sm_sync_gitignore=0
+  _sm_emit_gitignore=0
+  _sm_unstage_embedded=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      go)                    [ "$_sm_mode_set" -eq 0 ] && _sm_mode=go  && _sm_mode_set=1 ;;
+      -T|--dry|--try|-n|--dry-run) [ "$_sm_mode_set" -eq 0 ] && _sm_mode=dry && _sm_mode_set=1 ;;
+      -D|--debug)            DBG=1; VRB=1 ;;
+      -DD|--deepdbg)         DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -V|--verbose)          _sm_verbose=1; VRB=1 ;;
+      -VV)                   _sm_verbose=1; VRB=1; VERYVRB=1 ;;
+      -i|--interactive)      _sm_interactive=1 ;;
+      --force)               _sm_force=1 ;;
+      --list-ignored)        _sm_list_ignored=1 ;;
+      --clean-leftovers)     _sm_clean_leftovers=1 ;;
+      --sync-gitignore)      _sm_sync_gitignore=1 ;;
+      --emit-gitignore)      _sm_emit_gitignore=1 ;;
+      --unstage-embedded)    _sm_unstage_embedded=1 ;;
+      -h|--help)             show_help submodules; exit 0 ;;
+      --)                    shift; break ;;
+      -*)                    printf 'Unknown option: %s\n\n' "$1" >&2; show_help submodules >&2; exit 2 ;;
+      *)                     printf 'Unexpected argument: %s\n\n' "$1" >&2; show_help submodules >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  # ─── Super-repo sanity ───
+  _sm_safe_git "$(pwd -P)" rev-parse --show-toplevel >/dev/null 2>&1 || {
+    echo "error: not inside a Git repository (or safe.directory could not be set)" >&2
+    exit 1
+  }
+  _sm_toplevel=$(git rev-parse --show-toplevel)
+  if [ "$_sm_toplevel" != "$(pwd -P)" ]; then
+    printf 'error: run this from the super-repo root (%s)\n' "$_sm_toplevel" >&2
+    exit 1
+  fi
+
+  # ─── leftovers / clean-leftovers ───
+  if [ "$_sm_clean_leftovers" -eq 1 ]; then
+    _leftovers=$(_sm_find_leftovers)
+    if [ -z "$_leftovers" ]; then
+      echo "No leftover directories found."
+      exit 0
+    fi
+    printf '%s\n' "$_leftovers" | while IFS= read -r _lo; do
+      _orig=${_lo%"${_sm_PREEXISTING_SUFFIX}"*}
+      printf '\n--- leftover: %s\n' "$_lo"
+      printf '    would pair with: %s\n' "$_orig"
+      if [ -e "$_orig" ]; then
+        printf '    note: "%s" currently exists — merging is NOT automatic\n' "$_orig"
+        _ans=$(_sm_ask "    [K]eep (do nothing) / [D]elete leftover / [A]bort? [K/d/a]: ")
+      else
+        printf '    note: "%s" does not exist — leftover can be restored in place\n' "$_orig"
+        _ans=$(_sm_ask "    [R]estore leftover to original / [D]elete / [K]eep / [A]bort? [R/d/k/a]: ")
+      fi
+      case "$_ans" in
+        d|D) rm -rf -- "$_lo" && echo "    deleted." ;;
+        r|R) [ ! -e "$_orig" ] && mv -- "$_lo" "$_orig" && echo "    restored." ;;
+        a|A) echo "Aborted."; exit 1 ;;
+        *)   echo "    kept." ;;
+      esac
+    done
+    exit 0
+  fi
+
+  _leftovers=$(_sm_find_leftovers)
+  if [ -n "$_leftovers" ]; then
+    echo "error: leftover aside-directories from a previous run detected:" >&2
+    printf '%s\n' "$_leftovers" | sed 's/^/  /' >&2
+    echo >&2
+    echo "These were created when 'go' was interrupted mid-add. Resolve first:" >&2
+    echo "  $US sm --clean-leftovers" >&2
+    exit 3
+  fi
+
+  # ─── --list-ignored ───
+  if [ "$_sm_list_ignored" -eq 1 ]; then
+    echo "Ignored nested repos under $_sm_toplevel (marker: .git/$_sm_IGNORE_MARKER):"
+    _n=0
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/listign.XXXXXX")
+    find . -mindepth 2 -name .git \( -type d -o -type f \) \
+         -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
+    while IFS= read -r gp; do
+      sp=${gp%/.git}; sp=${sp#./}
+      if _sm_is_ignored "$gp" "$sp"; then
+        printf '  %s\n' "$sp"
+        _n=$((_n + 1))
+      fi
+    done < "$_tmp"
+    rm -f "$_tmp"
+    printf '\nTotal ignored: %s\n' "$_n"
+    exit 0
+  fi
+
+  # ─── --unstage-embedded ───
+  if [ "$_sm_unstage_embedded" -eq 1 ]; then
+    _embedded=$(git ls-files -s 2>/dev/null | awk '$1 == "160000" {print}' \
+                | cut -f2- | sort)
+    if [ -z "$_embedded" ]; then
+      echo "No embedded repo entries found in the index."
+      exit 0
+    fi
+    _registered_list=''
+    [ -f .gitmodules ] && _registered_list=$(
+      git config -f .gitmodules --get-regexp "^submodule\..*\.path$" 2>/dev/null \
+          | sed 's/^[^ ]* //'
+    )
+    _to_unstage=$(
+      printf '%s\n' "$_embedded" | while IFS= read -r _p; do
+        if ! printf '%s\n' "$_registered_list" | grep -Fxq "$_p"; then
+          printf '%s\n' "$_p"
+        fi
+      done
+    )
+    if [ -z "$_to_unstage" ]; then
+      echo "All mode-160000 entries are registered submodules — nothing to unstage."
+      exit 0
+    fi
+    echo "Embedded (non-submodule) repos currently staged:"
+    printf '%s\n' "$_to_unstage" | sed 's/^/  /'
+    echo
+    printf '%s\n' "$_to_unstage" | while IFS= read -r _p; do
+      printf 'UNSTAGE  %s\n' "$_p"
+      git rm --cached -f -- "$_p" >/dev/null 2>&1 || {
+        printf 'WARN  git rm --cached -f failed for %s\n' "$_p" >&2
+      }
+    done
+    echo
+    echo "Done. Working tree is unchanged."
+    echo "Tip: run '$US sm --sync-gitignore' to prevent 'git add' from re-staging them."
+    exit 0
+  fi
+
+  # ─── --sync-gitignore / --emit-gitignore ───
+  if [ "$_sm_sync_gitignore" -eq 1 ] || [ "$_sm_emit_gitignore" -eq 1 ]; then
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/syncign.XXXXXX")
+    find . -mindepth 2 -name .git \( -type d -o -type f \) \
+         -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
+    _patterns=$(
+      while IFS= read -r gp; do
+        sp=${gp%/.git}; sp=${sp#./}
+        if _sm_is_ignored "$gp" "$sp"; then
+          printf '/%s/\n' "$sp"
+        fi
+      done < "$_tmp"
+    )
+    rm -f "$_tmp"
+    if [ -z "$_patterns" ]; then
+      echo "No ignored nested repos found — nothing to write."
+      exit 0
+    fi
+    _header='# --- my-git-submodules: ignored nested repos (do not edit between markers) ---'
+    _footer='# --- end my-git-submodules ---'
+    if [ "$_sm_emit_gitignore" -eq 1 ]; then
+      printf '%s\n%s\n%s\n' "$_header" "$_patterns" "$_footer"
+      exit 0
+    fi
+    _exclude="$_sm_toplevel/.git/info/exclude"
+    mkdir -p "$_sm_toplevel/.git/info" 2>/dev/null || true
+    _existing=''
+    [ -f "$_exclude" ] && _existing=$(cat "$_exclude")
+    _clean=$(
+      printf '%s\n' "$_existing" | awk -v h="$_header" -v f="$_footer" '
+        $0 == h { inblock = 1; next }
+        $0 == f { inblock = 0; next }
+        inblock == 0 { print }
+      '
+    )
+    _new_tmp=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
+    {
+      [ -n "$_clean" ] && printf '%s\n' "$_clean"
+      printf '%s\n%s\n%s\n' "$_header" "$_patterns" "$_footer"
+    } > "$_new_tmp"
+    if mv -- "$_new_tmp" "$_exclude"; then
+      _count=$(printf '%s\n' "$_patterns" | wc -l | tr -d ' ')
+      printf 'Wrote %s gitignore entries to %s\n' "$_count" "$_exclude"
+      echo "These are local-only (not tracked by git)."
+    else
+      rm -f "$_new_tmp"
+      echo "error: could not write $_exclude" >&2
+      exit 1
+    fi
+    exit 0
+  fi
+
+  # ─── Main analyze/dry/go flow ───
+  _sm_super_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached)')
+  _sm_super_origin=$(git config --get remote.origin.url 2>/dev/null || echo '(no origin)')
+  _sm_super_dirty=$(git status --porcelain --ignore-submodules=all 2>/dev/null | head -n1)
+
+  log_dbg_med "sm mode=$_sm_mode debug=$DBG verbose=$_sm_verbose interactive=$_sm_interactive force=$_sm_force"
+
+  _sm_tmpfile=$(mktemp "${TMPDIR:-/tmp}/submodscan.XXXXXX")
+  _sm_plan=$(mktemp "${TMPDIR:-/tmp}/submodplan.XXXXXX")
+
+  INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+  _sm_cleanup() {
+    _rc=$?
+    if [ -n "$INFLIGHT_TMP" ] && [ -e "$INFLIGHT_TMP" ]; then
+      printf 'RECOVER  restoring %s <- %s\n' "$INFLIGHT_ORIG" "$INFLIGHT_TMP" >&2
+      rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
+      mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
+    fi
+    rm -f "$_sm_tmpfile" "$_sm_plan" 2>/dev/null || true
+    trap - EXIT
+    exit "$_rc"
+  }
+  trap _sm_cleanup EXIT INT TERM HUP
+
+  find . -mindepth 2 -name .git \( -type d -o -type f \) \
+       -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_sm_tmpfile"
+  _sm_total=$(wc -l < "$_sm_tmpfile" | tr -d ' ')
+
+  _sm_c_registered=0; _sm_c_ready=0; _sm_c_need_untrack=0; _sm_c_no_url=0; _sm_c_dirty=0
+  _sm_c_prompt=0; _sm_c_nested=0; _sm_c_ignored=0; _sm_c_moved=0
+
+  _sm_show_header=1
+  [ "$_sm_mode" = go ]      && [ "$_sm_verbose" -eq 0 ] && _sm_show_header=0
+  [ "$_sm_mode" = analyze ] && [ "$_sm_verbose" -eq 0 ] && _sm_show_header=0
+  [ "$_sm_mode" = dry ]     && [ "$_sm_verbose" -eq 0 ] && _sm_show_header=0
+
+  if [ "$_sm_show_header" -eq 1 ]; then
+    echo "============================================================"
+    printf 'Super-repo : %s\n' "$_sm_toplevel"
+    printf 'Branch     : %s\n' "$_sm_super_branch"
+    printf 'Origin     : %s\n' "$_sm_super_origin"
+    [ -n "$_sm_super_dirty" ] && printf 'Worktree   : DIRTY\n' || printf 'Worktree   : clean\n'
+    if [ -f .gitmodules ]; then
+      _reg_count=$(git config -f .gitmodules --get-regexp "^submodule\..*\.path$" 2>/dev/null | wc -l | tr -d ' ')
+      printf '.gitmodules: present (%s entries)\n' "$_reg_count"
+    else
+      printf '.gitmodules: none\n'
+    fi
+    printf 'Candidates : %s nested .git found\n' "$_sm_total"
+    printf 'Interactive: %s     Verbose: %s     Force: %s\n' \
+      "$([ "$_sm_interactive" -eq 1 ] && echo on || echo off)" \
+      "$([ "$_sm_verbose"     -eq 1 ] && echo on || echo off)" \
+      "$([ "$_sm_force"       -eq 1 ] && echo on || echo off)"
+    echo "============================================================"
+    echo
+  fi
+
+  if [ "$_sm_total" -eq 0 ]; then
+    echo "No nested Git repositories found below $_sm_toplevel."
+    exit 0
+  fi
+
+  _sm_compact_header_printed=0
+  _sm_maybe_print_compact_header() {
+    [ "$_sm_verbose" -eq 1 ] && return 0
+    [ "$_sm_compact_header_printed" -eq 1 ] && return 0
+    [ "$_sm_mode" = go ] && return 0
+    printf '%-8s %-2s  %-52s %s\n' "STATUS" "FL" "PATH" "INFO"
+    _sm_compact_header_printed=1
+  }
+
+  # ─── Per-candidate analysis loop ───
+  while IFS= read -r gitpath; do
+    submod_path=${gitpath%/.git}
+    submod_path=${submod_path#./}
+
+    log_dbg_med "sm candidate: $submod_path"
+
+    cfg=$(_sm_resolve_cfg "$gitpath" "$submod_path")
+    url=''
+    [ -f "$cfg" ] && url=$(git config -f "$cfg" --get remote.origin.url 2>/dev/null || true)
+
+    ignored=0
+    _sm_is_ignored "$gitpath" "$submod_path" && ignored=1
+
+    registered=0
+    _sm_is_registered_submodule "$submod_path" && registered=1
+
+    enc=''
+    [ "$registered" -eq 0 ] && enc=$(_sm_enclosing_submodule "$submod_path" || true)
+
+    tracked=0
+    [ "$registered" -eq 0 ] && _sm_is_tracked_in_index "$submod_path" && tracked=1
+
+    clean=0
+    _sm_nested_is_clean "$submod_path" && clean=1
+
+    status_kw=unknown
+    plan_action=''
+
+    if [ "$registered" -eq 1 ]; then
+      status_kw=registered
+      _sm_c_registered=$((_sm_c_registered + 1))
+    elif [ -n "$enc" ]; then
+      status_kw=nested
+      _sm_c_nested=$((_sm_c_nested + 1))
+    elif [ "$ignored" -eq 1 ] && [ "$_sm_force" -eq 0 ]; then
+      status_kw=ignored
+      _sm_c_ignored=$((_sm_c_ignored + 1))
+    else
+      moved_from=''
+      if [ -n "$url" ]; then
+        moved_from=$(_sm_find_moved_submodule "$url" || true)
+      fi
+      if [ -n "$moved_from" ]; then
+        status_kw=moved
+        _sm_c_moved=$((_sm_c_moved + 1))
+        plan_action=rebind-moved
+        printf '%s\t%s\t%s\t%s\n' \
+          "$plan_action" "$submod_path" "$url" "$moved_from" >> "$_sm_plan"
+      elif [ -z "$url" ]; then
+        if [ "$_sm_interactive" -eq 1 ] && [ "$_sm_mode" != analyze ]; then
+          status_kw=will-prompt
+          _sm_c_prompt=$((_sm_c_prompt + 1))
+          [ "$tracked" -eq 1 ] && plan_action=prompt-url-untrack || plan_action=prompt-url
+          printf '%s\t%s\t\n' "$plan_action" "$submod_path" >> "$_sm_plan"
+        else
+          status_kw=no-url
+          _sm_c_no_url=$((_sm_c_no_url + 1))
+        fi
+      else
+        if [ "$tracked" -eq 1 ]; then
+          status_kw=ready-untrack
+          _sm_c_need_untrack=$((_sm_c_need_untrack + 1))
+          plan_action=add-with-untrack
+        else
+          status_kw=ready
+          _sm_c_ready=$((_sm_c_ready + 1))
+          plan_action=add
+        fi
+        if _sm_url_is_suspicious "$url" && [ "$status_kw" = ready ]; then
+          status_kw=suspicious
+        fi
+        printf '%s\t%s\t%s\n' "$plan_action" "$submod_path" "$url" >> "$_sm_plan"
+      fi
+      [ "$clean" -eq 0 ] && [ -n "$plan_action" ] && _sm_c_dirty=$((_sm_c_dirty + 1))
+    fi
+
+    _fl_dirty='-'; [ "$clean" -eq 0 ] && _fl_dirty='D'
+    _fl_track='-'; [ "$tracked" -eq 1 ] && _fl_track='T'
+    _flags="${_fl_dirty}${_fl_track}"
+
+    case "$status_kw" in
+      registered)    _status_short='OK';       _info='registered' ;;
+      nested)        _status_short='NESTED';   _info="parent=$enc" ;;
+      ignored)       _status_short='IGNORED';  _info='marker' ;;
+      ready)         _status_short='READY';    _info="$url" ;;
+      ready-untrack) _status_short='READY+UT'; _info="$url" ;;
+      will-prompt)   _status_short='PROMPT';   _info='(no origin URL)' ;;
+      no-url)        _status_short='NO-URL';   _info='(no origin URL)' ;;
+      suspicious)    _status_short='SUSPECT';  _info="$url" ;;
+      moved)         _status_short='MOVED';    _info="was=$moved_from  url=$url" ;;
+      *)             _status_short="$status_kw"; _info='' ;;
+    esac
+
+    if [ "$_sm_verbose" -eq 1 ]; then
+      printf -- '--- %s\n' "$submod_path"
+      if [ "$ignored" -eq 1 ]; then
+        if [ "$_sm_force" -eq 1 ]; then
+          printf '    ignore       : marker present, OVERRIDDEN by --force\n'
+        else
+          printf '    ignore       : marker present — ignored\n'
+        fi
+      fi
+      [ ! -f "$cfg" ] && printf '    config       : MISSING (%s)\n' "$cfg"
+      if [ -n "$url" ]; then
+        if _sm_url_is_suspicious "$url"; then
+          printf '    origin URL   : %s   [suspicious scheme]\n' "$url"
+        else
+          printf '    origin URL   : %s\n' "$url"
+        fi
+      else
+        printf '    origin URL   : (none — nested repo has no remote.origin)\n'
+      fi
+      printf '    nested HEAD  : %s @ %s\n' \
+        "$(_sm_nested_branch "$submod_path")" "$(_sm_nested_head "$submod_path")"
+      [ "$clean" -eq 1 ] && printf '    nested tree  : clean\n' \
+                        || printf '    nested tree  : DIRTY (uncommitted changes inside)\n'
+      case "$status_kw" in
+        registered)    printf '    status       : ALREADY a submodule (.gitmodules)\n' ;;
+        nested)        printf '    status       : NESTED inside submodule "%s"\n' "$enc" ;;
+        ignored)       printf '    status       : IGNORED via marker\n' ;;
+        ready)         printf '    status       : READY (will add)\n' ;;
+        ready-untrack) printf '    index        : TRACKED as plain files — needs untrack\n'
+                       printf '    status       : READY (will untrack, then add)\n' ;;
+        will-prompt)   printf '    status       : WILL PROMPT for URL (interactive)\n' ;;
+        no-url)        printf '    status       : CANNOT ADD — no URL to register against\n' ;;
+        suspicious)    printf '    status       : READY but URL scheme is suspicious\n' ;;
+        moved)         printf '    status       : MOVED from "%s" (same URL, old path missing)\n' "$moved_from"
+                       printf '    action       : rename bookkeeping is manual; see note below\n' ;;
+        *)             printf '    status       : %s\n' "$status_kw" ;;
+      esac
+    else
+      if [ "$_sm_mode" != go ]; then
+        _sm_maybe_print_compact_header
+        _sm_emit_compact "$_status_short" "$_flags" "$submod_path" "$_info"
+      fi
+    fi
+  done < "$_sm_tmpfile"
+
+  # ─── Summary ───
+  _sm_to_do=$((_sm_c_ready + _sm_c_need_untrack + _sm_c_prompt + _sm_c_moved))
+
+  if [ "$_sm_verbose" -eq 1 ] || [ "$_sm_mode" != go ]; then
+    echo
+    echo "============================================================"
+    echo "Summary"
+    echo "============================================================"
+    printf '  already registered       : %s\n' "$_sm_c_registered"
+    printf '  ready to add             : %s\n' "$_sm_c_ready"
+    printf '  ready (needs untrack)    : %s\n' "$_sm_c_need_untrack"
+    printf '  missing origin URL       : %s\n' "$_sm_c_no_url"
+    [ "$_sm_c_prompt"  -gt 0 ] && printf '  will prompt for URL      : %s\n' "$_sm_c_prompt"
+    [ "$_sm_c_nested"  -gt 0 ] && printf '  nested in submodule      : %s   (belongs to parent)\n' "$_sm_c_nested"
+    [ "$_sm_c_ignored" -gt 0 ] && printf '  ignored via marker       : %s%s\n' "$_sm_c_ignored" \
+      "$([ "$_sm_force" -eq 1 ] && echo '   (overridden by --force)')"
+    [ "$_sm_c_moved"   -gt 0 ] && printf '  moved (rename detected)  : %s   (will be rebound)\n' "$_sm_c_moved"
+    printf '  actionable with dirty WT : %s   (their changes preserved)\n' "$_sm_c_dirty"
+    printf '  actions planned          : %s\n' "$_sm_to_do"
+    echo
+  fi
+
+  if [ "$_sm_mode" = analyze ]; then
+    if [ "$_sm_to_do" -gt 0 ]; then
+      echo "Next: run '$US sm --dry' to preview, then '$US sm go' to apply."
+      [ "$_sm_c_no_url"  -gt 0 ] && echo "Tip:  add -i/--interactive to be prompted for missing URLs."
+      [ "$_sm_c_ignored" -gt 0 ] && echo "Tip:  '$US sm --list-ignored' to audit, or 'go --force' to override markers."
+    else
+      echo "Nothing to do."
+    fi
+    [ "$_sm_c_nested" -gt 0 ] && echo "Note: nested-in-submodule entries must be added from inside the parent submodule."
+    if [ "$_sm_c_moved" -gt 0 ]; then
+      echo "Note: MOVED entries are submodules whose on-disk path changed."
+      echo "      'go' will rebind each: remove the old .gitmodules entry,"
+      echo "      remove .git/modules/<OLD>/, untrack <OLD> from the index,"
+      echo "      and add the submodule fresh at the new path via the"
+      echo "      same URL.  Use -i to be warned about unpushed work."
+    fi
+    exit 0
+  fi
+
+  if [ "$_sm_to_do" -eq 0 ]; then
+    [ "$_sm_verbose" -eq 1 ] && echo "Nothing to do."
+    exit 0
+  fi
+
+  # ─── Dry ───
+  if [ "$_sm_mode" = dry ]; then
+    echo "Planned operations (dry run):"
+    while IFS="$(printf '\t')" read -r action sp url old; do
+      case "$action" in
+        add-with-untrack)
+          printf '  git rm --cached -r -- %s\n' "$sp"
+          printf '  git submodule add %s %s\n' "$url" "$sp"
+          ;;
+        add)
+          printf '  git submodule add %s %s\n' "$url" "$sp"
+          ;;
+        prompt-url)
+          printf '  [prompt for URL] git submodule add <url> %s\n' "$sp"
+          ;;
+        prompt-url-untrack)
+          printf '  [prompt for URL] then:\n'
+          printf '    git rm --cached -r -- %s\n' "$sp"
+          printf '    git submodule add <url> %s\n' "$sp"
+          ;;
+        rebind-moved)
+          printf '  # REBIND moved submodule: %s -> %s\n' "$old" "$sp"
+          printf '    (remove [submodule "%s"] from .gitmodules)\n' "$old"
+          printf '    git rm --cached -- %s\n' "$old"
+          printf '    rm -rf -- .git/modules/%s\n' "$old"
+          printf '    git submodule add %s %s\n' "$url" "$sp"
+          ;;
+      esac
+    done < "$_sm_plan"
+    echo
+    echo "Dry run complete. Re-run with 'go' to apply."
+    exit 0
+  fi
+
+  # ─── Go — apply ───
+  _sm_try_add_with_prompts() {
+    _sp=$1; _url=$2
+    _orig_url=$_url
+
+    if [ "$_sm_interactive" -eq 1 ]; then
+      while _sm_url_is_suspicious "$_url"; do
+        printf '\n    The URL "%s" uses an unusual scheme that often fails.\n' "$_url"
+        _ans=$(_sm_ask "    [U]se anyway / [E]dit / [S]kip / [I]gnore permanently / [A]bort? [U/e/s/i/a]: ")
+        case "$_ans" in
+          e|E)
+            _new=$(_sm_ask "    New URL: ")
+            _new=$(_sm_normalize_url "$_new")
+            if [ -n "$_new" ] && [ "$_new" != "$_url" ]; then
+              _pre_cfg=$(_sm_resolve_cfg "${_sp}/.git" "$_sp")
+              _sm_persist_url_change "$_pre_cfg" "$_new" "$_orig_url" || true
+              _url=$_new
+            fi
+            ;;
+          s|S) return 1 ;;
+          i|I)
+            _gp=$(_sm_gitpath_for "$_sp")
+            if [ -n "$_gp" ]; then
+              _sm_mark_ignored "$_gp" "$_sp" && return 3 || return 1
+            fi
+            return 1 ;;
+          a|A) return 2 ;;
+          u|U|'') break ;;
+          *) : ;;
+        esac
+      done
+    fi
+
+    _tmp="${_sp}${_sm_PREEXISTING_SUFFIX}$$"
+    INFLIGHT_ORIG="$_sp"; INFLIGHT_TMP="$_tmp"
+    mv -- "$_sp" "$_tmp"
+
+    while : ; do
+      printf 'ADD      %s  <-  %s\n' "$_sp" "$_url"
+      _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+      _sm_safe_git "$_sm_toplevel" submodule add "$_url" "$_sp" 2>"$_errlog"
+      _rc=$?
+
+      if [ "$_rc" -eq 0 ]; then
+        rm -f "$_errlog"
+        rm -rf -- "$_sp"
+        mv -- "$_tmp" "$_sp"
+        INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        return 0
+      fi
+
+      cat "$_errlog" >&2
+      _reason=other
+      if   grep -q 'is in submodule' "$_errlog" 2>/dev/null; then _reason=in-submodule
+      elif grep -q 'already exists in the index' "$_errlog" 2>/dev/null; then _reason=in-index
+      elif grep -q 'A git directory for .* is found locally' "$_errlog" 2>/dev/null; then _reason=stale-gitdir
+      elif grep -q 'Repository not found\|Could not read from remote\|does not appear to be a git repository\|Operation timed out\|Connection timed out\|Could not resolve host\|Name or service not known' "$_errlog" 2>/dev/null; then _reason=bad-url
+      fi
+      rm -f "$_errlog"
+
+      printf 'ERROR  git submodule add failed for %s (reason: %s)\n' "$_sp" "$_reason" >&2
+
+      if [ "$_reason" = in-submodule ]; then
+        rm -rf -- "$_sp" 2>/dev/null || true
+        mv -- "$_tmp" "$_sp"
+        INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        if [ "$_sm_interactive" -ne 1 ]; then
+          echo "    (path lives inside an existing submodule — skipping)" >&2
+          return 1
+        fi
+        _enc=$(_sm_enclosing_submodule "$_sp" || true)
+        printf '\n    %s lives inside an existing submodule%s.\n' \
+          "$_sp" "$([ -n "$_enc" ] && printf ' (%s)' "$_enc")"
+        printf '    Options: [S]kip / [P]arent-add / [I]gnore / [A]bort\n'
+        _ans=$(_sm_ask "    Choice? [S/p/i/a]: ")
+        case "$_ans" in
+          p|P)
+            [ -z "$_enc" ] && { echo "    (no enclosing submodule — skipping)" >&2; return 1; }
+            _rel=${_sp#"$_enc"/}
+            printf '\n    Run inside the enclosing submodule:\n'
+            printf '        cd %s && git submodule add %s %s && cd -\n' "$_enc" "$_url" "$_rel"
+            printf '        git add %s\n' "$_enc"
+            printf '    Press Enter to continue (skipping for now)...'
+            _sm_ask '' >/dev/null
+            return 1 ;;
+          i|I)
+            _gp=$(_sm_gitpath_for "$_sp")
+            [ -n "$_gp" ] && _sm_mark_ignored "$_gp" "$_sp" && return 3
+            return 1 ;;
+          a|A) return 2 ;;
+          *)   return 1 ;;
+        esac
+      fi
+
+      if [ "$_reason" = in-index ]; then
+        echo "    (still in index; try: git rm --cached -r -- $_sp, then re-run)" >&2
+        rm -rf -- "$_sp" 2>/dev/null || true
+        mv -- "$_tmp" "$_sp"
+        INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        return 1
+      fi
+
+      if [ "$_reason" = stale-gitdir ]; then
+        _stale_gitdir="$_sm_toplevel/.git/modules/$_sp"
+        _stale_url=''
+        if [ -f "$_stale_gitdir/config" ]; then
+          _stale_url=$(git config -f "$_stale_gitdir/config" --get remote.origin.url 2>/dev/null || true)
+        fi
+        if [ "$_sm_interactive" -ne 1 ]; then
+          printf '    stale gitdir at %s (remote=%s) — skipping\n' \
+            "$_stale_gitdir" "${_stale_url:-unknown}" >&2
+          rm -rf -- "$_sp" 2>/dev/null || true
+          mv -- "$_tmp" "$_sp"
+          INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+          return 1
+        fi
+        printf '\n    A stale submodule gitdir already exists:\n'
+        printf '        %s\n' "$_stale_gitdir"
+        [ -n "$_stale_url" ] && printf '        (remembers origin=%s)\n' "$_stale_url"
+        printf '    This is leftover from an earlier interrupted run.\n'
+        printf '    Options:\n'
+        printf '      [R]euse   — pass --force to git submodule add (keeps existing gitdir)\n'
+        printf '      [D]elete  — remove the stale gitdir, then retry fresh\n'
+        printf '      [S]kip    — leave as-is for now\n'
+        printf '      [I]gnore  — write ignore marker\n'
+        printf '      [A]bort\n'
+        _ans=$(_sm_ask "    Choice? [R/d/s/i/a]: ")
+        case "$_ans" in
+          r|R)
+            printf 'ADD      %s  <-  %s   [--force reusing stale gitdir]\n' "$_sp" "$_url"
+            _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+            _sm_safe_git "$_sm_toplevel" submodule add --force "$_url" "$_sp" 2>"$_errlog"
+            _rc=$?
+            if [ "$_rc" -eq 0 ]; then
+              rm -f "$_errlog"
+              rm -rf -- "$_sp"
+              mv -- "$_tmp" "$_sp"
+              INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+              return 0
+            fi
+            cat "$_errlog" >&2
+            rm -f "$_errlog"
+            printf 'ERROR  --force retry also failed for %s\n' "$_sp" >&2
+            rm -rf -- "$_sp" 2>/dev/null || true
+            mv -- "$_tmp" "$_sp"
+            INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+            return 1
+            ;;
+          d|D)
+            printf '    removing %s\n' "$_stale_gitdir"
+            rm -rf -- "$_stale_gitdir" || {
+              echo "    (failed to remove — skipping)" >&2
+              rm -rf -- "$_sp" 2>/dev/null || true
+              mv -- "$_tmp" "$_sp"
+              INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+              return 1
+            }
+            _sm_remove_gitmodules_entry "$_sp" || true
+            rm -rf -- "$_sp" 2>/dev/null || true
+            continue
+            ;;
+          i|I)
+            rm -rf -- "$_sp" 2>/dev/null || true
+            mv -- "$_tmp" "$_sp"
+            INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+            _gp=$(_sm_gitpath_for "$_sp")
+            [ -n "$_gp" ] && _sm_mark_ignored "$_gp" "$_sp" && return 3
+            return 1
+            ;;
+          a|A)
+            rm -rf -- "$_sp" 2>/dev/null || true
+            mv -- "$_tmp" "$_sp"
+            INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+            return 2
+            ;;
+          *)
+            rm -rf -- "$_sp" 2>/dev/null || true
+            mv -- "$_tmp" "$_sp"
+            INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+            return 1
+            ;;
+        esac
+      fi
+
+      if [ "$_sm_interactive" -ne 1 ]; then
+        rm -rf -- "$_sp" 2>/dev/null || true
+        mv -- "$_tmp" "$_sp"
+        INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        return 2
+      fi
+
+      _ans=$(_sm_ask "    [R]etry with new URL / [S]kip / [I]gnore / [A]bort? [R/s/i/a]: ")
+      case "$_ans" in
+        s|S) rm -rf -- "$_sp" 2>/dev/null || true; mv -- "$_tmp" "$_sp"
+             INFLIGHT_ORIG=""; INFLIGHT_TMP=""; return 1 ;;
+        i|I) rm -rf -- "$_sp" 2>/dev/null || true; mv -- "$_tmp" "$_sp"
+             INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+             _gp=$(_sm_gitpath_for "$_sp")
+             [ -n "$_gp" ] && _sm_mark_ignored "$_gp" "$_sp" && return 3
+             return 1 ;;
+        a|A) rm -rf -- "$_sp" 2>/dev/null || true; mv -- "$_tmp" "$_sp"
+             INFLIGHT_ORIG=""; INFLIGHT_TMP=""; return 2 ;;
+        *)
+          _new=$(_sm_ask "    New URL: ")
+          _new=$(_sm_normalize_url "$_new")
+          if [ -z "$_new" ]; then
+            rm -rf -- "$_sp" 2>/dev/null || true; mv -- "$_tmp" "$_sp"
+            INFLIGHT_ORIG=""; INFLIGHT_TMP=""; return 1
+          fi
+          if [ -e "$_tmp/.git" ]; then
+            _rt_cfg=$(_sm_resolve_cfg "$_tmp/.git" "$_tmp")
+            _sm_persist_url_change "$_rt_cfg" "$_new" "$_orig_url" || true
+          fi
+          rm -rf -- "$_sp" 2>/dev/null || true
+          _url=$_new
+          _sm_remove_gitmodules_entry "$_sp" || true
+          continue
+          ;;
+      esac
+    done
+  }
+
+  [ "$_sm_verbose" -eq 1 ] && echo "Applying..."
+  _sm_added=0; _sm_skipped=0; _sm_newly_ignored=0; _sm_rebound=0
+  while IFS="$(printf '\t')" read -r action sp url old; do
+    case "$action" in
+      rebind-moved)
+        printf '\nREBIND   %s -> %s\n' "$old" "$sp"
+        printf '    url: %s\n' "$url"
+        _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
+        if [ -n "$_risk_msg" ]; then
+          printf '    warning: nested repo at %s has: %s\n' "$sp" "$_risk_msg"
+          printf '    The rebind re-clones from origin and would lose this.\n'
+          if [ "$_sm_interactive" -eq 1 ]; then
+            _ans=$(_sm_ask "    [P]roceed / [S]kip / [A]bort? [p/S/a]: ")
+            case "$_ans" in
+              p|P) : ;;
+              a|A) echo "Aborted by user." >&2; exit 1 ;;
+              *)   echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
+            esac
+          else
+            echo "    skipped (re-run with -i to confirm, or push/commit first)."
+            _sm_skipped=$((_sm_skipped + 1))
+            continue
+          fi
+        fi
+        if [ -f .gitmodules ]; then
+          printf '    removing [submodule "%s"] from .gitmodules\n' "$old"
+          _sm_remove_gitmodules_entry "$old" || {
+            echo "    error: could not edit .gitmodules — skipping" >&2
+            _sm_skipped=$((_sm_skipped + 1))
+            continue
+          }
+        fi
+        if git ls-files --error-unmatch -- "$old" >/dev/null 2>&1; then
+          printf '    git rm --cached -- %s\n' "$old"
+          git rm --cached --quiet -- "$old" 2>/dev/null || true
+        fi
+        _stale="$_sm_toplevel/.git/modules/$old"
+        if [ -e "$_stale" ]; then
+          printf '    rm -rf -- %s\n' "$_stale"
+          rm -rf -- "$_stale"
+        fi
+        _sm_try_add_with_prompts "$sp" "$url"
+        _rc=$?
+        case "$_rc" in
+          0) _sm_rebound=$((_sm_rebound + 1)) ;;
+          1) _sm_skipped=$((_sm_skipped + 1)) ;;
+          2) echo "Aborted by user." >&2; exit 1 ;;
+          3) _sm_newly_ignored=$((_sm_newly_ignored + 1)) ;;
+        esac
+        continue
+        ;;
+    esac
+
+    case "$action" in
+      prompt-url|prompt-url-untrack)
+        printf '\n    No origin URL recorded for %s.\n' "$sp"
+        if [ "$_sm_interactive" -eq 1 ]; then
+          _ans=$(_sm_ask "    Enter URL, or [I]gnore permanently, [A]bort, or blank to skip: ")
+        else
+          _ans=$(_sm_ask "    Enter URL, or [A]bort, or blank to skip: ")
+        fi
+        case "$_ans" in
+          i|I)
+            _gp=$(_sm_gitpath_for "$sp")
+            if [ -n "$_gp" ] && _sm_mark_ignored "$_gp" "$sp"; then
+              _sm_newly_ignored=$((_sm_newly_ignored + 1))
+            else
+              _sm_skipped=$((_sm_skipped + 1))
+            fi
+            continue ;;
+          a|A) echo "Aborted by user." >&2; exit 1 ;;
+          '')  echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
+          *)   url=$(_sm_normalize_url "$_ans") ;;
+        esac
+        ;;
+    esac
+
+    case "$action" in
+      add-with-untrack|prompt-url-untrack)
+        printf 'UNTRACK  %s\n' "$sp"
+        git rm --cached -r --quiet -- "$sp"
+        ;;
+    esac
+
+    _sm_try_add_with_prompts "$sp" "$url"
+    _rc=$?
+    case "$_rc" in
+      0) _sm_added=$((_sm_added + 1)) ;;
+      1) _sm_skipped=$((_sm_skipped + 1)) ;;
+      2) echo "Aborted by user." >&2; exit 1 ;;
+      3) _sm_newly_ignored=$((_sm_newly_ignored + 1)) ;;
+    esac
+  done < "$_sm_plan"
+
+  echo
+  printf 'Added: %s    Rebound: %s    Skipped: %s    Newly ignored: %s\n' \
+    "$_sm_added" "$_sm_rebound" "$_sm_skipped" "$_sm_newly_ignored"
+  if [ "$_sm_added" -gt 0 ] || [ "$_sm_rebound" -gt 0 ] || [ "$_sm_c_need_untrack" -gt 0 ]; then
+    echo "Review and commit:  git status  &&  git commit -m 'Register/rebind nested submodules'"
+  fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+# ═══ MAIN dispatcher ═══════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+
+main() {
+  # ─── Pre-dispatch: peel globals / --config / --create-config / --help ───
+  _want_create_config=0
+  _want_help=""
+  _rest=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -V|--verbose)      VRB=1 ;;
+      -VV)               VRB=1; VERYVRB=1 ;;
+      -D|--debug)        DBG=1; VRB=1 ;;
+      -DD|--deepdbg)     DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      --config)          shift; CONFIG_FILE=${1:-}; [ -n "$CONFIG_FILE" ] || fatal "--config: missing argument" ;;
+      --config=*)        CONFIG_FILE=${1#--config=} ;;
+      --create-config)   _want_create_config=1 ;;
+      -h|--help)
+        # `--help [topic]` — peek next arg
+        if [ $# -ge 2 ]; then
+          case "$2" in
+            -*|'')  _want_help=top ;;
+            *)      _want_help=$2; shift ;;
+          esac
+        else
+          _want_help=top
+        fi
+        ;;
+      --)                shift; while [ $# -gt 0 ]; do _rest="$_rest $(shell_escape "$1")"; shift; done; break ;;
+      -*)                _rest="$_rest $(shell_escape "$1")" ;;
+      *)                 _rest="$_rest $(shell_escape "$1")"; shift; while [ $# -gt 0 ]; do _rest="$_rest $(shell_escape "$1")"; shift; done; break ;;
+    esac
+    shift
+  done
+
+  if [ -n "$_want_help" ]; then
+    show_help "$_want_help"
+    exit 0
+  fi
+
+  if [ "$_want_create_config" -eq 1 ]; then
+    create_config
+    exit 0
+  fi
+
+  load_config
+
+  # ─── Rebuild argv from $_rest ───
+  # shellcheck disable=SC2086
+  eval "set -- $_rest"
+
+  # ─── No subcommand → legacy default: status (piped through less if TTY) ───
+  if [ $# -eq 0 ]; then
+    if [ -t 1 ]; then
+      cmd_status | less -R
+    else
+      cmd_status
+    fi
+    exit $?
+  fi
+
+  _sub=$1; shift
+  case "$_sub" in
+    status|st|s)                cmd_status "$@" ;;
+    masscommits|mc|c)           cmd_masscommits "$@" ;;
+    go)
+      log_warn "'go' is deprecated; use 'mc' or 'masscommits'"
+      cmd_masscommits "$@" ;;
+    submodules|sub|sm)          cmd_submodules "$@" ;;
+    claude-check)               cmd_claude_check "$@" ;;
+    help)                       show_help "${1:-top}" ;;
+    -h|--help)                  show_help top ;;
+    *)
+      log_error "unknown subcommand: $_sub"
+      echo >&2
+      show_help_top >&2
+      exit 64
+      ;;
+  esac
+}
+
+main "$@"
