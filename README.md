@@ -61,7 +61,7 @@ my-git claude-check            # audit .claude/ symlink convention
 
 | Subcommand      | Aliases        | What it does                                                                      |
 |-----------------|----------------|-----------------------------------------------------------------------------------|
-| `status`        | `st`, `s`      | List git status for each scoped repo + submodules (recursive, indented)           |
+| `status`        | `st`, `s`      | Compact tree summary (one line per repo); `-V` = per-node porcelain listing       |
 | `masscommits`   | `mc`, `c`, `go`| Bottom-up add + commit + push through submodule tree; runs `.claude` audit first  |
 | `submodules`    | `sm`, `sub`    | Discover & register nested git repos as proper submodules                         |
 | `claude-check`  |                | Audit `.claude/` symlink convention (read-only by default)                        |
@@ -86,6 +86,31 @@ Two independent axes. Debug implies verbose.
 `-DD` also enables `set -x` for deep tracing. Never design output that only
 makes sense for a specific `-V + -D` combo — pick one axis per block.
 
+## Status output
+
+Default is a one-line-per-repo ascii-art tree. Each line renders the repo's
+branch position in the tree followed by its state summary:
+
+```text
+/LINKS/global                    CLEAN :))
+├── src                          DIRTY (18)  [M:1 ??:17]
+│   ├── py/my-plex [unregistered]  CLEAN :))
+│   └── sh/my-git [unregistered]   DIRTY (2)  [M:2]
+└── etc                          CLEAN, ahead 1
+```
+
+States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
+`DIVERGED (ahead X, behind Y)`, `CLEAN (no remote for B)`,
+`DIRTY (N) [M:.. A:.. D:.. R:.. ??:..]`, `[SKIPPED — cross-user policy]`,
+`[ERROR …]`.
+
+The tree includes **both** registered submodules and unregistered nested
+git repos found on disk; unregistered ones are tagged `[unregistered]`.
+Run `my-git sm go` to register them. Nested repos with
+`.git/my-git-submodules.ignore` are suppressed from the tree.
+
+`my-git -V st` falls back to the per-node porcelain listing (legacy form).
+
 ## Examples
 
 ```sh
@@ -108,23 +133,42 @@ my-git -DD st /LINKS/global/src
 2. **No paths + CWD is inside a git repo** — operate on that repo + its submodules.
 3. **No paths + not in a repo** — fall back to `$GIT_REPOS` from config.
 
-## Privilege (sudo / su)
+## Privilege (sudo / su / policy)
 
 When a repo's `.git` is owned by a different user than the caller,
-`my-git` switches user **only for that repo** using whichever mechanism
-makes sense:
+`my-git` switches user **only for that repo**. Running as root always
+works (plain `su <owner> -c ...`, no password). For non-root callers,
+behavior is governed by two policy variables in the config:
 
 | Caller    | Repo owner    | Mechanism                             |
 |-----------|---------------|---------------------------------------|
 | user      | same user     | direct exec — no escalation           |
-| user A    | user B        | `sudo su B -c ...` (sudo prompts)     |
-| root      | user B        | `su B -c ...` — **drops rights**, no password |
+| root      | user B        | `su B -c ...` — drops rights, no password |
 | root      | root          | direct exec                           |
+| user A    | root          | `PRIV_POLICY_USER_TO_ROOT` (default `warn`) |
+| user A    | user B        | `PRIV_POLICY_USER_TO_USER` (default `fail`) |
+
+Each policy variable takes one of:
+
+| Value    | Behavior                                                                   |
+|----------|----------------------------------------------------------------------------|
+| `sudo`   | escalate via `sudo su <owner>` — requires sudo rights (macOS: `admin` / `wheel` / `sudo` group). If caller has no sudo rights, degrades to `fail`. |
+| `fail`   | ERROR and abort the whole run.                                             |
+| `ignore` | silently skip this repo; continue with the rest.                           |
+| `warn`   | print a `WARN:` line to stderr and skip this repo; continue with the rest. |
 
 So running `my-git` as root on a tree where most repos are user-owned
 does **not** leave every git invocation running as root — each repo's
-commands run as its actual owner. Set `ALLOW_SUDO_SU=0` in the config to
-refuse cross-owner repos outright.
+commands run as its actual owner. A non-root user running `my-git` over
+a tree that mixes their own repos with a root-owned super-repo will by
+default get warnings for the root-owned nodes and full operation on the
+rest.
+
+**Scope-level vs deep-level fail:** root-level policy violations (the
+top of `GIT_REPOS` / an explicit argument) abort the whole run cleanly
+via the parent shell. Policy violations discovered deeper in the
+submodule walk can only be reported per-node (shell subshell limits);
+those print `[ERROR]` and skip that subtree without aborting the run.
 
 ## `.claude` setup enforcement
 

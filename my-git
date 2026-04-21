@@ -9,17 +9,6 @@
 US=${0##*/}
 ME=$(id -un 2>/dev/null || echo "$USER")
 
-# ─── Defaults (overridden by config file) ────────────────────────────────
-GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
-CHECK_CLAUDE_SETUP=1
-CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
-COMMIT_MSG_LAST_N=3
-COMMIT_MSG_DIFF_MAX_FILES=10
-ALLOW_SUDO_SU=1
-DEFAULT_VERBOSE=0
-DEFAULT_DEBUG=0
-SM_AUTO_SAFE_DIRECTORY=1
-
 # ─── Runtime flags ───────────────────────────────────────────────────────
 VRB=0; VERYVRB=0; DBG=0; DEEPDBG=0
 CONFIG_FILE=""
@@ -64,12 +53,25 @@ CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
 COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
 
-# ─── Privilege ──────────────────────────────────────────────────────────
-# 1 = switch user when repo owner differs from current user:
-#       running as root -> 'su <owner> -c ...'       (drop rights, no password)
-#       running as user -> 'sudo su <owner> -c ...'  (sudo prompt, then su)
-# 0 = refuse to touch cross-owner repos (hard error)
-ALLOW_SUDO_SU=1
+# ─── Privilege: cross-user policy ───────────────────────────────────────
+# Controls what happens when the current user differs from the repo's
+# .git owner. Running as root ALWAYS just works (plain 'su <owner> -c ...',
+# no password, no policy). These two policies apply only when the caller
+# is a non-root user.
+#
+# Policy values:
+#   sudo    - escalate via 'sudo su <owner> -c ...' (requires sudo rights;
+#             macOS: caller must be in 'admin'/'wheel'/'sudo' group;
+#             if no rights, behaves like 'fail')
+#   fail    - ERROR and abort the whole run
+#   ignore  - silently skip this repo, continue with the rest
+#   warn    - print a warning and skip this repo, continue with the rest
+
+# user (non-root) operating on a root-owned repo:
+PRIV_POLICY_USER_TO_ROOT=warn
+
+# user A (non-root) operating on user B's (non-root) repo:
+PRIV_POLICY_USER_TO_USER=fail
 
 # ─── Default verbosity / debug ──────────────────────────────────────────
 # 1 = always behave as -V / -D (CLI flag can still raise the level)
@@ -106,6 +108,12 @@ load_config() {
     exit 2
   fi
   log_dbg_med "config: $_cf"
+  # All values come from the user's config. Defaults are NOT baked into
+  # my-git at runtime — they live only inside _default_config_content(),
+  # which --create-config writes to the config file. If the user's config
+  # is missing variables that my-git depends on, that is the user's
+  # responsibility: re-run --create-config (to a fresh path and diff) to
+  # see what is expected.
   # shellcheck disable=SC1090
   . "$_cf"
   # Apply defaults from config to runtime flags (CLI flags can still escalate).
@@ -167,6 +175,84 @@ need_sudo_for() {
   if [ -n "$_o" ] && [ "$_o" != "$ME" ]; then echo 1; else echo 0; fi
 }
 
+has_sudo_rights() {
+  # True if the current user is entitled to sudo. Checks admin/wheel/sudo
+  # group membership (covers macOS 'admin', Linux 'sudo'/'wheel'), then
+  # falls back to a non-interactive 'sudo -n -v' probe (succeeds only if
+  # credentials are cached OR NOPASSWD is configured — still a positive
+  # signal). If neither indicator says yes, we say no.
+  _me=${ME}
+  _groups=$(id -Gn "$_me" 2>/dev/null | tr ' ' '\n')
+  for _g in admin wheel sudo; do
+    printf '%s\n' "$_groups" | grep -qx "$_g" && return 0
+  done
+  sudo -n -v 2>/dev/null && return 0
+  return 1
+}
+
+# check_priv <repo>
+#   Decide whether to proceed with an operation on <repo> given current
+#   user, repo owner, and configured policy. Echoes ONE of:
+#     exec        — proceed (direct exec or su/sudo under the hood)
+#     skip        — policy=ignore: skip silently
+#     warn        — policy=warn: WARN already printed to stderr; skip
+#     fail:<msg>  — policy=fail (or sudo-without-rights, or bad policy
+#                   value): caller must log_error+fatal
+#   This function itself NEVER calls fatal() because it is usually invoked
+#   inside $(...), where fatal's exit would only kill the subshell.
+check_priv() {
+  _repo=$1
+  _gd=$_repo/.git
+  [ -e "$_gd" ] || { echo exec; return; }
+  _owner=$(file_owner "$_gd")
+  if [ -z "$_owner" ] || [ "$_owner" = "$ME" ] || [ "$ME" = "root" ]; then
+    echo exec; return
+  fi
+  if [ "$_owner" = "root" ]; then
+    _pol=${PRIV_POLICY_USER_TO_ROOT:-fail}
+    _polvar=PRIV_POLICY_USER_TO_ROOT
+  else
+    _pol=${PRIV_POLICY_USER_TO_USER:-fail}
+    _polvar=PRIV_POLICY_USER_TO_USER
+  fi
+  case "$_pol" in
+    sudo)
+      if has_sudo_rights; then
+        echo exec
+      else
+        echo "fail:$_repo: owned by $_owner; $_polvar=sudo but $ME has no sudo rights"
+      fi
+      ;;
+    ignore)
+      echo skip
+      ;;
+    warn)
+      log_warn "$_repo: owned by $_owner — skipping ($_polvar=warn)"
+      echo warn
+      ;;
+    fail)
+      echo "fail:$_repo: owned by $_owner; $_polvar=fail"
+      ;;
+    *)
+      echo "fail:$_polvar has invalid value '$_pol' (expected: sudo|fail|ignore|warn)"
+      ;;
+  esac
+}
+
+# priv_gate <repo>
+#   Wrapper around check_priv that MUST be called in the PARENT shell
+#   (not inside $()) so fatal() can exit the whole run. Sets the global
+#   PRIV_ACTION to one of: exec | skip | warn. If the policy is 'fail',
+#   calls fatal and terminates the process.
+priv_gate() {
+  PRIV_ACTION=$(check_priv "$1")
+  case "$PRIV_ACTION" in
+    fail:*) fatal "${PRIV_ACTION#fail:}" 13 ;;
+    exec|skip|warn) : ;;
+    *) fatal "internal: unknown priv action '$PRIV_ACTION'" 14 ;;
+  esac
+}
+
 # _xuser_exec <target_user> <repo> <cmd...>
 #   Execute a command in <repo> as <target_user>, picking the right
 #   mechanism for the current user:
@@ -188,8 +274,18 @@ _xuser_exec() {
 
 run_as_owner() {
   # run_as_owner <repo_worktree> <cmd> [args...]
-  #   Runs cmd in $repo as the .git owner. If current user == owner: direct
-  #   exec. If differs: 'su' (from root) or 'sudo su' (from non-root).
+  #   Runs cmd in $repo as the .git owner. Dispatch:
+  #     same user:  direct exec
+  #     caller=root: plain 'su <owner> -c ...' (always allowed)
+  #     cross-user: governed by PRIV_POLICY_USER_TO_{ROOT,USER}
+  #
+  # Policy NOTE: run_as_owner itself does NOT call priv_gate — it is often
+  # invoked inside $(...) (e.g. from list_direct_submodules), where
+  # priv_gate's fatal() couldn't exit the whole run. Callers that drive
+  # a repo (status_one, commit_one) must call priv_gate FIRST and only
+  # invoke run_as_owner when PRIV_ACTION = exec. When called in a context
+  # where the caller hasn't gated, cross-user access simply proceeds via
+  # _xuser_exec (which may then fail naturally if it's not permitted).
   _repo=$1; shift
   _gitdir=$_repo/.git
   [ -e "$_gitdir" ] || { log_error "run_as_owner: no .git at $_repo"; return 1; }
@@ -199,15 +295,12 @@ run_as_owner() {
     ( cd "$_repo" && "$@" )
     return $?
   fi
-  if [ "$ALLOW_SUDO_SU" != 1 ]; then
-    log_error "$_repo: owned by $_owner, current user $ME — ALLOW_SUDO_SU=0 refuses"
-    return 1
-  fi
   _xuser_exec "$_owner" "$_repo" "$@"
 }
 
 run_as_owner_capture() {
   # As run_as_owner, but captures stdout. Trailing newline stripped by $().
+  # See run_as_owner for policy notes: no priv_gate call here.
   _repo=$1; shift
   _gitdir=$_repo/.git
   [ -e "$_gitdir" ] || return 1
@@ -216,7 +309,6 @@ run_as_owner_capture() {
     ( cd "$_repo" && "$@" )
     return $?
   fi
-  [ "$ALLOW_SUDO_SU" = 1 ] || { log_error "$_repo: cross-owner + ALLOW_SUDO_SU=0"; return 1; }
   _xuser_exec "$_owner" "$_repo" "$@"
 }
 
@@ -245,6 +337,44 @@ list_direct_submodules() {
         [ -n "$_sub" ] || continue
         [ -e "$_r/$_sub/.git" ] && printf '%s\n' "$_sub"
       done
+}
+
+# list_unregistered_nested <repo>
+#   Print paths (relative to $repo) of DIRECT nested git repos that are NOT
+#   registered in $repo/.gitmodules — i.e. embedded/unregistered repos. Skips
+#   descendants of registered submodules (those are that sub's concern) and
+#   any repo marked with .git/my-git-submodules.ignore (see 'sm' subcommand).
+#   Also dedupes: if an unregistered repo contains another nested repo, only
+#   the shallower one is returned (descent into it happens via walk_tree_lines).
+list_unregistered_nested() {
+  _r=$1
+  [ -d "$_r" ] || return 0
+  _regtmp=/tmp/$US.reg.$$
+  run_as_owner_capture "$_r" git config -f .gitmodules \
+    --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
+  ( cd "$_r" 2>/dev/null || exit 0
+    # -prune after .git so find doesn't descend into .git/ internals.
+    find . -mindepth 2 -name .git -print -prune 2>/dev/null
+  ) | sed -e 's|^\./||' -e 's|/\.git$||' | sort | awk -v reg="$_regtmp" '
+      BEGIN {
+        nr = 0
+        while ((getline r < reg) > 0) if (r != "") registered[++nr] = r
+      }
+      {
+        for (i = 1; i <= nr; i++) {
+          if ($0 == registered[i] || index($0, registered[i] "/") == 1) next
+        }
+        if (last != "" && index($0, last "/") == 1) next
+        print
+        last = $0
+      }' | while IFS= read -r _sub; do
+    [ -n "$_sub" ] || continue
+    _gd=$(_sm_resolve_gitdir "$_r/$_sub/.git" "$_r/$_sub")
+    [ -e "$_gd/$_sm_IGNORE_MARKER" ] && continue
+    printf '%s\n' "$_sub"
+  done
+  rm -f "$_regtmp"
 }
 
 # walk_submodules <repo>
@@ -314,6 +444,106 @@ resolve_scope() {
 }
 
 # ─── Status subcommand ──────────────────────────────────────────────────
+# walk_tree_lines <abs_path> <display> <branch_prefix> <child_prefix> <tag>
+#   Pre-order DFS emitting one TAB-separated line per node:
+#     <branch_prefix>\t<abs_path>\t<display>\t<tag>
+#   <branch_prefix> : box-drawing prefix printed before the display name.
+#   <tag>           : "" for root, "reg" for registered submodule,
+#                     "unreg" for embedded/unregistered nested git repo.
+#   Does NOT descend into repos that cross-user policy says we can't read.
+walk_tree_lines() (
+  _root=$1; _display=$2; _pfx=$3; _cpfx=$4; _tag=$5
+  printf '%s\t%s\t%s\t%s\n' "$_pfx" "$_root" "$_display" "$_tag"
+  _action=$(check_priv "$_root")
+  [ "$_action" = "exec" ] || return 0
+  _subs_reg=$(list_direct_submodules "$_root")
+  _subs_unreg=$(list_unregistered_nested "$_root")
+  _all=$(printf '%s\n%s\n' "$_subs_reg" "$_subs_unreg" | grep -v '^$' | sort -u)
+  [ -z "$_all" ] && return 0
+  _total=$(printf '%s\n' "$_all" | grep -c .)
+  _i=0
+  printf '%s\n' "$_all" | while IFS= read -r _sub; do
+    [ -n "$_sub" ] || continue
+    _i=$((_i + 1))
+    if [ "$_i" -eq "$_total" ]; then
+      _my_pfx="${_cpfx}└── "
+      _my_cpfx="${_cpfx}    "
+    else
+      _my_pfx="${_cpfx}├── "
+      _my_cpfx="${_cpfx}│   "
+    fi
+    if printf '%s\n' "$_subs_reg" | grep -qxF "$_sub"; then
+      _ntag=reg
+    else
+      _ntag=unreg
+    fi
+    walk_tree_lines "$_root/$_sub" "$_sub" "$_my_pfx" "$_my_cpfx" "$_ntag"
+  done
+)
+
+# status_summary <repo>
+#   Print ONE compact line describing the repo's state. Handles cross-user
+#   policy, errors, dirty counts, ahead/behind/diverged. Never multiline.
+status_summary() {
+  _r=$1
+  is_git_repo "$_r" || { echo "[ERROR no .git]"; return 1; }
+  _action=$(check_priv "$_r")
+  case "$_action" in
+    fail:*) printf '[ERROR] %s\n' "${_action#fail:}"; return 1 ;;
+    skip|warn) echo "[SKIPPED — cross-user policy]"; return 0 ;;
+  esac
+  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
+  _rc=$?
+  [ "$_rc" -ne 0 ] && { echo "[ERROR git status failed]"; return 1; }
+  if [ -n "$_porc" ]; then
+    _total=$(printf '%s\n' "$_porc" | grep -c .)
+    _tally=$(printf '%s\n' "$_porc" | awk '
+      /^\?\?/ { u++; next }
+      {
+        x=substr($0,1,1); y=substr($0,2,1)
+        if (x=="M" || y=="M") m++
+        else if (x=="A" || y=="A") a++
+        else if (x=="D" || y=="D") d++
+        else if (x=="R" || y=="R") r++
+        else other++
+      }
+      END {
+        s=""
+        if (m) s=s" M:"m
+        if (a) s=s" A:"a
+        if (d) s=s" D:"d
+        if (r) s=s" R:"r
+        if (u) s=s" ??:"u
+        if (other) s=s" ?:"other
+        sub(/^ /,"",s)
+        print s
+      }')
+    printf 'DIRTY (%d)  [%s]\n' "$_total" "$_tally"
+    return 0
+  fi
+  _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  _rem_ref=origin/$_branch
+  _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null \
+    | grep -E "^[[:space:]]*remotes/$_rem_ref$" || true)
+  if [ -z "$_has_remote" ]; then
+    printf 'CLEAN (no remote for %s)\n' "$_branch"
+    return 0
+  fi
+  _ab=$(run_as_owner_capture "$_r" git rev-list --left-right --count \
+    "${_rem_ref}...${_branch}" 2>/dev/null)
+  _behind=$(printf '%s' "$_ab" | awk '{print $1+0}')
+  _ahead=$(printf '%s' "$_ab" | awk '{print $2+0}')
+  if [ "${_ahead:-0}" -gt 0 ] && [ "${_behind:-0}" -gt 0 ]; then
+    printf 'DIVERGED (ahead %s, behind %s)\n' "$_ahead" "$_behind"
+  elif [ "${_ahead:-0}" -gt 0 ]; then
+    printf 'CLEAN, ahead %s\n' "$_ahead"
+  elif [ "${_behind:-0}" -gt 0 ]; then
+    printf 'CLEAN, behind %s\n' "$_behind"
+  else
+    echo "CLEAN :))"
+  fi
+}
+
 # Print porcelain status + branch divergence for a single repo, indented.
 # Error codes 021-034 preserved from the original script where applicable.
 status_one() {
@@ -321,6 +551,22 @@ status_one() {
   _ind=$(indent_for "$_depth")
   # Only run if the repo's .git is accessible to this process (via run_as_owner).
   is_git_repo "$_r" || { printf '%s > %s: [ERROR no .git]\n' "$_ind" "$_r"; return 1; }
+
+  # Per-node cross-user policy check. status_one runs inside a pipeline
+  # subshell, so fatal() can't abort the whole run from here — we treat
+  # 'fail' at this depth as "print ERROR and skip this node" (root-level
+  # fails are caught by priv_gate in cmd_status, which IS the parent).
+  _action=$(check_priv "$_r")
+  case "$_action" in
+    fail:*)
+      printf '%s > %s: [ERROR] %s\n' "$_ind" "$_r" "${_action#fail:}"
+      return 1
+      ;;
+    skip|warn)
+      printf '%s > %s: [SKIPPED — cross-user policy]\n' "$_ind" "$_r"
+      return 0
+      ;;
+  esac
 
   _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>&1)
   _rc=$?
@@ -375,18 +621,48 @@ cmd_status() {
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to inspect"; exit 1; }
 
-  printf '%s\n' "$_roots" | while IFS= read -r _root; do
+  # Iterate roots in the PARENT shell (via a for-loop over a tmpfile) so
+  # that priv_gate's fatal() actually aborts the whole run on policy=fail.
+  _rtmp=/tmp/$US.roots.$$
+  printf '%s\n' "$_roots" > "$_rtmp"
+  _first=1
+  while IFS= read -r _root; do
     [ -n "$_root" ] || continue
-    _nodes=$(walk_submodules "$_root")
-    # walk_submodules returns post-order (leaves first). For status we want
-    # top-down readability: super first, then its children. Reverse.
-    printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
-      | while IFS= read -r _node; do
-          [ -n "$_node" ] || continue
-          _d=$(depth_of "$_root" "$_node")
-          status_one "$_node" "$_d"
-        done
-  done
+    priv_gate "$_root"
+    [ "$_first" = 1 ] || printf '\n'
+    _first=0
+    case "$PRIV_ACTION" in
+      skip)
+        continue
+        ;;
+      warn)
+        printf '%s  [SKIPPED — cross-user policy]\n' "$_root"
+        continue
+        ;;
+    esac
+    if [ "$VRB" = 1 ]; then
+      # Verbose: original per-node porcelain output, indented by depth.
+      _nodes=$(walk_submodules "$_root")
+      # walk_submodules returns post-order (leaves first). For status we want
+      # top-down readability: super first, then its children. Reverse.
+      printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
+        | while IFS= read -r _node; do
+            [ -n "$_node" ] || continue
+            _d=$(depth_of "$_root" "$_node")
+            status_one "$_node" "$_d"
+          done
+    else
+      # Default: compact one-line-per-repo tree.
+      walk_tree_lines "$_root" "$_root" "" "" "" \
+        | while IFS="$(printf '\t')" read -r _pfx _abs _disp _tag; do
+            _sum=$(status_summary "$_abs")
+            _mark=""
+            [ "$_tag" = "unreg" ] && _mark=" [unregistered]"
+            printf '%s%s%s  %s\n' "$_pfx" "$_disp" "$_mark" "$_sum"
+          done
+    fi
+  done < "$_rtmp"
+  rm -f "$_rtmp"
 }
 
 # ─── Masscommits subcommand ─────────────────────────────────────────────
@@ -444,6 +720,25 @@ $(run_as_owner_capture "$_r" git log "-${COMMIT_MSG_LAST_N}" 2>/dev/null)"
 commit_one() {
   _r=$1
 
+  # Cross-user policy. Deep nodes run inside a pipeline subshell, so
+  # fatal() can't abort the whole run from here — root-level fails are
+  # caught by priv_gate in cmd_masscommits (parent shell). Deep fails
+  # become per-node ERRORs.
+  _action=$(check_priv "$_r")
+  case "$_action" in
+    fail:*)
+      log_error "${_action#fail:}"
+      return 1
+      ;;
+    skip)
+      return 0
+      ;;
+    warn)
+      log_major "$_r: [SKIPPED — cross-user policy]"
+      return 0
+      ;;
+  esac
+
   # .claude setup audit (before staging so auto-fixes are part of the commit).
   if [ "$CHECK_CLAUDE_SETUP" = 1 ]; then
     ensure_claude_setup "$_r" || {
@@ -495,11 +790,13 @@ commit_one() {
 
   # If we must run git as another user, msgfile needs readable perms + chown.
   _owner=$(file_owner "$_r/.git")
-  if [ -n "$_owner" ] && [ "$_owner" != "$ME" ] && [ "$ALLOW_SUDO_SU" = 1 ]; then
+  if [ -n "$_owner" ] && [ "$_owner" != "$ME" ]; then
     if [ "$ME" = "root" ]; then
       chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
-    else
+    elif has_sudo_rights; then
       sudo chown "$_owner" "$_msgfile" 2>/dev/null || chmod 644 "$_msgfile"
+    else
+      chmod 644 "$_msgfile"
     fi
   fi
 
@@ -537,15 +834,25 @@ cmd_masscommits() {
   [ -z "$_roots" ] && { log_error "no repositories to commit"; exit 1; }
 
   _rc_total=0
-  printf '%s\n' "$_roots" | while IFS= read -r _root; do
+  # File-redirected while keeps us in the parent shell so root-level
+  # priv_gate fail aborts the whole run.
+  _rtmp=/tmp/$US.roots.$$
+  printf '%s\n' "$_roots" > "$_rtmp"
+  while IFS= read -r _root; do
     [ -n "$_root" ] || continue
+    priv_gate "$_root"
+    case "$PRIV_ACTION" in
+      skip) continue ;;
+      warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
+    esac
     _nodes=$(walk_submodules "$_root")
     # post-order: deepest first so parent gitlinks can bump.
     printf '%s\n' "$_nodes" | while IFS= read -r _node; do
       [ -n "$_node" ] || continue
       commit_one "$_node" || _rc_total=1
     done
-  done
+  done < "$_rtmp"
+  rm -f "$_rtmp"
 
   # Final status snapshot (mirrors current script's behaviour).
   echo
@@ -798,10 +1105,23 @@ Recursively lists git status of the scoped repos and all their submodules.
 Uses  git status --porcelain --ignore-submodules  at each level (submodules
 are traversed manually so we can show nested structure).
 
-Output is indented by submodule depth. Clean/ahead/dirty states:
-  CLEAN :))                     — working tree clean, in sync with origin
-  Local <-> Remote out of sync  — clean but diverged from origin/<branch>
-  <porcelain lines>             — uncommitted changes
+Default output: ONE LINE PER REPO, ascii-art tree prefix. States:
+  CLEAN :))                 — working tree clean, in sync with origin
+  CLEAN, ahead N            — clean, local ahead of origin by N commits
+  CLEAN, behind N           — clean, local behind origin by N commits
+  DIVERGED (ahead X, ..)    — both sides have unique commits
+  CLEAN (no remote for B)   — no origin/<branch> tracking ref
+  DIRTY (N)  [M:.. ??:..]   — N porcelain entries, grouped by type
+  [SKIPPED — cross-user …]  — cross-user policy (warn/ignore) suppressed
+  [ERROR …]                 — per-repo failure; doesn't abort the run
+
+The tree includes BOTH registered submodules and unregistered nested git
+repos found on disk. The latter are marked ' [unregistered]' — use
+'$US sm go' to register them as proper submodules. Nested repos carrying
+'.git/my-git-submodules.ignore' (see 'sm' subcommand) are suppressed.
+
+-V / --verbose promotes to the long form: per-node porcelain lines
+indented by submodule depth (the pre-2026 behavior).
 
 Options: -V / -VV / -D / -DD, --help
 Scope:   see  $US --help
@@ -891,6 +1211,14 @@ Options:
   --help             Show extended help
 
 Ignore marker:  writes '<nested>/.git/my-git-submodules.ignore' (delete to un-ignore).
+
+Rebind auto-save: when 'sm go' rebinds a moved submodule and the nested
+repo has ONLY modifications to already-tracked files (no untracked files,
+no unpushed commits, no stashes), sm auto-commits them with a message
+listing the changed filenames and pushes to origin before re-cloning.
+Anything more (untracked files, unpushed commits, stashes) still warns
+and skips (or prompts with -i).
+
 See also:      $US --help                (top-level)
 EOF
 }
@@ -911,20 +1239,31 @@ Commands:
   $US --create-config     Write default config to first writable location
   $US --config FILE ...   Use specific file (overrides search)
 
-Variables (all optional; defaults shown):
-  GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
-                              Fallback repo list (used when no CWD repo).
-  CHECK_CLAUDE_SETUP=1        Audit .claude/ during 'mc'; 0 disables.
-  CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
+Variables (defaults live only inside --create-config; at runtime, ALL
+values come from the user's config):
+  GIT_REPOS                   Fallback repo list (used when no CWD repo).
+  CHECK_CLAUDE_SETUP          Audit .claude/ during 'mc'; 0 disables.
+  CLAUDE_PROJECT_DIR_CENTRAL_REPO
                               Central tree where .claude dirs live.
-  COMMIT_MSG_LAST_N=3         # of recent log entries in auto-commit body.
-  COMMIT_MSG_DIFF_MAX_FILES=10  Switch to file-list block above this count.
-  ALLOW_SUDO_SU=1             Permit 'sudo su <owner>' for cross-owner repos.
-  DEFAULT_VERBOSE=0           Set 1 to behave as -V always.
-  DEFAULT_DEBUG=0             Set 1 to behave as -D always.
-  SM_AUTO_SAFE_DIRECTORY=1    In 'sm', auto-add safe.directory on errors.
+  COMMIT_MSG_LAST_N           # of recent log entries in auto-commit body.
+  COMMIT_MSG_DIFF_MAX_FILES   Switch to file-list block above this count.
+  PRIV_POLICY_USER_TO_ROOT    non-root caller, root-owned repo (default warn)
+  PRIV_POLICY_USER_TO_USER    user A caller, user B's repo    (default fail)
+                              Policy values: sudo | fail | ignore | warn
+                                sudo   — 'sudo su <owner>' if caller has
+                                         sudo rights, else falls back to fail
+                                fail   — ERROR, abort the whole run
+                                ignore — silently skip this repo
+                                warn   — WARN then skip this repo
+                              Running as root always works (uses 'su'); the
+                              policies apply only to non-root callers.
+  DEFAULT_VERBOSE             Set 1 to behave as -V always.
+  DEFAULT_DEBUG               Set 1 to behave as -D always.
+  SM_AUTO_SAFE_DIRECTORY      In 'sm', auto-add safe.directory on errors.
 
 Missing config file triggers guidance + exit 2 on any subcommand.
+To see shipped defaults: run 'my-git --create-config' (writes to first
+writable location; shows path) or inspect '_default_config_content' in my-git.
 EOF
 }
 
@@ -1186,6 +1525,38 @@ _sm_remove_gitmodules_entry() {
     rm -f "$_rge_tmp"
     return 1
   fi
+}
+
+# _sm_autocommit_if_safe <sp>
+#   If the nested repo at <sp> has ONLY modifications to already-tracked
+#   files (no untracked files, no unpushed commits, no stashes), commit -a
+#   with a message listing the changed filenames AND push to origin.
+#   Intended as a pre-rebind auto-save: the rebind re-clones from origin,
+#   so anything not pushed is lost. Only safe to auto-handle when the
+#   change set is purely a 'git commit -a' away from a clean pushed state.
+#   Returns: 0 on success  | 1 if not applicable  | 2 on failure
+_sm_autocommit_if_safe() {
+  _ac_sp=$1
+  _porc=$(_sm_safe_git "$_ac_sp" -C "$_ac_sp" status --porcelain 2>/dev/null || true)
+  [ -n "$_porc" ] || return 1
+  printf '%s\n' "$_porc" | awk '/^\?\?/ { f=1 } END { exit !f }' && return 1
+  _up=$(_sm_safe_git "$_ac_sp" -C "$_ac_sp" log --branches --not --remotes --oneline 2>/dev/null || true)
+  [ -n "$_up" ] && return 1
+  _st=$(_sm_safe_git "$_ac_sp" -C "$_ac_sp" stash list 2>/dev/null || true)
+  [ -n "$_st" ] && return 1
+  _files=$(printf '%s\n' "$_porc" | awk '{print substr($0,4)}' | sort -u)
+  _msg=$(printf '%s\n' "$_files" | paste -sd, - | sed 's/,/, /g')
+  printf '    auto-commit (tracked-file mods only): %s\n' "$_msg"
+  _sm_safe_git "$_ac_sp" -C "$_ac_sp" commit -a -q -m "$_msg" >/dev/null 2>&1 || {
+    printf '    auto-commit failed — falling back to warn\n' >&2
+    return 2
+  }
+  printf '    auto-push to origin\n'
+  _sm_safe_git "$_ac_sp" -C "$_ac_sp" push -q 2>/dev/null || {
+    printf '    auto-push failed — falling back to warn\n' >&2
+    return 2
+  }
+  return 0
 }
 
 _sm_rebind_has_risky_state() {
@@ -1922,6 +2293,14 @@ cmd_submodules() {
         printf '    url: %s\n' "$url"
         _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
         if [ -n "$_risk_msg" ]; then
+          # Shortcut: if the only dirt is tracked-file modifications, just
+          # commit -a + push before the rebind re-clones (user instruction).
+          _sm_autocommit_if_safe "$sp"
+          if [ $? -eq 0 ]; then
+            _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
+          fi
+        fi
+        if [ -n "$_risk_msg" ]; then
           printf '    warning: nested repo at %s has: %s\n' "$sp" "$_risk_msg"
           printf '    The rebind re-clones from origin and would lose this.\n'
           if [ "$_sm_interactive" -eq 1 ]; then
@@ -2070,7 +2449,7 @@ main() {
   # ─── No subcommand → legacy default: status (piped through less if TTY) ───
   if [ $# -eq 0 ]; then
     if [ -t 1 ]; then
-      cmd_status | less -R
+      cmd_status #| less -R
     else
       cmd_status
     fi
