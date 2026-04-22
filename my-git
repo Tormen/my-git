@@ -15,6 +15,7 @@ CONFIG_FILE=""
 CONFIG_SEARCH_ORDER="/LINKS/default/my-git.conf $HOME/.mygit.conf /etc/my-git.conf /usr/local/etc/my-git.conf"
 DRY_RUN=0
 INTERACTIVE=0
+RECURSIVE=0
 
 # ─── Logging ─────────────────────────────────────────────────────────────
 log_major()     { printf ' >>> %s\n' "$*"; }
@@ -80,6 +81,10 @@ DEFAULT_DEBUG=0
 
 # ─── Submodules (sm) subcommand ─────────────────────────────────────────
 SM_AUTO_SAFE_DIRECTORY=1
+# SSH ConnectTimeout (seconds) applied to any clone/fetch ‘sm’ performs
+# via SSH. Protects against half-minute+ default stalls when a host is
+# unreachable. Applied via GIT_SSH_COMMAND at cmd_submodules start.
+SM_SSH_CONNECT_TIMEOUT=30
 EOF
 }
 
@@ -349,7 +354,7 @@ list_direct_submodules() {
 list_unregistered_nested() {
   _r=$1
   [ -d "$_r" ] || return 0
-  _regtmp=/tmp/$US.reg.$$
+  _regtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.reg.XXXXXX")
   run_as_owner_capture "$_r" git config -f .gitmodules \
     --get-regexp '^submodule\..*\.path$' 2>/dev/null \
     | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
@@ -370,11 +375,56 @@ list_unregistered_nested() {
         last = $0
       }' | while IFS= read -r _sub; do
     [ -n "$_sub" ] || continue
-    _gd=$(_sm_resolve_gitdir "$_r/$_sub/.git" "$_r/$_sub")
-    [ -e "$_gd/$_sm_IGNORE_MARKER" ] && continue
     printf '%s\n' "$_sub"
   done
   rm -f "$_regtmp"
+}
+
+# list_stale_submodules <repo>
+#   Print paths (relative to $repo) of entries registered in $repo/.gitmodules
+#   whose on-disk path doesn't exist (no .git file or dir at that path).
+#   These are phantom registrations the user should clean up via 'sm go'.
+list_stale_submodules() {
+  _lsr_r=$1
+  [ -d "$_lsr_r" ] || return 0
+  [ -f "$_lsr_r/.gitmodules" ] || return 0
+  run_as_owner_capture "$_lsr_r" git config -f .gitmodules \
+    --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{$1=""; sub(/^ /,""); print}' \
+    | while IFS= read -r _p; do
+        [ -n "$_p" ] || continue
+        [ -e "$_lsr_r/$_p/.git" ] && continue
+        printf '%s\n' "$_p"
+      done
+}
+
+# is_nested_ignored <repo> <sub>
+#   Return 0 if $repo/$sub has the my-git-submodules.ignore marker.
+is_nested_ignored() {
+  _ini_r=$1; _ini_sub=$2
+  _ini_gd=$(_sm_resolve_gitdir "$_ini_r/$_ini_sub/.git" "$_ini_r/$_ini_sub")
+  [ -e "$_ini_gd/$_sm_IGNORE_MARKER" ]
+}
+
+# find_cross_submodule_unregistered <repo>
+#   Walk every REGISTERED submodule under <repo> and list unregistered
+#   non-ignored nested git repos found inside them. These cannot be
+#   registered from <repo> (they belong to their parent submodule); we list
+#   them so 'sm' can tell the user where to run the actual registration.
+#   Output: TAB-separated "<parent-submodule-abs-path>\t<unregistered-sub-rel-to-parent>".
+find_cross_submodule_unregistered() {
+  _fcu_r=$1
+  [ -d "$_fcu_r" ] || return 0
+  walk_submodules "$_fcu_r" | while IFS= read -r _fcu_node; do
+    [ -n "$_fcu_node" ] || continue
+    # Skip the root itself — sm already analyzed it directly.
+    [ "$_fcu_node" = "$_fcu_r" ] && continue
+    list_unregistered_nested "$_fcu_node" | while IFS= read -r _fcu_sub; do
+      [ -n "$_fcu_sub" ] || continue
+      is_nested_ignored "$_fcu_node" "$_fcu_sub" && continue
+      printf '%s\t%s\n' "$_fcu_node" "$_fcu_sub"
+    done
+  done
 }
 
 # walk_submodules <repo>
@@ -449,16 +499,28 @@ resolve_scope() {
 #     <branch_prefix>\t<abs_path>\t<display>\t<tag>
 #   <branch_prefix> : box-drawing prefix printed before the display name.
 #   <tag>           : "" for root, "reg" for registered submodule,
-#                     "unreg" for embedded/unregistered nested git repo.
+#                     "unreg" for embedded/unregistered nested git repo,
+#                     "unreg-ign" for unregistered repo carrying the ignore
+#                     marker (not descended — shown as leaf),
+#                     "reg-ign" for the rare conflict state (registered AND
+#                     marked ignore),
+#                     "stale" for a .gitmodules entry with no directory on
+#                     disk (shown as leaf; can't be descended).
 #   Does NOT descend into repos that cross-user policy says we can't read.
 walk_tree_lines() (
   _root=$1; _display=$2; _pfx=$3; _cpfx=$4; _tag=$5
   printf '%s\t%s\t%s\t%s\n' "$_pfx" "$_root" "$_display" "$_tag"
   _action=$(check_priv "$_root")
   [ "$_action" = "exec" ] || return 0
+  # Don't descend into a subtree marked as ignored (opt-out) or stale
+  # (there's no directory on disk to descend into).
+  case "$_tag" in
+    *ign|stale) return 0 ;;
+  esac
   _subs_reg=$(list_direct_submodules "$_root")
   _subs_unreg=$(list_unregistered_nested "$_root")
-  _all=$(printf '%s\n%s\n' "$_subs_reg" "$_subs_unreg" | grep -v '^$' | sort -u)
+  _subs_stale=$(list_stale_submodules "$_root")
+  _all=$(printf '%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" "$_subs_stale" | grep -v '^$' | sort -u)
   [ -z "$_all" ] && return 0
   _total=$(printf '%s\n' "$_all" | grep -c .)
   _i=0
@@ -472,10 +534,17 @@ walk_tree_lines() (
       _my_pfx="${_cpfx}├── "
       _my_cpfx="${_cpfx}│   "
     fi
-    if printf '%s\n' "$_subs_reg" | grep -qxF "$_sub"; then
+    # Classification precedence: stale beats reg/unreg (no dir on disk means
+    # we can't do anything else with it). Otherwise reg vs unreg by membership.
+    if printf '%s\n' "$_subs_stale" | grep -qxF "$_sub"; then
+      _ntag=stale
+    elif printf '%s\n' "$_subs_reg" | grep -qxF "$_sub"; then
       _ntag=reg
     else
       _ntag=unreg
+    fi
+    if [ "$_ntag" != stale ] && is_nested_ignored "$_root" "$_sub"; then
+      _ntag="${_ntag}-ign"
     fi
     walk_tree_lines "$_root/$_sub" "$_sub" "$_my_pfx" "$_my_cpfx" "$_ntag"
   done
@@ -609,6 +678,7 @@ cmd_status() {
       -VV)          VRB=1; VERYVRB=1 ;;
       -D|--debug)   DBG=1; VRB=1 ;;
       -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -R|--recursive) : ;;  # st is always recursive — accepted for symmetry
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "status: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -623,7 +693,8 @@ cmd_status() {
 
   # Iterate roots in the PARENT shell (via a for-loop over a tmpfile) so
   # that priv_gate's fatal() actually aborts the whole run on policy=fail.
-  _rtmp=/tmp/$US.roots.$$
+  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
+  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   _first=1
   while IFS= read -r _root; do
@@ -655,9 +726,18 @@ cmd_status() {
       # Default: compact one-line-per-repo tree.
       walk_tree_lines "$_root" "$_root" "" "" "" \
         | while IFS="$(printf '\t')" read -r _pfx _abs _disp _tag; do
-            _sum=$(status_summary "$_abs")
+            case "$_tag" in
+              stale)     _sum="[no directory on disk — run 'sm go' to clean]" ;;
+              *)         _sum=$(status_summary "$_abs") ;;
+            esac
             _mark=""
-            [ "$_tag" = "unreg" ] && _mark=" [unregistered]"
+            case "$_tag" in
+              reg)       _mark=" [registered]" ;;
+              unreg)     _mark=" [unregistered]" ;;
+              unreg-ign) _mark=" [unregistered, ignored]" ;;
+              reg-ign)   _mark=" [registered, ignored]" ;;
+              stale)     _mark=" [STALE REGISTRATION]" ;;
+            esac
             printf '%s%s%s  %s\n' "$_pfx" "$_disp" "$_mark" "$_sum"
           done
     fi
@@ -785,7 +865,7 @@ commit_one() {
 
   run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; return 1; }
 
-  _msgfile=/tmp/$US.commit-msg.$$
+  _msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.commit-msg.XXXXXX")
   build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; return 1; }
 
   # If we must run git as another user, msgfile needs readable perms + chown.
@@ -821,6 +901,7 @@ cmd_masscommits() {
       -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
       -i|--interactive) INTERACTIVE=1 ;;
+      -R|--recursive) RECURSIVE=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "masscommits: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -836,7 +917,8 @@ cmd_masscommits() {
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
   # priv_gate fail aborts the whole run.
-  _rtmp=/tmp/$US.roots.$$
+  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
+  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
@@ -845,8 +927,16 @@ cmd_masscommits() {
       skip) continue ;;
       warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
     esac
-    _nodes=$(walk_submodules "$_root")
-    # post-order: deepest first so parent gitlinks can bump.
+    if [ "$RECURSIVE" = 1 ]; then
+      # Post-order: deepest first so parent gitlinks can bump to freshly
+      # committed children.
+      _nodes=$(walk_submodules "$_root")
+    else
+      # Single level: git only cares about this repo's own index. A
+      # submodule gitlink bump here (if any) is picked up by 'git add -A'
+      # — but we do NOT descend into the submodule's own working tree.
+      _nodes=$_root
+    fi
     printf '%s\n' "$_nodes" | while IFS= read -r _node; do
       [ -n "$_node" ] || continue
       commit_one "$_node" || _rc_total=1
@@ -1030,6 +1120,7 @@ cmd_claude_check() {
       -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
       -i|--interactive) INTERACTIVE=1 ;;
+      -R|--recursive) RECURSIVE=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "claude-check: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -1067,12 +1158,16 @@ show_help_top() {
   cat <<EOF
 usage: $US [global-opts] <subcommand> [sub-opts] [paths...]
 
-Multi-repo git dispatcher with recursive submodule support.
+Purpose: manage a multitude of git repos — plus nested git trees and
+repos that use submodules — easily, from a single command. 'st' gives a
+recursive OVERVIEW of every repo in sight. 'sm' and 'mc' act on ONE
+level at a time by default (git's native scope), and recurse through the
+submodule tree only when you pass -R/--recursive.
 
 Subcommands:
-  status | st | s          List status of repo(s) + submodules (recursive)
-  masscommits | mc | c     Add + commit + push repo(s) + submodules (bottom-up)
-  submodules | sub | sm    Nested-repo registration tool
+  status | st | s          List status of repo(s) + submodules (always recursive — overview)
+  masscommits | mc | c     Add + commit + push (single level; -R = full bottom-up walk)
+  submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   claude-check             Audit .claude/ setup (read-only by default)
   help                     Show this help
 
@@ -1081,14 +1176,25 @@ Global options:
   -VV                      Verbosity level 2
   -D, --debug              Debug level 1  (implies -V)
   -DD, --deepdbg           Debug level 2  (implies -VV; enables set -x)
+  -R, --recursive          For 'mc' and 'sm': walk the full submodule tree.
+                           (st already recurses by default; -R is a no-op there.)
   --config <FILE>          Use specific config file
   --create-config          Write default config to first writable location
   -h, --help [TOPIC]       Show help (topic = subcommand or option)
 
 Scope (st / mc / claude-check):
-  explicit paths           operate on each given repo (+submodules, recursive)
-  none + inside git repo   operate on that repo + submodules (CWD-aware)
+  explicit paths           operate on each given repo
+  none + inside git repo   operate on that repo (CWD-aware)
   none + outside any repo  fallback to \$GIT_REPOS from config
+
+Recursion (mc / sm):
+  default                  ONE level only — git itself only cares about the
+                           current repo's own gitlinks. A changed submodule
+                           HEAD is picked up as a gitlink bump, but the
+                           submodule's own working tree is NOT touched.
+  -R / --recursive         Walk the whole submodule tree (mc: bottom-up so
+                           child commits bubble into parent gitlinks; sm:
+                           top-down so parent rebinds settle first).
 
 Run 'my-git --help <topic>' for details on any subcommand or option.
 Config file search order and variables:  my-git --help config
@@ -1116,12 +1222,31 @@ Default output: ONE LINE PER REPO, ascii-art tree prefix. States:
   [ERROR …]                 — per-repo failure; doesn't abort the run
 
 The tree includes BOTH registered submodules and unregistered nested git
-repos found on disk. The latter are marked ' [unregistered]' — use
-'$US sm go' to register them as proper submodules. Nested repos carrying
-'.git/my-git-submodules.ignore' (see 'sm' subcommand) are suppressed.
+repos found on disk. Marks shown after the display name:
+  [registered]              — nested git repo registered in .gitmodules
+                              ('sm' is happy; no action required from 'sm')
+  [unregistered]            — nested git repo not yet in .gitmodules
+                              (run '$US sm go' to register)
+  [registered, ignored]     — registered submodule ALSO carrying the ignore
+                              marker ('.git/my-git-submodules.ignore') — this
+                              is a conflict; see 'sm --list-ignored'
+  [unregistered, ignored]   — unregistered nested repo carrying the ignore
+                              marker; 'sm go' will skip it. Subtree NOT
+                              descended.
+  [STALE REGISTRATION]      — entry in .gitmodules whose on-disk path does
+                              NOT exist (phantom registration from a past
+                              rename or remove). Run '$US sm go' to clean up.
+
+The top-level scope path carries no tag (it IS the super-repo, not a nested
+entry). DIRTY/CLEAN is orthogonal to registration — DIRTY just means
+uncommitted file changes, handled by 'mc', not 'sm'.
 
 -V / --verbose promotes to the long form: per-node porcelain lines
 indented by submodule depth (the pre-2026 behavior).
+
+Recursion: 'st' is ALWAYS recursive — that is its job (the OVERVIEW
+across a multi-repo / submodule tree). -R is accepted silently for
+symmetry with 'mc' / 'sm' but has no effect.
 
 Options: -V / -VV / -D / -DD, --help
 Scope:   see  $US --help
@@ -1132,15 +1257,24 @@ show_help_masscommits() {
   cat <<EOF
 my-git masscommits  (aliases: mc, c, go)
 
-usage: $US [-V|-D] mc [-n|--dry-run] [-i|--interactive] [paths...]
+usage: $US [-V|-D] mc [-n|--dry-run] [-i|--interactive] [-R|--recursive] [paths...]
 
-For each repo in scope, recurses bottom-up through submodules and:
+For each repo in scope:
   1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
   2. If dirty  — git add -A, auto-generate commit message, git commit, git push
   3. If clean  — checks local-vs-remote; pushes if ahead; else DONE
 
-Bottom-up is required so each parent's gitlink bumps onto the freshly-pushed
-child commit in the same run.
+Scope & recursion:
+  default             ONE level — act on the current repo only. A changed
+                      submodule HEAD is committed as a gitlink bump, but the
+                      submodule itself is NOT entered. This matches git's
+                      own model: each super-repo is responsible for its own
+                      index, not for what lives inside its submodules.
+  -R, --recursive     Walk the full submodule tree BOTTOM-UP. Deepest
+                      children commit+push first so each parent's gitlink
+                      lands on the freshly-pushed child commit in the same
+                      run. Use this when you want ONE command to settle a
+                      whole tree of nested repos.
 
 Commit-message template:
   line 1: intro (filename / short file list / 'AUTOMATIC-MASS-COMMIT')
@@ -1150,6 +1284,7 @@ Commit-message template:
 Options:
   -n, -T, --try, --dry, --dry-run   Preview; no writes, no commits, no pushes
   -i, --interactive                  Prompt before destructive .claude migration
+  -R, --recursive                    Walk the full submodule tree bottom-up
   -V, -VV, -D, -DD                   Verbosity / debug
   --help
 
@@ -1207,10 +1342,103 @@ Options:
   -D, --debug        set -x plus extra diagnostics
   -V, --verbose      Full multi-line block per candidate
   -i, --interactive  Prompt on failures / missing info
-  --force            With 'go', ignore per-repo ignore markers
+  -R, --recursive    Walk into every registered submodule (top-down)
+  --force            With 'go', ignore per-repo ignore markers AND bypass
+                     suspicious-URL guards; with embedded paths, reuse a
+                     stale .git/modules/<name>/ instead of erroring out
   --help             Show extended help
 
+────────────────────────────────────────────────────────────────────────
+Decision table — what 'sm go' does for each situation it encounters.
+Every case that can occur is listed here; anything not in this table
+is a bug. The table reflects CURRENT behavior, not aspirational design.
+────────────────────────────────────────────────────────────────────────
+
+  SITUATION                                 DEFAULT                       WITH -i
+  -----------------------------------       ---------------------------   ------------------------------
+  already registered (path + URL OK)        no-op                         no-op
+  nested inside registered submodule        silent skip (see summary)     silent skip (see summary)
+  stale registration                        auto-remove                   prompt [Y]es / [S]kip / [A]bort
+   (.gitmodules entry, no dir on disk)
+  carries my-git-submodules.ignore marker   silent skip (see summary)     silent skip (same)
+                                            --force: treat as fresh       --force: treat as fresh
+  marker + .gitmodules path mismatch        CONFLICT note, skip           prompt [U]pdate / [R]emove /
+   (ignore here, registered elsewhere)                                      [S]kip / [A]bort
+  moved (URL matches a different
+   registered path), nested repo CLEAN      rebind in place (no re-clone) same (no extra prompt)
+  moved, nested repo RISKY                  SKIP with 'push/commit        prompt [P]roceed / [S]kip /
+   (uncommitted+untracked, unpushed           first' hint                   [A]bort
+    branches, or stashes)
+  no origin URL on nested repo              silent skip (counted          prompt for URL
+                                             'missing origin URL')
+  unregistered with URL, plain new          git submodule add             same
+  unregistered with URL, path already
+   tracked in index (embedded)              UNTRACK (git rm --cached -r)  same
+                                             + git submodule add
+  URL looks suspicious (unusual scheme)     add anyway (counted)          extra [U]se / [E]dit / [S]kip /
+                                                                            [I]gnore perm / [A]bort first
+  path matches a .gitignore pattern         silent skip (.gitignore IS    prompt [N]egate / [F]orce /
+   (pre-checked with git check-ignore)       the marker — no 'add' run)     [S]kip / [A]bort
+                                                                            [N] appends '!<rel>/' to the
+                                                                            matching .gitignore, then adds
+  stale .git/modules/<name>/                ERROR + skip                  same; --force: reuse + add
+   (from an interrupted prior run)
+
+Abort ([A]) in any -i prompt exits the whole run with code 77; under -R
+it propagates up and terminates the entire recursive walk (not just the
+current node).
+
 Ignore marker:  writes '<nested>/.git/my-git-submodules.ignore' (delete to un-ignore).
+
+Exclude-file sync: at the END of every 'sm go' run (even when nothing was
+registered), my-git reconciles \$SUPER/.git/info/exclude so every nested
+repo carrying the ignore marker is listed as /path/ there — this prevents
+'git status' in the super-repo from showing those repos as Untracked. The
+block is delimited by '# --- my-git-submodules: ignored nested repos ...'
+markers so unrelated excludes are left alone. --sync-gitignore /
+--emit-gitignore still work standalone.
+
+Apply order (top-down): registration is applied parents-first — shortest
+path first, deeper paths later. Once a parent has been registered (add or
+rebind) in this run, any remaining candidate below it is skipped with a
+'now nested inside registered submodule X' note; register those from
+INSIDE the parent ('cd X && $US sm go'). This is the OPPOSITE of 'mc',
+which is bottom-up so child commits bubble into the parent's gitlink.
+
+Recursion (opt-in): by default 'sm' acts on ONE level — git itself only
+cares about the current repo's own gitlinks; what lives inside a
+registered submodule is that submodule's own concern. Pass -R /
+--recursive to have 'sm' (analyze / --dry / go) walk into every
+registered direct submodule top-down, mirroring what 'st' shows, so a
+single '$US sm -R go' at the super-repo covers every nested .git in the
+tree. [A]bort inside a nested prompt propagates: it aborts the WHOLE
+walk, not just the current node. Flag-driven modes (--list-ignored /
+--emit-gitignore / --clean-leftovers / --sync-gitignore /
+--unstage-embedded) never recurse even with -R — they already traverse
+globally from the current repo.
+
+Stale registrations: entries in .gitmodules whose on-disk path does NOT
+exist are detected and (with 'go') removed — 'git config -f .gitmodules
+--remove-section submodule.<name>', plus '.git/config' cleanup,
+'git rm --cached -f -- <path>', and 'rm -rf -- .git/modules/<name>'.
+Under -i, each stale entry is prompted before removal. Typical cause:
+a submodule was renamed on disk without updating .gitmodules, leaving
+the old entry behind.
+
+--list-ignored: lists EVERY nested repo that carries the ignore marker.
+Entries that are ALSO registered in .gitmodules (same path, or same URL at
+a different path) are shown with a '!! CONFLICT' remark — the marker says
+"skip" but .gitmodules says "tracked", which is inconsistent state.
+
+Ignored-path mismatch: when 'sm go' detects the conflict (ignored marker
+here, but .gitmodules has this URL at a different path), it stops with
+status CONFLICT and, under -i, prompts:
+   [U]pdate  — rewrite .gitmodules path AND remove the marker, then rebind
+               in place (no re-clone; local branches / commits / changes
+               preserved).
+   [R]emove  — delete the ignore marker only; the next 'sm go' will then
+               see this as a normal moved submodule.
+   [S]kip / [A]bort.
 
 Rebind auto-save: when 'sm go' rebinds a moved submodule and the nested
 repo has ONLY modifications to already-tracked files (no untracked files,
@@ -1260,6 +1488,9 @@ values come from the user's config):
   DEFAULT_VERBOSE             Set 1 to behave as -V always.
   DEFAULT_DEBUG               Set 1 to behave as -D always.
   SM_AUTO_SAFE_DIRECTORY      In 'sm', auto-add safe.directory on errors.
+  SM_SSH_CONNECT_TIMEOUT      SSH ConnectTimeout (seconds) for clone/fetch
+                              in 'sm' (default 30). Applied via GIT_SSH_COMMAND
+                              unless the user already set that env var.
 
 Missing config file triggers guidance + exit 2 on any subcommand.
 To see shipped defaults: run 'my-git --create-config' (writes to first
@@ -1330,6 +1561,9 @@ _sm_ask() {
   if [ -r /dev/tty ]; then
     printf '%s' "$_prompt" >/dev/tty
     IFS= read -r _ans </dev/tty || _ans=''
+    # Strip all whitespace (including trailing CR from CRLF-ish terminals)
+    # so case-matches like a|A actually fire for typed single-char answers.
+    _ans=$(printf '%s' "$_ans" | tr -d '[:space:]')
     printf '%s' "$_ans"
   else
     printf 'error: interactive prompt needed but no TTY available: %s\n' \
@@ -1428,6 +1662,26 @@ _sm_is_registered_submodule() {
   [ -f .gitmodules ] || return 1
   git config -f .gitmodules --get-regexp "^submodule\..*\.path$" 2>/dev/null \
       | sed 's/^[^ ]* //' | grep -Fxq "$_sp"
+}
+
+# _sm_registered_path_for_url <url>
+#   Print the path under which <url> is registered in $_sm_toplevel/.gitmodules,
+#   or nothing if it isn't. If multiple entries have the same url, prints the
+#   first one.
+_sm_registered_path_for_url() {
+  _url_match=$1
+  [ -z "$_url_match" ] && return 1
+  [ -f .gitmodules ] || return 1
+  git config -f .gitmodules --get-regexp "^submodule\..*\.url$" 2>/dev/null \
+      | while IFS= read -r _line; do
+          _key=${_line%% *}
+          _val=${_line#* }
+          [ "$_val" = "$_url_match" ] || continue
+          _name=${_key#submodule.}
+          _name=${_name%.url}
+          _p=$(git config -f .gitmodules --get "submodule.${_name}.path" 2>/dev/null || true)
+          [ -n "$_p" ] && { printf '%s\n' "$_p"; return 0; }
+        done
 }
 
 _sm_is_tracked_in_index() {
@@ -1559,6 +1813,169 @@ _sm_autocommit_if_safe() {
   return 0
 }
 
+# _sm_collect_ignore_patterns
+#   Scan $_sm_toplevel for nested repos carrying the ignore marker and print
+#   one `/path/` line per match on stdout. Callers use this to build the
+#   .git/info/exclude block or to emit to the terminal. Returns 1 if none.
+_sm_collect_ignore_patterns() {
+  _cip_tmp=$(mktemp "${TMPDIR:-/tmp}/syncignfind.XXXXXX")
+  find . -mindepth 2 -name .git \( -type d -o -type f \) \
+       -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_cip_tmp"
+  _cip_patterns=$(
+    while IFS= read -r gp; do
+      sp=${gp%/.git}; sp=${sp#./}
+      if _sm_is_ignored "$gp" "$sp"; then
+        printf '/%s/\n' "$sp"
+      fi
+    done < "$_cip_tmp"
+  )
+  rm -f "$_cip_tmp"
+  [ -z "$_cip_patterns" ] && return 1
+  printf '%s\n' "$_cip_patterns"
+  return 0
+}
+
+_sm_emit_ignore_patterns() {
+  _eip_pats=$(_sm_collect_ignore_patterns) || return 1
+  _eip_header='# --- my-git-submodules: ignored nested repos (do not edit between markers) ---'
+  _eip_footer='# --- end my-git-submodules ---'
+  printf '%s\n%s\n%s\n' "$_eip_header" "$_eip_pats" "$_eip_footer"
+}
+
+# _sm_sync_ignore_exclude [quiet]
+#   Rewrite the marker-delimited block in $_sm_toplevel/.git/info/exclude to
+#   exactly match the current set of ignored nested repos. Also drops the
+#   block entirely when there are none. Idempotent.
+#   With arg "quiet", print nothing when already up-to-date.
+_sm_sync_ignore_exclude() {
+  _sie_quiet=${1:-}
+  _sie_header='# --- my-git-submodules: ignored nested repos (do not edit between markers) ---'
+  _sie_footer='# --- end my-git-submodules ---'
+  _sie_pats=$(_sm_collect_ignore_patterns || true)
+  _sie_exclude="$_sm_toplevel/.git/info/exclude"
+  mkdir -p "$_sm_toplevel/.git/info" 2>/dev/null || true
+  _sie_existing=''
+  [ -f "$_sie_exclude" ] && _sie_existing=$(cat "$_sie_exclude")
+  _sie_clean=$(
+    printf '%s\n' "$_sie_existing" | awk -v h="$_sie_header" -v f="$_sie_footer" '
+      $0 == h { inblock = 1; next }
+      $0 == f { inblock = 0; next }
+      inblock == 0 { print }
+    '
+  )
+  if [ -z "$_sie_pats" ]; then
+    # No ignored repos — strip any existing block.
+    if printf '%s\n' "$_sie_existing" | grep -Fxq "$_sie_header"; then
+      _sie_new=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
+      [ -n "$_sie_clean" ] && printf '%s\n' "$_sie_clean" > "$_sie_new" || : > "$_sie_new"
+      if mv -- "$_sie_new" "$_sie_exclude"; then
+        [ "$_sie_quiet" = quiet ] || printf 'Removed stale ignored-block from %s\n' "$_sie_exclude"
+      else
+        rm -f "$_sie_new"
+        echo "error: could not write $_sie_exclude" >&2
+        return 1
+      fi
+    else
+      [ "$_sie_quiet" = quiet ] || echo "No ignored nested repos — nothing to sync."
+    fi
+    return 0
+  fi
+  # Something to write. Skip the mv if contents would be identical.
+  _sie_would=$(
+    [ -n "$_sie_clean" ] && printf '%s\n' "$_sie_clean"
+    printf '%s\n%s\n%s\n' "$_sie_header" "$_sie_pats" "$_sie_footer"
+  )
+  if [ "$_sie_would" = "$_sie_existing" ]; then
+    [ "$_sie_quiet" = quiet ] || echo ".git/info/exclude already up to date."
+    return 0
+  fi
+  _sie_new=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
+  printf '%s\n' "$_sie_would" > "$_sie_new"
+  if mv -- "$_sie_new" "$_sie_exclude"; then
+    _sie_count=$(printf '%s\n' "$_sie_pats" | wc -l | tr -d ' ')
+    printf 'Synced %s ignored nested-repo paths to %s\n' "$_sie_count" "$_sie_exclude"
+    [ "$_sie_quiet" = quiet ] || echo "These are local-only (not tracked by git)."
+  else
+    rm -f "$_sie_new"
+    echo "error: could not write $_sie_exclude" >&2
+    return 1
+  fi
+}
+
+# _sm_try_preserve_rebind <old_path> <new_sp> <url>
+#   Move the nested gitdir into .git/modules/<new_sp>, rewrite <new_sp>/.git
+#   to point at it, update .gitmodules in place, and stage the move in the
+#   superproject index. NO re-clone — ALL local state (branches, unpushed
+#   commits, stashes, uncommitted changes, reflogs, hooks) is kept intact.
+#
+#   Source gitdir is located in priority order:
+#     1. .git/modules/<old_path>   (stale super-repo entry, if any)
+#     2. <new_sp>/.git/            (embedded real dir — user moved manually)
+#     3. target of <new_sp>/.git   (pointer file to a gitdir elsewhere)
+#
+#   Returns: 0 on success | 1 if no source gitdir is found / move fails.
+_sm_try_preserve_rebind() {
+  _pr_old=$1; _pr_sp=$2; _pr_url=$3
+  _pr_stale="$_sm_toplevel/.git/modules/$_pr_old"
+  _pr_new_gd="$_sm_toplevel/.git/modules/$_pr_sp"
+  [ -e "$_pr_new_gd" ]  && return 1
+  [ -e "$_pr_sp/.git" ] || return 1
+  # Locate the source gitdir.
+  _pr_src=''
+  _pr_src_kind=''
+  if [ -d "$_pr_stale" ]; then
+    _pr_src=$_pr_stale
+    _pr_src_kind=stale
+  elif [ -d "$_pr_sp/.git" ]; then
+    _pr_src=$_pr_sp/.git
+    _pr_src_kind=embedded
+  elif [ -f "$_pr_sp/.git" ]; then
+    _pr_gdline=$(sed -n 's/^gitdir: //p' "$_pr_sp/.git")
+    case "$_pr_gdline" in
+      /*) _pr_src=$_pr_gdline ;;
+      *)  _pr_src=$_pr_sp/$_pr_gdline ;;
+    esac
+    [ -d "$_pr_src" ] || return 1
+    _pr_src_kind=pointer
+  else
+    return 1
+  fi
+  # Compute relative paths for the new pointer and core.worktree.
+  _pr_up=$(printf '%s' "$_pr_sp" | awk -F/ '{ for (i=1;i<=NF;i++) printf "../" }')
+  _pr_wt_up=$(printf '%s' ".git/modules/$_pr_sp" | awk -F/ '{ for (i=1;i<=NF;i++) printf "../" }')
+  # Move gitdir to its canonical super-repo location.
+  _pr_newdir=${_pr_new_gd%/*}
+  mkdir -p "$_pr_newdir" || return 1
+  mv -- "$_pr_src" "$_pr_new_gd" || return 1
+  # For the stale/pointer cases the remaining <sp>/.git is an old pointer
+  # (or a now-stale pointer file to the place we just emptied). For the
+  # embedded case, the mv above already took <sp>/.git away.
+  [ -e "$_pr_sp/.git" ] && rm -rf -- "$_pr_sp/.git" 2>/dev/null
+  printf 'gitdir: %s.git/modules/%s\n' "$_pr_up" "$_pr_sp" > "$_pr_sp/.git" || {
+    # Roll back: move gitdir back where it came from.
+    mv -- "$_pr_new_gd" "$_pr_src" 2>/dev/null || true
+    return 1
+  }
+  # Fix up the moved gitdir's config.
+  git config -f "$_pr_new_gd/config" core.worktree "${_pr_wt_up}${_pr_sp}" || true
+  [ -n "$_pr_url" ] && git config -f "$_pr_new_gd/config" remote.origin.url "$_pr_url" || true
+  # Update .gitmodules: drop old entry, append new.
+  if [ -f "$_sm_toplevel/.gitmodules" ]; then
+    _sm_remove_gitmodules_entry "$_pr_old" || true
+  fi
+  {
+    printf '[submodule "%s"]\n' "$_pr_sp"
+    printf '\tpath = %s\n' "$_pr_sp"
+    printf '\turl = %s\n' "$_pr_url"
+  } >> "$_sm_toplevel/.gitmodules"
+  # Update the superproject index.
+  if git ls-files --error-unmatch -- "$_pr_old" >/dev/null 2>&1; then
+    git rm --cached -q -- "$_pr_old" 2>/dev/null || true
+  fi
+  git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
+  return 0
+}
+
 _sm_rebind_has_risky_state() {
   _rhs_sp=$1
   [ -d "$_rhs_sp/.git" ] || [ -f "$_rhs_sp/.git" ] || return 1
@@ -1576,8 +1993,91 @@ _sm_rebind_has_risky_state() {
   return 1
 }
 
-# ─── cmd_submodules: top-level flow from my-git-submodules.sh ───────────
+# ─── cmd_submodules: top-level dispatch + recursion wrapper ─────────────
+# The actual work is in _sm_run_here() (the former cmd_submodules body,
+# renamed so we can run it in a subshell to contain its 'exit' calls).
+# cmd_submodules() wraps that call and — when -R/--recursive is given —
+# recurses into every registered direct submodule. Default is single-level
+# (git itself only cares about one level of gitlinks per super-repo).
+#
+# Even with -R, flag-driven modes that already perform their own global
+# traversal (--list-ignored, --emit-gitignore, --clean-leftovers,
+# --sync-gitignore, --unstage-embedded) do NOT recurse — running them N
+# times would duplicate output.
+_sm_mode_wants_recursion() {
+  # -R / --recursive is required; without it, never recurse.
+  _want_r=0
+  for _arg; do
+    case "$_arg" in
+      -R|--recursive) _want_r=1 ;;
+    esac
+  done
+  [ "$_want_r" = 1 ] || return 1
+  for _arg; do
+    case "$_arg" in
+      --list-ignored|--emit-gitignore|--clean-leftovers|--sync-gitignore|--unstage-embedded)
+        return 1 ;;
+      -h|--help)
+        return 1 ;;
+    esac
+  done
+  return 0
+}
+
 cmd_submodules() {
+  # Run the body in a subshell so its 'exit' calls contain to this level
+  # and don't abort the outer recursion walk. User-triggered abort uses
+  # exit code 77, which we propagate up so [A]bort in a nested call
+  # terminates the whole walk (not just the current node).
+  ( _sm_run_here "$@" )
+  _sm_outer_rc=$?
+  [ "$_sm_outer_rc" = 77 ] && return 77
+
+  # Recurse into each direct registered submodule in depth-first top-down
+  # order. Parents are processed before children so that rebinds/renames
+  # at the parent level settle before we look inside.
+  if _sm_mode_wants_recursion "$@"; then
+    _sm_cwd_abs=$(pwd -P)
+    _sm_rec_list=$(mktemp "${TMPDIR:-/tmp}/smrec.XXXXXX")
+    list_direct_submodules "$_sm_cwd_abs" > "$_sm_rec_list" 2>/dev/null || :
+    while IFS= read -r _sm_sub; do
+      [ -n "$_sm_sub" ] || continue
+      _sm_abs="$_sm_cwd_abs/$_sm_sub"
+      [ -e "$_sm_abs/.git" ] || continue
+      # Skip children that have nothing to report and no further
+      # registered submodules to descend into — avoids the "=== path ==="
+      # banner followed by "No nested Git repositories found" noise.
+      _sm_child_reg=$(list_direct_submodules "$_sm_abs")
+      _sm_child_unreg=$(list_unregistered_nested "$_sm_abs")
+      _sm_child_stale=$(list_stale_submodules "$_sm_abs")
+      if [ -z "$_sm_child_reg" ] && [ -z "$_sm_child_unreg" ] && [ -z "$_sm_child_stale" ]; then
+        continue
+      fi
+      printf '\n============================================================\n'
+      printf '=== %s\n' "$_sm_abs"
+      printf '============================================================\n'
+      ( cd "$_sm_abs" 2>/dev/null && cmd_submodules "$@" )
+      _sm_child_rc=$?
+      if [ "$_sm_child_rc" = 77 ]; then
+        rm -f "$_sm_rec_list"
+        return 77
+      fi
+    done < "$_sm_rec_list"
+    rm -f "$_sm_rec_list"
+  fi
+  return $_sm_outer_rc
+}
+
+# ─── _sm_run_here: single-repo sm work (formerly cmd_submodules body) ────
+_sm_run_here() {
+  # Apply an SSH ConnectTimeout so unreachable hosts fail in seconds instead
+  # of the OS default (75s+). Only set if user hasn't already chosen one.
+  if [ -z "${GIT_SSH_COMMAND:-}" ]; then
+    _sm_ct=${SM_SSH_CONNECT_TIMEOUT:-30}
+    GIT_SSH_COMMAND="ssh -o ConnectTimeout=$_sm_ct -o BatchMode=no"
+    export GIT_SSH_COMMAND
+    log_dbg_med "GIT_SSH_COMMAND=$GIT_SSH_COMMAND"
+  fi
   # Re-parse sm's argv (passed as $@).
   _sm_mode=analyze
   _sm_mode_set=0
@@ -1605,6 +2105,7 @@ cmd_submodules() {
       --sync-gitignore)      _sm_sync_gitignore=1 ;;
       --emit-gitignore)      _sm_emit_gitignore=1 ;;
       --unstage-embedded)    _sm_unstage_embedded=1 ;;
+      -R|--recursive)        RECURSIVE=1 ;;
       -h|--help)             show_help submodules; exit 0 ;;
       --)                    shift; break ;;
       -*)                    printf 'Unknown option: %s\n\n' "$1" >&2; show_help submodules >&2; exit 2 ;;
@@ -1645,7 +2146,7 @@ cmd_submodules() {
       case "$_ans" in
         d|D) rm -rf -- "$_lo" && echo "    deleted." ;;
         r|R) [ ! -e "$_orig" ] && mv -- "$_lo" "$_orig" && echo "    restored." ;;
-        a|A) echo "Aborted."; exit 1 ;;
+        a|A) echo "Aborted."; exit 77 ;;
         *)   echo "    kept." ;;
       esac
     done
@@ -1665,19 +2166,36 @@ cmd_submodules() {
   # ─── --list-ignored ───
   if [ "$_sm_list_ignored" -eq 1 ]; then
     echo "Ignored nested repos under $_sm_toplevel (marker: .git/$_sm_IGNORE_MARKER):"
-    _n=0
+    _n=0; _n_conflict=0
     _tmp=$(mktemp "${TMPDIR:-/tmp}/listign.XXXXXX")
     find . -mindepth 2 -name .git \( -type d -o -type f \) \
          -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
     while IFS= read -r gp; do
       sp=${gp%/.git}; sp=${sp#./}
-      if _sm_is_ignored "$gp" "$sp"; then
-        printf '  %s\n' "$sp"
-        _n=$((_n + 1))
+      _sm_is_ignored "$gp" "$sp" || continue
+      printf '  %s\n' "$sp"
+      _n=$((_n + 1))
+      # Diagnostic remarks — an ignored repo is expected NOT to be in
+      # .gitmodules. Flag any conflict so `sm go` can fix it.
+      _cfg=$(_sm_resolve_cfg "$gp" "$sp")
+      _url=''
+      [ -f "$_cfg" ] && _url=$(git config -f "$_cfg" --get remote.origin.url 2>/dev/null || true)
+      if _sm_is_registered_submodule "$sp"; then
+        printf '    !! CONFLICT: also registered in .gitmodules at this same path\n'
+        _n_conflict=$((_n_conflict + 1))
+      elif [ -n "$_url" ]; then
+        _regpath=$(_sm_registered_path_for_url "$_url" || true)
+        if [ -n "$_regpath" ] && [ "$_regpath" != "$sp" ]; then
+          printf '    !! CONFLICT: registered in .gitmodules at %s (path mismatch)\n' "$_regpath"
+          printf '       run:  %s sm go -i   and choose [U]pdate path, or [R]emove marker\n' "$US"
+          _n_conflict=$((_n_conflict + 1))
+        fi
       fi
     done < "$_tmp"
     rm -f "$_tmp"
-    printf '\nTotal ignored: %s\n' "$_n"
+    printf '\nTotal ignored: %s' "$_n"
+    [ "$_n_conflict" -gt 0 ] && printf ' (conflicts: %s)' "$_n_conflict"
+    printf '\n'
     exit 0
   fi
 
@@ -1722,54 +2240,16 @@ cmd_submodules() {
 
   # ─── --sync-gitignore / --emit-gitignore ───
   if [ "$_sm_sync_gitignore" -eq 1 ] || [ "$_sm_emit_gitignore" -eq 1 ]; then
-    _tmp=$(mktemp "${TMPDIR:-/tmp}/syncign.XXXXXX")
-    find . -mindepth 2 -name .git \( -type d -o -type f \) \
-         -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
-    _patterns=$(
-      while IFS= read -r gp; do
-        sp=${gp%/.git}; sp=${sp#./}
-        if _sm_is_ignored "$gp" "$sp"; then
-          printf '/%s/\n' "$sp"
-        fi
-      done < "$_tmp"
-    )
-    rm -f "$_tmp"
-    if [ -z "$_patterns" ]; then
-      echo "No ignored nested repos found — nothing to write."
-      exit 0
-    fi
-    _header='# --- my-git-submodules: ignored nested repos (do not edit between markers) ---'
-    _footer='# --- end my-git-submodules ---'
+    _sgi_rc=0
     if [ "$_sm_emit_gitignore" -eq 1 ]; then
-      printf '%s\n%s\n%s\n' "$_header" "$_patterns" "$_footer"
-      exit 0
-    fi
-    _exclude="$_sm_toplevel/.git/info/exclude"
-    mkdir -p "$_sm_toplevel/.git/info" 2>/dev/null || true
-    _existing=''
-    [ -f "$_exclude" ] && _existing=$(cat "$_exclude")
-    _clean=$(
-      printf '%s\n' "$_existing" | awk -v h="$_header" -v f="$_footer" '
-        $0 == h { inblock = 1; next }
-        $0 == f { inblock = 0; next }
-        inblock == 0 { print }
-      '
-    )
-    _new_tmp=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
-    {
-      [ -n "$_clean" ] && printf '%s\n' "$_clean"
-      printf '%s\n%s\n%s\n' "$_header" "$_patterns" "$_footer"
-    } > "$_new_tmp"
-    if mv -- "$_new_tmp" "$_exclude"; then
-      _count=$(printf '%s\n' "$_patterns" | wc -l | tr -d ' ')
-      printf 'Wrote %s gitignore entries to %s\n' "$_count" "$_exclude"
-      echo "These are local-only (not tracked by git)."
+      _sm_emit_ignore_patterns
+      _sgi_rc=$?
+      [ "$_sgi_rc" -ne 0 ] && echo "No ignored nested repos found — nothing to emit."
     else
-      rm -f "$_new_tmp"
-      echo "error: could not write $_exclude" >&2
-      exit 1
+      _sm_sync_ignore_exclude
+      _sgi_rc=$?
     fi
-    exit 0
+    exit "$_sgi_rc"
   fi
 
   # ─── Main analyze/dry/go flow ───
@@ -1801,7 +2281,8 @@ cmd_submodules() {
   _sm_total=$(wc -l < "$_sm_tmpfile" | tr -d ' ')
 
   _sm_c_registered=0; _sm_c_ready=0; _sm_c_need_untrack=0; _sm_c_no_url=0; _sm_c_dirty=0
-  _sm_c_prompt=0; _sm_c_nested=0; _sm_c_ignored=0; _sm_c_moved=0
+  _sm_c_prompt=0; _sm_c_nested=0; _sm_c_ignored=0; _sm_c_moved=0; _sm_c_ignored_mismatch=0
+  _sm_c_stale=0
 
   _sm_show_header=1
   [ "$_sm_mode" = go ]      && [ "$_sm_verbose" -eq 0 ] && _sm_show_header=0
@@ -1843,6 +2324,36 @@ cmd_submodules() {
     _sm_compact_header_printed=1
   }
 
+  # ─── Stale-registration pre-pass ───
+  # Detect entries in .gitmodules whose on-disk path DOESN'T EXIST. These
+  # are invisible to the main 'find .git' loop (which only sees real
+  # directories), yet they clutter .gitmodules and cause 'git submodule
+  # status' to list phantom entries. Typical cause: a submodule was moved
+  # on disk without updating the registration (or the old entry wasn't
+  # removed after a rename).
+  if [ -f .gitmodules ]; then
+    git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | while IFS= read -r _stline; do
+        _stkey=${_stline%% *}; _stpath=${_stline#* }
+        [ -n "$_stpath" ] || continue
+        # Does the path exist AND contain a .git file or dir? If yes → not stale.
+        if [ -e "$_stpath/.git" ]; then
+          continue
+        fi
+        # Extract the submodule name from the config key (submodule.<NAME>.path).
+        _stname=${_stkey#submodule.}
+        _stname=${_stname%.path}
+        _sturl=$(git config -f .gitmodules --get "submodule.${_stname}.url" 2>/dev/null || true)
+        printf 'stale-registration\t%s\t%s\t%s\n' "$_stpath" "$_sturl" "$_stname" >> "$_sm_plan"
+        _sm_emit_compact STALE "" "$_stpath" "registered but missing on disk (name=$_stname)"
+        _sm_c_stale=$((_sm_c_stale + 1))
+      done
+    # _sm_c_stale updates inside the pipe live in a subshell (POSIX sh).
+    # Recover the count by counting lines we just wrote.
+    _sm_c_stale=$(awk -F'\t' '$1=="stale-registration"' "$_sm_plan" 2>/dev/null | wc -l | tr -d ' ')
+    [ -z "$_sm_c_stale" ] && _sm_c_stale=0
+  fi
+
   # ─── Per-candidate analysis loop ───
   while IFS= read -r gitpath; do
     submod_path=${gitpath%/.git}
@@ -1879,8 +2390,22 @@ cmd_submodules() {
       status_kw=nested
       _sm_c_nested=$((_sm_c_nested + 1))
     elif [ "$ignored" -eq 1 ] && [ "$_sm_force" -eq 0 ]; then
-      status_kw=ignored
-      _sm_c_ignored=$((_sm_c_ignored + 1))
+      # Ignored via marker — but check for a path-mismatch conflict first:
+      # .gitmodules already registers this URL at a DIFFERENT path (typically
+      # a stale "old" location that no longer exists on disk). That state is
+      # inconsistent and should be surfaced, not silently skipped.
+      _ig_regpath=''
+      [ -n "$url" ] && _ig_regpath=$(_sm_registered_path_for_url "$url" || true)
+      if [ -n "$_ig_regpath" ] && [ "$_ig_regpath" != "$submod_path" ]; then
+        status_kw=ignored-mismatch
+        _sm_c_ignored_mismatch=$((_sm_c_ignored_mismatch + 1))
+        plan_action=resolve-ignored-mismatch
+        printf '%s\t%s\t%s\t%s\n' \
+          "$plan_action" "$submod_path" "$url" "$_ig_regpath" >> "$_sm_plan"
+      else
+        status_kw=ignored
+        _sm_c_ignored=$((_sm_c_ignored + 1))
+      fi
     else
       moved_from=''
       if [ -n "$url" ]; then
@@ -1925,16 +2450,17 @@ cmd_submodules() {
     _flags="${_fl_dirty}${_fl_track}"
 
     case "$status_kw" in
-      registered)    _status_short='OK';       _info='registered' ;;
-      nested)        _status_short='NESTED';   _info="parent=$enc" ;;
-      ignored)       _status_short='IGNORED';  _info='marker' ;;
-      ready)         _status_short='READY';    _info="$url" ;;
-      ready-untrack) _status_short='READY+UT'; _info="$url" ;;
-      will-prompt)   _status_short='PROMPT';   _info='(no origin URL)' ;;
-      no-url)        _status_short='NO-URL';   _info='(no origin URL)' ;;
-      suspicious)    _status_short='SUSPECT';  _info="$url" ;;
-      moved)         _status_short='MOVED';    _info="was=$moved_from  url=$url" ;;
-      *)             _status_short="$status_kw"; _info='' ;;
+      registered)       _status_short='OK';       _info='registered' ;;
+      nested)           _status_short='NESTED';   _info="parent=$enc" ;;
+      ignored)          _status_short='IGNORED';  _info='marker' ;;
+      ignored-mismatch) _status_short='CONFLICT'; _info="marker here, registered as $_ig_regpath" ;;
+      ready)            _status_short='READY';    _info="$url" ;;
+      ready-untrack)    _status_short='READY+UT'; _info="$url" ;;
+      will-prompt)      _status_short='PROMPT';   _info='(no origin URL)' ;;
+      no-url)           _status_short='NO-URL';   _info='(no origin URL)' ;;
+      suspicious)       _status_short='SUSPECT';  _info="$url" ;;
+      moved)            _status_short='MOVED';    _info="was=$moved_from  url=$url" ;;
+      *)                _status_short="$status_kw"; _info='' ;;
     esac
 
     if [ "$_sm_verbose" -eq 1 ]; then
@@ -1964,6 +2490,9 @@ cmd_submodules() {
         registered)    printf '    status       : ALREADY a submodule (.gitmodules)\n' ;;
         nested)        printf '    status       : NESTED inside submodule "%s"\n' "$enc" ;;
         ignored)       printf '    status       : IGNORED via marker\n' ;;
+        ignored-mismatch)
+                       printf '    status       : CONFLICT — ignored here but registered at "%s"\n' "$_ig_regpath"
+                       printf '    action       : sm go -i will prompt [U]pdate path / [R]emove marker\n' ;;
         ready)         printf '    status       : READY (will add)\n' ;;
         ready-untrack) printf '    index        : TRACKED as plain files — needs untrack\n'
                        printf '    status       : READY (will untrack, then add)\n' ;;
@@ -1983,7 +2512,7 @@ cmd_submodules() {
   done < "$_sm_tmpfile"
 
   # ─── Summary ───
-  _sm_to_do=$((_sm_c_ready + _sm_c_need_untrack + _sm_c_prompt + _sm_c_moved))
+  _sm_to_do=$((_sm_c_ready + _sm_c_need_untrack + _sm_c_prompt + _sm_c_moved + _sm_c_ignored_mismatch + _sm_c_stale))
 
   if [ "$_sm_verbose" -eq 1 ] || [ "$_sm_mode" != go ]; then
     echo
@@ -1998,7 +2527,9 @@ cmd_submodules() {
     [ "$_sm_c_nested"  -gt 0 ] && printf '  nested in submodule      : %s   (belongs to parent)\n' "$_sm_c_nested"
     [ "$_sm_c_ignored" -gt 0 ] && printf '  ignored via marker       : %s%s\n' "$_sm_c_ignored" \
       "$([ "$_sm_force" -eq 1 ] && echo '   (overridden by --force)')"
+    [ "$_sm_c_ignored_mismatch" -gt 0 ] && printf '  ignored + path mismatch  : %s   (CONFLICT — will prompt with -i)\n' "$_sm_c_ignored_mismatch"
     [ "$_sm_c_moved"   -gt 0 ] && printf '  moved (rename detected)  : %s   (will be rebound)\n' "$_sm_c_moved"
+    [ "$_sm_c_stale"   -gt 0 ] && printf '  stale registrations      : %s   (in .gitmodules, no on-disk path — will be REMOVED)\n' "$_sm_c_stale"
     printf '  actionable with dirty WT : %s   (their changes preserved)\n' "$_sm_c_dirty"
     printf '  actions planned          : %s\n' "$_sm_to_do"
     echo
@@ -2023,10 +2554,62 @@ cmd_submodules() {
     exit 0
   fi
 
+  # Cross-submodule scan: find unregistered non-ignored nested repos that live
+  # INSIDE registered submodules (sm can't register them from here — they
+  # belong to their parent submodule — but it MUST mention them so the user
+  # isn't left wondering why 'st' shows [unregistered] that 'sm go' ignores).
+  _sm_cross_tmp=$(mktemp "${TMPDIR:-/tmp}/smcross.XXXXXX")
+  find_cross_submodule_unregistered "$(pwd -P)" > "$_sm_cross_tmp" 2>/dev/null || : > "$_sm_cross_tmp"
+  _sm_c_cross=$(awk 'NF' "$_sm_cross_tmp" 2>/dev/null | wc -l | tr -d ' ')
+  [ -z "$_sm_c_cross" ] && _sm_c_cross=0
+
   if [ "$_sm_to_do" -eq 0 ]; then
-    [ "$_sm_verbose" -eq 1 ] && echo "Nothing to do."
+    # Always print a registration verdict so the user can tell "all fine" from
+    # "nothing printed because silent". Structure: MILESTONE ' >>> ' first, then
+    # '  >> ' elaborations.
+    if [ "$_sm_c_ignored_mismatch" -gt 0 ]; then
+      printf ' >>> sm: %s CONFLICT(s) — registered path disagrees with ignore marker\n' \
+        "$_sm_c_ignored_mismatch"
+      printf '  >> run:  %s sm --list-ignored\n' "$US"
+      printf '  >> then: %s sm go -i     # to pick [U]pdate path or [R]emove marker\n' "$US"
+    elif [ "$_sm_c_cross" -gt 0 ]; then
+      printf ' >>> sm: %s unregistered nested repo(s) live INSIDE registered submodules\n' \
+        "$_sm_c_cross"
+      printf '  >> to register them, either pass -R to walk the whole tree:\n'
+      printf '        %s sm -R go -i\n' "$US"
+      printf '  >> or cd into each parent and run sm go there:\n'
+      while IFS="$(printf '\t')" read -r _cpar _csub; do
+        [ -n "$_cpar" ] || continue
+        printf '        cd %s && %s sm go -i    # to register: %s\n' "$_cpar" "$US" "$_csub"
+      done < "$_sm_cross_tmp"
+    else
+      printf ' >>> sm: all nested repos accounted for (registered: %s, ignored: %s' \
+        "$_sm_c_registered" "$_sm_c_ignored"
+      [ "$_sm_c_nested" -gt 0 ] && printf ', inside-submodule: %s' "$_sm_c_nested"
+      printf ')\n'
+      if [ "$_sm_c_nested" -gt 0 ]; then
+        printf '  >> note: %s nested-in-submodule entry(ies) must be registered from inside their parent\n' \
+          "$_sm_c_nested"
+      fi
+    fi
+    rm -f "$_sm_cross_tmp"
+    # Still reconcile the exclude file even when there's nothing to register —
+    # users may have added/removed ignore markers by hand since the last run.
+    [ "$_sm_mode" = go ] && _sm_sync_ignore_exclude quiet || true
     exit 0
   fi
+
+  # ─── Sort the plan TOP-DOWN (parents before children) ───
+  # Registration must be top-down: once a parent is registered as a submodule,
+  # any nested candidate below it belongs to the parent, not the super-repo.
+  # (This is the OPPOSITE order from 'mc', which is bottom-up so child commits
+  # bubble up into the parent's gitlink.)
+  _sm_plan_sorted=$(mktemp "${TMPDIR:-/tmp}/submodplansort.XXXXXX")
+  awk -F'\t' -v OFS='\t' '{
+    n = gsub(/\//, "/", $2)
+    printf "%04d\t%s\n", n, $0
+  }' "$_sm_plan" | LC_ALL=C sort -s -k1,1 -k3,3 | cut -f2- > "$_sm_plan_sorted"
+  mv "$_sm_plan_sorted" "$_sm_plan"
 
   # ─── Dry ───
   if [ "$_sm_mode" = dry ]; then
@@ -2054,6 +2637,17 @@ cmd_submodules() {
           printf '    git rm --cached -- %s\n' "$old"
           printf '    rm -rf -- .git/modules/%s\n' "$old"
           printf '    git submodule add %s %s\n' "$url" "$sp"
+          ;;
+        resolve-ignored-mismatch)
+          printf '  # CONFLICT: %s has ignore marker, registered at %s\n' "$sp" "$old"
+          printf '    (requires -i: prompts [U]pdate path / [R]emove marker / [S]kip / [A]bort)\n'
+          ;;
+        stale-registration)
+          printf '  # STALE: %s is in .gitmodules but no directory exists\n' "$sp"
+          printf '    git config -f .gitmodules --remove-section submodule.%s\n' "$old"
+          printf '    git config --remove-section submodule.%s  2>/dev/null || true\n' "$old"
+          printf '    git rm --cached -f -- %s  2>/dev/null || true\n' "$sp"
+          printf '    rm -rf -- .git/modules/%s  2>/dev/null || true\n' "$old"
           ;;
       esac
     done < "$_sm_plan"
@@ -2095,6 +2689,102 @@ cmd_submodules() {
       done
     fi
 
+    # ─── .gitignore pre-check ─────────────────────────────────────────
+    # Catch the 'ignored-path' case BEFORE invoking 'git submodule add'. A
+    # .gitignore match is a deliberate user signal ("skip this"), not a
+    # failure — handling it here avoids git's noisy "hint: Use -f if you
+    # really want to add them." banner and the misleading ERROR line.
+    _ignpath_force=0
+    _ci=$(git -C "$_sm_toplevel" check-ignore -v -- "$_sp" 2>/dev/null | head -1)
+    if [ -n "$_ci" ]; then
+      _ci_lhs=$(printf '%s' "$_ci" | awk -F'\t' '{print $1}')
+      _ci_src=${_ci_lhs%%:*}
+      _ci_rest=${_ci_lhs#*:}
+      _ci_lno=${_ci_rest%%:*}
+      _ci_pat=${_ci_rest#*:}
+      # Hint: the matching .gitignore may belong to an UNREGISTERED nested
+      # repo of the super — in which case that nested repo is the real fix.
+      _hint_dir=""
+      if [ -n "$_ci_src" ]; then
+        _reg_paths=$(git -C "$_sm_toplevel" config -f .gitmodules \
+          --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+          | awk '{$1=""; sub(/^ /,""); print}')
+        _d=$(dirname "$_ci_src")
+        while [ -n "$_d" ] && [ "$_d" != "." ] && [ "$_d" != "/" ]; do
+          if [ -e "$_sm_toplevel/$_d/.git" ]; then
+            if ! printf '%s\n' "$_reg_paths" | grep -qxF "$_d"; then
+              _hint_dir=$_d
+              break
+            fi
+          fi
+          _d=$(dirname "$_d")
+        done
+      fi
+      # Compute path to append as a negation, relative to the matching
+      # .gitignore's own directory (so it targets this file's scope).
+      _gi_dir=$(dirname "$_ci_src")
+      case "$_gi_dir" in
+        ""|".") _rel_from_gi=$_sp ;;
+        *)      _rel_from_gi=${_sp#"$_gi_dir"/} ;;
+      esac
+
+      if [ "$_sm_interactive" -ne 1 ]; then
+        # Default: respect .gitignore silently. It IS the permanent marker
+        # (no need for a parallel my-git-submodules.ignore file).
+        if [ -n "$_ci_lhs" ]; then
+          log_medium "respecting .gitignore for $_sp ($_ci_src:$_ci_lno pattern '$_ci_pat')"
+        else
+          log_medium "respecting .gitignore for $_sp"
+        fi
+        [ -n "$_hint_dir" ] && \
+          log_medium "hint: $_hint_dir is itself an unregistered nested repo — register it first so its .gitignore stops leaking"
+        return 1
+      fi
+
+      printf '\n    %s is matched by a .gitignore pattern.\n' "$_sp"
+      if [ -n "$_ci_lhs" ]; then
+        printf '      source:  %s:%s\n' "$_ci_src" "$_ci_lno"
+        printf '      pattern: %s\n' "$_ci_pat"
+      fi
+      if [ -n "$_hint_dir" ]; then
+        printf '      hint:    %s is itself an UNREGISTERED nested repo —\n' "$_hint_dir"
+        printf '               register it first (%s sm go, accept %s)\n' "$US" "$_hint_dir"
+        printf '               so its .gitignore stops leaking into this add.\n'
+      fi
+      printf '    Options:\n'
+      printf '      [N]egate  append "!%s/" to %s, then register  (keeps .gitignore honest)\n' \
+        "$_rel_from_gi" "$_ci_src"
+      printf '      [F]orce   git submodule add -f                (leaves .gitignore stale)\n'
+      printf '      [S]kip    respect .gitignore                  (.gitignore IS the marker)\n'
+      printf '      [A]bort\n'
+      _ans=$(_sm_ask "    Choice? [N/f/s/a]: ")
+      case "$_ans" in
+        n|N|'')
+          _gi_file="$_sm_toplevel/$_ci_src"
+          if [ -s "$_gi_file" ]; then
+            _last=$(tail -c1 "$_gi_file" 2>/dev/null)
+            if [ "$_last" != "" ] && [ "$_last" != "
+" ]; then
+              printf '\n' >> "$_gi_file" 2>/dev/null || {
+                log_error "could not append to $_gi_file — skipping"
+                return 1
+              }
+            fi
+          fi
+          printf '!%s/\n' "$_rel_from_gi" >> "$_gi_file" 2>/dev/null || {
+            log_error "could not append to $_gi_file — skipping"
+            return 1
+          }
+          printf '    appended "!%s/" to %s\n' "$_rel_from_gi" "$_ci_src"
+          # Fall through — git submodule add will now succeed without -f.
+          ;;
+        f|F) _ignpath_force=1 ;;
+        s|S) return 1 ;;
+        a|A) return 2 ;;
+        *)   return 1 ;;
+      esac
+    fi
+
     _tmp="${_sp}${_sm_PREEXISTING_SUFFIX}$$"
     INFLIGHT_ORIG="$_sp"; INFLIGHT_TMP="$_tmp"
     mv -- "$_sp" "$_tmp"
@@ -2102,7 +2792,11 @@ cmd_submodules() {
     while : ; do
       printf 'ADD      %s  <-  %s\n' "$_sp" "$_url"
       _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
-      _sm_safe_git "$_sm_toplevel" submodule add "$_url" "$_sp" 2>"$_errlog"
+      if [ "$_ignpath_force" = 1 ]; then
+        _sm_safe_git "$_sm_toplevel" submodule add -f "$_url" "$_sp" 2>"$_errlog"
+      else
+        _sm_safe_git "$_sm_toplevel" submodule add "$_url" "$_sp" 2>"$_errlog"
+      fi
       _rc=$?
 
       if [ "$_rc" -eq 0 ]; then
@@ -2118,6 +2812,7 @@ cmd_submodules() {
       if   grep -q 'is in submodule' "$_errlog" 2>/dev/null; then _reason=in-submodule
       elif grep -q 'already exists in the index' "$_errlog" 2>/dev/null; then _reason=in-index
       elif grep -q 'A git directory for .* is found locally' "$_errlog" 2>/dev/null; then _reason=stale-gitdir
+      elif grep -q 'following paths are ignored\|paths are ignored by one of your' "$_errlog" 2>/dev/null; then _reason=ignored-path
       elif grep -q 'Repository not found\|Could not read from remote\|does not appear to be a git repository\|Operation timed out\|Connection timed out\|Could not resolve host\|Name or service not known' "$_errlog" 2>/dev/null; then _reason=bad-url
       fi
       rm -f "$_errlog"
@@ -2158,6 +2853,16 @@ cmd_submodules() {
 
       if [ "$_reason" = in-index ]; then
         echo "    (still in index; try: git rm --cached -r -- $_sp, then re-run)" >&2
+        rm -rf -- "$_sp" 2>/dev/null || true
+        mv -- "$_tmp" "$_sp"
+        INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        return 1
+      fi
+
+      if [ "$_reason" = ignored-path ]; then
+        # Pathological: the pre-check missed this. Skip silently rather
+        # than spew ERROR — the pre-check is authoritative, anything past
+        # it is unexpected state we shouldn't annoy the user about.
         rm -rf -- "$_sp" 2>/dev/null || true
         mv -- "$_tmp" "$_sp"
         INFLIGHT_ORIG=""; INFLIGHT_TMP=""
@@ -2286,11 +2991,59 @@ cmd_submodules() {
 
   [ "$_sm_verbose" -eq 1 ] && echo "Applying..."
   _sm_added=0; _sm_skipped=0; _sm_newly_ignored=0; _sm_rebound=0
+  _sm_stale_removed=0
+  _sm_skipped_nested_after=0
   while IFS="$(printf '\t')" read -r action sp url old; do
+    # Top-down invariant: if a previous step in this run registered an
+    # ancestor of $sp as a submodule, $sp no longer belongs to the super-repo.
+    # Re-read .gitmodules NOW (it may have changed since analysis) and defer
+    # to the parent submodule.
     case "$action" in
+      add|add-with-untrack|prompt-url|prompt-url-untrack|resolve-ignored-mismatch|rebind-moved)
+        _enc_now=$(_sm_enclosing_submodule "$sp" || true)
+        if [ -n "$_enc_now" ]; then
+          printf '\nSKIP     %s  (now nested inside registered submodule %s)\n' "$sp" "$_enc_now"
+          printf '    register it from inside the parent:\n'
+          printf '      cd %s && %s sm go\n' "$_enc_now" "$US"
+          _sm_skipped_nested_after=$((_sm_skipped_nested_after + 1))
+          _sm_skipped=$((_sm_skipped + 1))
+          continue
+        fi
+        ;;
+    esac
+    case "$action" in
+      stale-registration)
+        # $old holds the submodule NAME (from the .gitmodules key), $sp the path.
+        printf '\nSTALE    %s  (registered as name=%s, no directory on disk)\n' "$sp" "$old"
+        if [ "$_sm_interactive" -eq 1 ]; then
+          _ans=$(_sm_ask "    Remove stale registration? [Y]es / [S]kip / [A]bort: ")
+          case "$_ans" in
+            a|A) echo "Aborted by user." >&2; exit 77 ;;
+            s|S|n|N) echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
+          esac
+        fi
+        printf '    removing .gitmodules entry, .git/config entry, index entry, .git/modules/%s\n' "$old"
+        git config -f .gitmodules --remove-section "submodule.$old" 2>/dev/null || true
+        git config --remove-section "submodule.$old" 2>/dev/null || true
+        git rm --cached -f -- "$sp" 2>/dev/null || true
+        if [ -n "$old" ]; then
+          rm -rf -- ".git/modules/$old" 2>/dev/null || true
+        fi
+        _sm_stale_removed=$((_sm_stale_removed + 1))
+        continue
+        ;;
       rebind-moved)
         printf '\nREBIND   %s -> %s\n' "$old" "$sp"
         printf '    url: %s\n' "$url"
+        # Preferred path: rename .git/modules/<old> -> .git/modules/<sp>
+        # and rewrite the gitdir pointer — no re-clone, preserves local
+        # branches, unpushed commits, stashes, and uncommitted changes.
+        if _sm_try_preserve_rebind "$old" "$sp" "$url"; then
+          printf '    gitdir moved in-place (no re-clone; all local state kept)\n'
+          _sm_rebound=$((_sm_rebound + 1))
+          continue
+        fi
+        # Fall back to re-clone flow (below).
         _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
         if [ -n "$_risk_msg" ]; then
           # Shortcut: if the only dirt is tracked-file modifications, just
@@ -2307,7 +3060,7 @@ cmd_submodules() {
             _ans=$(_sm_ask "    [P]roceed / [S]kip / [A]bort? [p/S/a]: ")
             case "$_ans" in
               p|P) : ;;
-              a|A) echo "Aborted by user." >&2; exit 1 ;;
+              a|A) echo "Aborted by user." >&2; exit 77 ;;
               *)   echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
             esac
           else
@@ -2338,10 +3091,103 @@ cmd_submodules() {
         case "$_rc" in
           0) _sm_rebound=$((_sm_rebound + 1)) ;;
           1) _sm_skipped=$((_sm_skipped + 1)) ;;
-          2) echo "Aborted by user." >&2; exit 1 ;;
+          2) echo "Aborted by user." >&2; exit 77 ;;
           3) _sm_newly_ignored=$((_sm_newly_ignored + 1)) ;;
         esac
         continue
+        ;;
+      resolve-ignored-mismatch)
+        printf '\nCONFLICT %s  (ignore marker present, registered in .gitmodules at %s)\n' "$sp" "$old"
+        printf '    url: %s\n' "$url"
+        if [ "$_sm_interactive" -ne 1 ]; then
+          echo "    skipped (re-run with -i to resolve)." >&2
+          _sm_skipped=$((_sm_skipped + 1))
+          continue
+        fi
+        printf '    Options:\n'
+        printf '      [U]pdate .gitmodules path (%s -> %s) AND remove the ignore marker,\n' "$old" "$sp"
+        printf '          then rebind in place (preserves local branches / commits / changes)\n'
+        printf '      [R]emove ignore marker only; leave .gitmodules entry as-is\n'
+        printf '          (next "%s sm go" will treat this as a moved submodule)\n' "$US"
+        printf '      [S]kip  / [A]bort\n'
+        _ans=$(_sm_ask "    Choice? [U/r/s/a]: ")
+        case "$_ans" in
+          u|U|'')
+            _gp=$(_sm_gitpath_for "$sp")
+            if [ -n "$_gp" ]; then
+              _mk=$(_sm_ignore_marker_path "$_gp" "$sp")
+              if rm -f "$_mk" 2>/dev/null; then
+                printf '    removed ignore marker: %s\n' "$_mk"
+              else
+                echo "    warning: could not remove ignore marker: $_mk" >&2
+              fi
+            fi
+            # Try preserve-rebind first (no re-clone; keeps all local state).
+            if _sm_try_preserve_rebind "$old" "$sp" "$url"; then
+              printf '    .gitmodules path updated: %s -> %s\n' "$old" "$sp"
+              printf '    gitdir moved in-place (no re-clone; all local state kept)\n'
+              _sm_rebound=$((_sm_rebound + 1))
+              continue
+            fi
+            # Preserve-rebind refused (usually because .git/modules/<old> is
+            # absent). Fall back to the full re-clone rebind flow. Reuse the
+            # rebind-moved code path by re-emitting the work here.
+            _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
+            if [ -n "$_risk_msg" ]; then
+              _sm_autocommit_if_safe "$sp"
+              [ $? -eq 0 ] && _risk_msg=$(_sm_rebind_has_risky_state "$sp" || true)
+            fi
+            if [ -n "$_risk_msg" ]; then
+              printf '    warning: nested repo at %s has: %s\n' "$sp" "$_risk_msg"
+              printf '    The rebind re-clones from origin and would lose this.\n'
+              _ans2=$(_sm_ask "    [P]roceed / [S]kip / [A]bort? [p/S/a]: ")
+              case "$_ans2" in
+                p|P) : ;;
+                a|A) echo "Aborted by user." >&2; exit 77 ;;
+                *)   echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
+              esac
+            fi
+            if [ -f .gitmodules ]; then
+              printf '    removing [submodule "%s"] from .gitmodules\n' "$old"
+              _sm_remove_gitmodules_entry "$old" || {
+                echo "    error: could not edit .gitmodules — skipping" >&2
+                _sm_skipped=$((_sm_skipped + 1)); continue
+              }
+            fi
+            if git ls-files --error-unmatch -- "$old" >/dev/null 2>&1; then
+              printf '    git rm --cached -- %s\n' "$old"
+              git rm --cached --quiet -- "$old" 2>/dev/null || true
+            fi
+            _stale="$_sm_toplevel/.git/modules/$old"
+            if [ -e "$_stale" ]; then
+              printf '    rm -rf -- %s\n' "$_stale"
+              rm -rf -- "$_stale"
+            fi
+            _sm_try_add_with_prompts "$sp" "$url"
+            _rc=$?
+            case "$_rc" in
+              0) _sm_rebound=$((_sm_rebound + 1)) ;;
+              1) _sm_skipped=$((_sm_skipped + 1)) ;;
+              2) echo "Aborted by user." >&2; exit 77 ;;
+              3) _sm_newly_ignored=$((_sm_newly_ignored + 1)) ;;
+            esac
+            continue ;;
+          r|R)
+            _gp=$(_sm_gitpath_for "$sp")
+            if [ -n "$_gp" ]; then
+              _mk=$(_sm_ignore_marker_path "$_gp" "$sp")
+              if rm -f "$_mk" 2>/dev/null; then
+                printf '    removed ignore marker: %s\n' "$_mk"
+                printf '    (next "%s sm go" will now detect this as a moved submodule)\n' "$US"
+              else
+                echo "    warning: could not remove ignore marker: $_mk" >&2
+              fi
+            fi
+            _sm_skipped=$((_sm_skipped + 1))
+            continue ;;
+          a|A) echo "Aborted by user." >&2; exit 77 ;;
+          *)   echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
+        esac
         ;;
     esac
 
@@ -2362,7 +3208,7 @@ cmd_submodules() {
               _sm_skipped=$((_sm_skipped + 1))
             fi
             continue ;;
-          a|A) echo "Aborted by user." >&2; exit 1 ;;
+          a|A) echo "Aborted by user." >&2; exit 77 ;;
           '')  echo "    skipped."; _sm_skipped=$((_sm_skipped + 1)); continue ;;
           *)   url=$(_sm_normalize_url "$_ans") ;;
         esac
@@ -2381,15 +3227,37 @@ cmd_submodules() {
     case "$_rc" in
       0) _sm_added=$((_sm_added + 1)) ;;
       1) _sm_skipped=$((_sm_skipped + 1)) ;;
-      2) echo "Aborted by user." >&2; exit 1 ;;
+      2) echo "Aborted by user." >&2; exit 77 ;;
       3) _sm_newly_ignored=$((_sm_newly_ignored + 1)) ;;
     esac
   done < "$_sm_plan"
 
   echo
-  printf 'Added: %s    Rebound: %s    Skipped: %s    Newly ignored: %s\n' \
-    "$_sm_added" "$_sm_rebound" "$_sm_skipped" "$_sm_newly_ignored"
-  if [ "$_sm_added" -gt 0 ] || [ "$_sm_rebound" -gt 0 ] || [ "$_sm_c_need_untrack" -gt 0 ]; then
+  printf 'Added: %s    Rebound: %s    Stale removed: %s    Skipped: %s    Newly ignored: %s\n' \
+    "$_sm_added" "$_sm_rebound" "$_sm_stale_removed" "$_sm_skipped" "$_sm_newly_ignored"
+  if [ "$_sm_skipped_nested_after" -gt 0 ]; then
+    printf '  (of skipped: %s became nested-in-parent after a rebind/add in this run —\n' \
+      "$_sm_skipped_nested_after"
+    printf '   register those from inside the parent submodule)\n'
+  fi
+  # Cross-submodule: report unregistered nested repos found inside registered
+  # submodules — they can only be registered from their parent, not from here.
+  if [ "${_sm_c_cross:-0}" -gt 0 ] && [ -s "${_sm_cross_tmp:-/dev/null}" ]; then
+    printf '\n >>> sm: %s unregistered nested repo(s) live INSIDE registered submodules\n' \
+      "$_sm_c_cross"
+    printf '  >> to register them, either pass -R to walk the whole tree:\n'
+    printf '        %s sm -R go -i\n' "$US"
+    printf '  >> or cd into each parent and run sm go there:\n'
+    while IFS="$(printf '\t')" read -r _cpar _csub; do
+      [ -n "$_cpar" ] || continue
+      printf '        cd %s && %s sm go -i    # to register: %s\n' "$_cpar" "$US" "$_csub"
+    done < "$_sm_cross_tmp"
+  fi
+  rm -f "${_sm_cross_tmp:-/dev/null}" 2>/dev/null || true
+  # Always reconcile .git/info/exclude with the current set of ignored nested
+  # repos so 'git status' in the super-repo doesn't show them as Untracked.
+  _sm_sync_ignore_exclude quiet || true
+  if [ "$_sm_added" -gt 0 ] || [ "$_sm_rebound" -gt 0 ] || [ "$_sm_c_need_untrack" -gt 0 ] || [ "$_sm_stale_removed" -gt 0 ]; then
     echo "Review and commit:  git status  &&  git commit -m 'Register/rebind nested submodules'"
   fi
 }

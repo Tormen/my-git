@@ -2,11 +2,28 @@
 
 Multi-repo git dispatcher with recursive submodule support.
 
-One command (`my-git`) walks a set of super-repos — and every nested
-submodule — to show status, mass-commit changes, or register new nested
-repos as submodules. Designed around the reality that a single tree can
-span multiple git repos owned by multiple users and nested several levels
-deep.
+**Purpose:** manage a multitude of git repos — plus nested git trees and
+repos that use submodules — easily, from a single command. Designed
+around the reality that a single tree can span multiple git repos owned
+by multiple users and nested several levels deep.
+
+`my-git` gives you:
+
+- **`st`** — a recursive **overview** of every repo in a tree (status,
+  divergence, registration state). Always walks the full submodule tree,
+  because the whole point is to see everything in one glance.
+- **`mc`** — mass add + commit + push. **Single level by default** (git's
+  own scope); pass `-R` to walk the full submodule tree bottom-up so
+  child commits bubble into parent gitlinks in one run.
+- **`sm`** — register / rebind / clean up nested repos as proper
+  submodules. **Single level by default**; pass `-R` to walk top-down
+  through every registered submodule.
+
+The split between "always recursive" (`st`) and "opt-in recursive"
+(`mc` / `sm`) mirrors git itself: a super-repo's index only records its
+own submodules' commit SHAs. What lives *inside* a submodule is that
+submodule's responsibility, not the super's. `-R` is the escape hatch
+for "I want ONE command to settle a whole nested tree."
 
 ## Install
 
@@ -49,26 +66,47 @@ config file.
 ## Quick start
 
 ```sh
-my-git st                      # status of current repo + submodules (CWD-aware)
-my-git st /LINKS/global        # status of a specific super-repo tree
-my-git mc                      # mass add+commit+push of current repo + submodules
-my-git sm                      # analyze nested unregistered repos
-my-git sm go                   # register them as submodules
+my-git st                      # recursive OVERVIEW of current tree (CWD-aware)
+my-git st /LINKS/global        # recursive overview of a specific super-repo tree
+my-git mc                      # commit+push the CURRENT repo only (single level)
+my-git mc -R                   # commit+push THIS repo + every submodule (bottom-up)
+my-git sm                      # analyze nested unregistered repos (THIS level)
+my-git sm go                   # register them (THIS level only)
+my-git sm -R go                # register everything, walking the whole tree top-down
 my-git claude-check            # audit .claude/ symlink convention
 ```
 
 ## Subcommands
 
-| Subcommand      | Aliases        | What it does                                                                      |
-|-----------------|----------------|-----------------------------------------------------------------------------------|
-| `status`        | `st`, `s`      | Compact tree summary (one line per repo); `-V` = per-node porcelain listing       |
-| `masscommits`   | `mc`, `c`, `go`| Bottom-up add + commit + push through submodule tree; runs `.claude` audit first  |
-| `submodules`    | `sm`, `sub`    | Discover & register nested git repos as proper submodules                         |
-| `claude-check`  |                | Audit `.claude/` symlink convention (read-only by default)                        |
-| `help`          |                | Show top-level help                                                               |
-| *(none)*        |                | `status`, paged through `less` when stdout is a TTY                               |
+| Subcommand      | Aliases        | Recursion | What it does                                                                      |
+|-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
+| `status`        | `st`, `s`      | always    | Compact tree summary (one line per repo); `-V` = per-node porcelain listing       |
+| `masscommits`   | `mc`, `c`, `go`| opt-in `-R` | Add + commit + push; `-R` = bottom-up walk through every submodule              |
+| `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos; `-R` = top-down walk                      |
+| `claude-check`  |                | always    | Audit `.claude/` symlink convention (read-only by default)                        |
+| `help`          |                | —         | Show top-level help                                                               |
+| *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
 
 Run `my-git --help <subcommand>` (or `my-git <sub> --help`) for details.
+
+### Why recursion is opt-in for `mc` and `sm`
+
+Git's own model is: each super-repo is responsible only for its own index
+and its own submodule gitlinks (one commit SHA per registered submodule).
+What lives inside a submodule — further nested repos, sub-submodules,
+dirty files — is that submodule's concern, not the super's.
+
+`mc` and `sm` follow that model by default. Pass `-R` / `--recursive`
+when you want one command to settle a whole nested tree:
+
+- `mc -R` — **bottom-up**: deepest children commit+push first so each
+  parent's gitlink lands on the freshly-pushed child commit in the
+  same run.
+- `sm -R` — **top-down**: parent rebinds and registrations settle first
+  so children see a stable parent state.
+
+`st` is always recursive because overview IS its job — a multi-level
+tree seen at a glance, no walking required.
 
 ## Verbosity & debug
 
@@ -86,17 +124,50 @@ Two independent axes. Debug implies verbose.
 `-DD` also enables `set -x` for deep tracing. Never design output that only
 makes sense for a specific `-V + -D` combo — pick one axis per block.
 
+## `sm go` decision table
+
+Every situation `sm go` can encounter, and what it does in default vs
+`-i` mode. Anything not listed here is a bug — either in the code or in
+this table. The table reflects **current** behavior, not aspirational
+design.
+
+| Situation                                                                    | `sm go` (default)                                 | `sm go -i`                                           |
+|------------------------------------------------------------------------------|---------------------------------------------------|------------------------------------------------------|
+| already registered (path + url match)                                        | no-op                                             | no-op                                                |
+| nested inside registered submodule                                           | silent skip (counted in summary)                  | silent skip (counted in summary)                     |
+| stale registration (`.gitmodules` entry, no dir on disk)                     | auto-remove                                       | prompt `[Y]es / [S]kip / [A]bort`                    |
+| carries `my-git-submodules.ignore` marker                                    | silent skip; `--force` treats as fresh            | silent skip; `--force` treats as fresh               |
+| marker + `.gitmodules` path mismatch (ignore here, registered elsewhere)     | `CONFLICT` note, skip                             | prompt `[U]pdate / [R]emove / [S]kip / [A]bort`      |
+| moved (url matches a different registered path), nested repo **clean**       | rebind in place (no re-clone; all local state kept) | same (no extra prompt)                             |
+| moved, nested repo **risky** (uncommitted+untracked, unpushed branches, stashes) | **skip** with "push/commit first" hint         | prompt `[P]roceed / [S]kip / [A]bort`                |
+| no origin url on nested repo                                                 | silent skip (counted `missing origin URL`)        | prompt for URL                                       |
+| unregistered with url, plain new                                             | `git submodule add`                               | same                                                 |
+| unregistered with url, path already tracked in index (embedded)              | `UNTRACK` (`git rm --cached -r`) + `git submodule add` | same                                            |
+| url looks suspicious (unusual scheme)                                        | add anyway (warn only, counted)                   | extra `[U]se / [E]dit / [S]kip / [I]gnore perm / [A]bort` prompt first |
+| path matches a `.gitignore` pattern (pre-checked with `git check-ignore`)    | silent skip — `.gitignore` IS the marker (no `add` run) | prompt `[N]egate / [F]orce / [S]kip / [A]bort` — `[N]` appends `!<rel>/` to the matching `.gitignore`, then adds |
+| stale `.git/modules/<name>/` from an interrupted prior run                   | **ERROR** + skip                                  | same; `--force` reuses the stale gitdir and adds     |
+
+`[A]bort` in any `-i` prompt exits the whole run with code 77; under
+`-R` it propagates up and terminates the entire recursive walk (not
+just the current node).
+
+`--force` effects, consolidated:
+
+- bypasses per-repo `my-git-submodules.ignore` markers (treat as fresh).
+- reuses a stale `.git/modules/<name>/` rather than erroring out.
+- skips the suspicious-URL guard.
+
 ## Status output
 
 Default is a one-line-per-repo ascii-art tree. Each line renders the repo's
 branch position in the tree followed by its state summary:
 
 ```text
-/LINKS/global                    CLEAN :))
-├── src                          DIRTY (18)  [M:1 ??:17]
-│   ├── py/my-plex [unregistered]  CLEAN :))
-│   └── sh/my-git [unregistered]   DIRTY (2)  [M:2]
-└── etc                          CLEAN, ahead 1
+/LINKS/global                          CLEAN :))
+├── src [registered]                   DIRTY (18)  [M:1 ??:17]
+│   ├── py/my-plex [registered]        CLEAN :))
+│   └── sh/my-git [unregistered]       DIRTY (2)  [M:2]
+└── etc [registered]                   CLEAN, ahead 1
 ```
 
 States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
@@ -105,9 +176,27 @@ States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
 `[ERROR …]`.
 
 The tree includes **both** registered submodules and unregistered nested
-git repos found on disk; unregistered ones are tagged `[unregistered]`.
-Run `my-git sm go` to register them. Nested repos with
-`.git/my-git-submodules.ignore` are suppressed from the tree.
+git repos found on disk. Marks shown after the display name make registration
+state explicit:
+
+- `[registered]` — nested git repo registered in `.gitmodules`; `sm` has
+  nothing to do for this entry.
+- `[unregistered]` — nested git repo not yet in `.gitmodules`. Run
+  `my-git sm go` to register.
+- `[registered, ignored]` — registered submodule **also** carrying the
+  `my-git-submodules.ignore` marker. Conflict state; inspect with
+  `my-git sm --list-ignored`.
+- `[unregistered, ignored]` — unregistered nested repo carrying the ignore
+  marker; `sm go` skips it and `st` does not descend into its subtree.
+- `[STALE REGISTRATION]` — entry in `.gitmodules` whose on-disk path does
+  not exist. Run `my-git sm go` to clean up (removes the `.gitmodules`
+  section, the `.git/config` entry, the index entry, and
+  `.git/modules/<name>/`).
+
+The top-level scope path itself (root of each tree) carries no tag — it is
+the super-repo, not a nested entry. DIRTY/CLEAN is orthogonal to
+registration: DIRTY just means uncommitted file changes, handled by
+`mc`, not `sm`.
 
 `my-git -V st` falls back to the per-node porcelain listing (legacy form).
 
@@ -117,11 +206,17 @@ Run `my-git sm go` to register them. Nested repos with
 # Status of a three-level nested tree (global → src → py/my-plex):
 my-git st /LINKS/global
 
-# Preview what mc would do (no writes):
+# Preview what mc would do for the CURRENT repo only (no writes, single level):
 my-git mc --dry-run
 
-# Register everything + show what it did verbosely:
+# Preview what mc -R would do for the whole tree (no writes, bottom-up):
+my-git mc -R --dry-run /LINKS/global
+
+# Register everything (THIS repo only) + show what it did verbosely:
 my-git -V sm go
+
+# Register everything across the whole tree, top-down, verbose:
+my-git -V sm -R go /LINKS/global
 
 # Deep debug on a single repo, no pager:
 my-git -DD st /LINKS/global/src
