@@ -3781,7 +3781,32 @@ _sm_run_here() {
     done
 
     if [ "$_sm_rmgit" = 1 ]; then
-      # Destructive path: rm -rf each nested .git.
+      # Destructive path: rm -rf each nested .git. REQUIRE an explicit
+      # 'yes' confirmation — not just [y/N] — since this permanently
+      # deletes each nested repo's history. Always ask, regardless of
+      # -i / non-interactive; if no TTY, refuse rather than proceed.
+      echo
+      printf '%s%s%s\n' "$C_RED$C_BOLD" \
+        "!!! --rm-git will PERMANENTLY DELETE the following nested .git dir(s):" "$C_RESET"
+      printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
+        printf '      %s%s/%s%s\n' "$C_YELLOW" "$_fl_top" "$_n" "$C_RESET"
+      done
+      printf '    Each nested repo'\''s HISTORY WILL BE LOST (orphaned objects inside the\n'
+      printf '    moved-out .git are unrecoverable unless you had a backup).\n'
+      printf '    Default flatten (without --rm-git) keeps histories; use that if unsure.\n'
+      printf '\n'
+      if [ ! -r /dev/tty ]; then
+        log_error "--rm-git needs interactive confirmation but no TTY is available"
+        exit 1
+      fi
+      printf '%sType exactly %s'\''yes'\''%s %sto proceed, anything else to abort:%s ' \
+        "$C_RED$C_BOLD" "$C_YELLOW" "$C_RESET$C_RED$C_BOLD" "" "$C_RESET" >/dev/tty
+      IFS= read -r _fl_confirm </dev/tty || _fl_confirm=''
+      if [ "$_fl_confirm" != "yes" ]; then
+        log_major "--rm-git: aborted (expected literal 'yes', got: '$_fl_confirm')"
+        exit 1
+      fi
       printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
         [ -n "$_n" ] || continue
         log_medium "RM       $_n"
