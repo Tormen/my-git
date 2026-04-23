@@ -167,17 +167,20 @@ file_owner() {
 is_pushable() {
   # 0 = push allowed, 1 = commit-only.
   # Push is allowed ONLY when the repo's absolute path matches one of
-  # the entries in GIT_REPOS (resolved to absolute). This protects
-  # against pushing to third-party forks (or repos with a ./url local
-  # remote like icfp) during an -R walk. Each super-repo in GIT_REPOS
-  # IS meant to receive pushes; submodules discovered under it during
-  # -R are not.
+  # the entries in GIT_REPOS. Compare BOTH forms — logical (symlink-
+  # preserving, e.g. '/LINKS/src') and physical (realpath, e.g.
+  # '/Users/MINE/system/global/src') — on each side, so the match works
+  # regardless of whether GIT_REPOS and the caller's CWD use symlink
+  # or resolved form. Each super-repo in GIT_REPOS is meant to receive
+  # pushes; submodules walked via -R that aren't in the list are not.
   _ip_r=$1
-  _ip_abs=$(cd "$_ip_r" 2>/dev/null && pwd -P) || return 1
+  _ip_log=$(cd "$_ip_r" 2>/dev/null && printf '%s' "$PWD") || return 1
+  _ip_phys=$(cd "$_ip_r" 2>/dev/null && pwd -P) || return 1
   for _ip_base in $GIT_REPOS; do
     [ -d "$_ip_base" ] || continue
-    _ip_base_abs=$(cd "$_ip_base" 2>/dev/null && pwd -P) || continue
-    if [ "$_ip_abs" = "$_ip_base_abs" ]; then
+    _ip_base_log=$(cd "$_ip_base" 2>/dev/null && printf '%s' "$PWD") || continue
+    _ip_base_phys=$(cd "$_ip_base" 2>/dev/null && pwd -P) || continue
+    if [ "$_ip_log" = "$_ip_base_log" ] || [ "$_ip_phys" = "$_ip_base_phys" ]; then
       return 0
     fi
   done
@@ -337,9 +340,23 @@ is_git_repo() {
 
 git_toplevel_of() {
   # Print the top-level of the git worktree containing $1, or empty.
+  # Returns the LOGICAL (symlink-preserving) path — i.e. if $1 was
+  # '/LINKS/src' (a symlink to /Users/MINE/system/global/src), the
+  # output is '/LINKS/src', not the dereferenced physical path. This
+  # keeps my-git's user-facing output speaking the same path the user
+  # typed. Equality checks that need to dereference use pwd -P locally.
   _p=$1
   [ -d "$_p" ] || _p=${_p%/*}
-  ( cd "$_p" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null )
+  (
+    cd "$_p" 2>/dev/null || exit 1
+    _cdup=$(git rev-parse --show-cdup 2>/dev/null) || exit 1
+    # Descend via the relative cdup — 'cd' is logical by default in
+    # POSIX sh, so $PWD stays in the symlinked world.
+    if [ -n "$_cdup" ]; then
+      cd "$_cdup" 2>/dev/null || exit 1
+    fi
+    printf '%s\n' "$PWD"
+  )
 }
 
 # ─── Submodule discovery ────────────────────────────────────────────────
@@ -477,10 +494,11 @@ indent_for() {
 # ─── Scope resolution ───────────────────────────────────────────────────
 # Echoes newline-separated list of super-repo roots to operate on.
 resolve_scope() {
+  # Returns LOGICAL (symlink-preserving) absolute paths — see git_toplevel_of.
   # If explicit paths passed, use them.
   if [ $# -gt 0 ]; then
     for _p in "$@"; do
-      _abs=$(cd "$_p" 2>/dev/null && pwd -P) || { log_error "not a directory: $_p"; return 1; }
+      _abs=$(cd "$_p" 2>/dev/null && printf '%s' "$PWD") || { log_error "not a directory: $_p"; return 1; }
       if ! is_git_repo "$_abs"; then
         log_error "not a git repo (no .git): $_abs"
         return 1
@@ -501,7 +519,8 @@ resolve_scope() {
   for _r in $GIT_REPOS; do
     [ -d "$_r" ] || { log_warn "skipping missing repo from GIT_REPOS: $_r"; continue; }
     is_git_repo "$_r" || { log_warn "skipping non-git path from GIT_REPOS: $_r"; continue; }
-    _abs=$(cd "$_r" && pwd -P)
+    # Logical path: preserve the form written in GIT_REPOS (e.g. /LINKS/src).
+    _abs=$(cd "$_r" 2>/dev/null && printf '%s' "$PWD")
     printf '%s\n' "$_abs"
   done
 }
