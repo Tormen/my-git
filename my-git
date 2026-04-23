@@ -1897,6 +1897,29 @@ cmd_pull() {
 # each .git back); --rm-git irreversibly deletes the nested .git dirs.
 # Must run from the repo's toplevel.
 cmd_flatten() {
+  # _fl_build_paths_argv: compute the list of paths flatten ACTUALLY
+  # touches — strip '/.git' from each nested entry (so 'it/foo/.git'
+  # becomes 'it/foo', the directory containing the files we want to
+  # add), then union with orphan gitlink paths (already without /.git),
+  # dedup, and build a shell-escaped argv string in $_fl_argv.
+  # Used by the add/commit phase so we pass ONLY flatten's paths to
+  # 'git add --' and 'git commit --only --', leaving any unrelated
+  # user changes untouched.
+  _fl_build_paths_argv() {
+    _fl_paths_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flpaths.XXXXXX") || return 1
+    {
+      printf '%s\n' "$_fl_nested" | sed 's|/\.git$||'
+      printf '%s\n' "$_fl_orphan"
+    } | grep -v '^$' | sort -u > "$_fl_paths_tmp"
+    _fl_argv=""
+    while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      _fl_argv="$_fl_argv $(shell_escape "$_p")"
+    done < "$_fl_paths_tmp"
+    rm -f "$_fl_paths_tmp"
+    [ -n "$_fl_argv" ]
+  }
+
   _fl_mode=analyze
   _fl_interactive=0
   _fl_rmgit=0
@@ -2021,18 +2044,23 @@ cmd_flatten() {
       log_major "--rm-git: aborted (expected literal 'yes', got: '$_fl_confirm')"
       exit 1
     fi
-    printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+    while IFS= read -r _n; do
       [ -n "$_n" ] || continue
       log_medium "delete   $_n"
       run rm -rf -- "$_n" || log_warn "rm failed for $_n"
-    done
-    log_major "staging & committing flattened content..."
-    run git add -A || { log_error "git add -A failed"; exit 1; }
+    done <<_FL_EOF
+$_fl_nested
+_FL_EOF
+    log_major "staging & committing flattened content (only paths flatten touched)..."
+    _fl_build_paths_argv || { log_error "could not compute path list"; exit 1; }
+    # shellcheck disable=SC2086
+    eval "run git add -- $_fl_argv" || { log_error "git add failed"; exit 1; }
     _fl_msg="my-git flatten --rm-git: $_fl_n_nested nested .git removed, $_fl_n_orphan orphan gitlink(s) unstaged"
     _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
-    if run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
+    # shellcheck disable=SC2086
+    if eval "run git commit --only -q -m \"\$_fl_msg\" -- $_fl_argv" 2>"$_fl_commit_log"; then
       rm -f "$_fl_commit_log"
-      log_major "$_fl_top: $(c_green 'DONE :))') (flattened; nested histories DELETED)"
+      log_major "$_fl_top: $(c_green 'DONE :))') (flattened; child .git dirs DELETED; unrelated changes left untouched)"
     else
       log_error "flatten commit failed:"
       cat "$_fl_commit_log" >&2
@@ -2061,7 +2089,7 @@ cmd_flatten() {
   trap '_fl_restore; rm -rf "$_fl_save_root"; exit 1' INT TERM HUP
 
   _fl_i=0
-  printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+  while IFS= read -r _n; do
     [ -n "$_n" ] || continue
     _fl_i=$((_fl_i + 1))
     _fl_save_path="$_fl_save_root/$_fl_i"
@@ -2073,18 +2101,28 @@ cmd_flatten() {
       rm -rf "$_fl_save_root"
       exit 1
     }
-  done
+  done <<_FL_EOF
+$_fl_nested
+_FL_EOF
 
-  log_major "staging & committing flattened content..."
-  if ! run git add -A; then
-    log_error "git add -A failed; restoring .git dirs..."
+  log_major "staging & committing flattened content (only paths flatten touched)..."
+  if ! _fl_build_paths_argv; then
+    log_error "could not compute path list; restoring .git dirs..."
+    _fl_restore
+    rm -rf "$_fl_save_root"
+    exit 1
+  fi
+  # shellcheck disable=SC2086
+  if ! eval "run git add -- $_fl_argv"; then
+    log_error "git add failed; restoring .git dirs..."
     _fl_restore
     rm -rf "$_fl_save_root"
     exit 1
   fi
   _fl_msg="my-git flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged"
   _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
-  if ! run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
+  # shellcheck disable=SC2086
+  if ! eval "run git commit --only -q -m \"\$_fl_msg\" -- $_fl_argv" 2>"$_fl_commit_log"; then
     log_error "flatten commit failed:"
     cat "$_fl_commit_log" >&2
     rm -f "$_fl_commit_log"
@@ -2098,7 +2136,7 @@ cmd_flatten() {
   _fl_restore
   rm -rf "$_fl_save_root"
   trap - INT TERM HUP
-  log_major "$_fl_top: $(c_green 'DONE :))') (flattened; nested histories preserved)"
+  log_major "$_fl_top: $(c_green 'DONE :))') (flattened; child .git dirs kept as-is; unrelated changes left untouched)"
 }
 
 # ═════════════════════════════════════════════════════════════════════════
