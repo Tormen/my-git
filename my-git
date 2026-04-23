@@ -3979,12 +3979,21 @@ _sm_run_here() {
   done < "$_sm_plan"
 
   echo
-  printf 'Added: %s    Rebound: %s    Stale removed: %s    Skipped: %s    Newly ignored: %s\n' \
-    "$_sm_added" "$_sm_rebound" "$_sm_stale_removed" "$_sm_skipped" "$_sm_newly_ignored"
+  log_major "sm: summary"
+  _sm_total=$((_sm_added + _sm_rebound + _sm_stale_removed + _sm_skipped + _sm_newly_ignored))
+  _sm_parts=""
+  [ "$_sm_added" -gt 0 ]         && _sm_parts="$_sm_parts added=$_sm_added"
+  [ "$_sm_rebound" -gt 0 ]       && _sm_parts="$_sm_parts rebound=$_sm_rebound"
+  [ "$_sm_stale_removed" -gt 0 ] && _sm_parts="$_sm_parts stale-removed=$_sm_stale_removed"
+  [ "$_sm_skipped" -gt 0 ]       && _sm_parts="$_sm_parts skipped=$_sm_skipped"
+  [ "$_sm_newly_ignored" -gt 0 ] && _sm_parts="$_sm_parts newly-ignored=$_sm_newly_ignored"
+  [ -z "$_sm_parts" ] && _sm_parts=" (nothing to do)"
+  printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$_sm_total" "$_sm_parts"
   if [ "$_sm_skipped_nested_after" -gt 0 ]; then
-    printf '  (of skipped: %s became nested-in-parent after a rebind/add in this run —\n' \
-      "$_sm_skipped_nested_after"
-    printf '   register those from inside the parent submodule)\n'
+    printf '  %s>>%s   of skipped: %s became nested-in-parent after a rebind/add in this run —\n' \
+      "$C_BLUE" "$C_RESET" "$_sm_skipped_nested_after"
+    printf '  %s>>%s   register those from inside the parent submodule\n' \
+      "$C_BLUE" "$C_RESET"
   fi
   # Cross-submodule: report unregistered nested repos found inside registered
   # submodules — they can only be registered from their parent, not from here.
