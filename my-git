@@ -26,7 +26,7 @@ if [ -t 1 ]; then
   C_RED=$(printf '\033[31m')
   C_GREEN=$(printf '\033[32m')
   C_YELLOW=$(printf '\033[33m')
-  C_BLUE=$(printf '\033[34m')
+  C_BLUE=$(printf '\033[94m')    # bright blue (ANSI 94 vs plain 34 — better contrast on dark bg)
   C_CYAN=$(printf '\033[36m')
   C_RESET=$(printf '\033[0m')
 else
