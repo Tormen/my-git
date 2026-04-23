@@ -1019,14 +1019,10 @@ build_commit_message() {
   _files=$(run_as_owner_capture "$_r" git status --porcelain 2>/dev/null | cut -c4-)
   _files_cnt=$(printf '%s\n' "$_files" | grep -c . || true)
 
-  # Intro line
-  if [ "$_files_cnt" -eq 1 ]; then
-    _intro="$_files: ..."
-  elif [ "$_files_cnt" -le 5 ]; then
-    _intro=$( printf '%s' "$_files" | paste -s - ; printf '\n\n'; printf '%s\n' "$_files" | sed -e 's/$/: .../' )
-  else
-    _intro="$_r: AUTOMATIC-MASS-COMMIT [my-git mc]"
-  fi
+  # Subject: unified "MASSCOMMIT from my-git" per user's mental model
+  # of mc ('mass commit'). Full file list and diffs go into the body
+  # block below so the info is preserved.
+  _intro="MASSCOMMIT from my-git"
 
   # Diff / files block
   if [ "$_files_cnt" -gt "$COMMIT_MSG_DIFF_MAX_FILES" ]; then
@@ -1056,8 +1052,9 @@ $(printf '%s\n' "$_files" | while IFS= read -r _f; do
 
 $(run_as_owner_capture "$_r" git log "-${COMMIT_MSG_LAST_N}" 2>/dev/null)"
 
-  # Final message
-  printf '%s\n.\n' "$_intro"
+  # Final message: subject, blank line (proper git subject-body separator),
+  # then the '#'-prefixed body with file list + recent-log excerpt.
+  printf '%s\n\n' "$_intro"
   printf '%s%s\n' "$_diffs" "$_cmtMsgs" | sed -e 's/^/#   /'
 }
 
@@ -1285,59 +1282,24 @@ commit_one() {
       fi
     fi
   else
+    # mc = MASS COMMIT: classic per-type porcelain counts; we'll
+    # 'git add -A && git commit -a' everything in this repo.
     _n=$(printf '%s\n' "$_porc" | grep -c . 2>/dev/null | head -1)
     _state=dirty
-    # Split dirt into buckets: bumps + recorded (my-git-caused) vs user.
-    _cls=$(printf '%s\n' "$_porc" | _mc_classify_dirt "$_r")
-    _bumps=$(printf '%s\n' "$_cls" | sed -n '1p')
-    _recorded=$(printf '%s\n' "$_cls" | sed -n '2p')
-    _userp=$(printf '%s\n' "$_cls" | sed -n '3p')
-    # awk '{print NF}' on an empty string outputs nothing (no input
-    # line), which breaks '[ -gt 0 ]' later. Guard with explicit 0.
-    if [ -z "$_bumps" ]; then _bump_ct=0; else _bump_ct=$(printf '%s' "$_bumps" | awk '{print NF}'); fi
-    if [ -z "$_recorded" ]; then _rec_ct=0; else _rec_ct=$(printf '%s' "$_recorded" | awk '{print NF}'); fi
-    if [ -z "$_userp" ]; then _user_ct=0; else _user_ct=$(printf '%s' "$_userp" | awk '{print NF}'); fi
-    # Description: show bumps/user split when bumps+recorded > 0.
-    if [ "$_bump_ct" -gt 0 ] || [ "$_rec_ct" -gt 0 ]; then
-      _auto_ct=$((_bump_ct + _rec_ct))
-      if [ "$_user_ct" -gt 0 ]; then
-        _state_desc="DIRTY ($_n) [auto:$_auto_ct user:$_user_ct]"
-      else
-        _state_desc="DIRTY ($_n) [auto:$_auto_ct]"
-      fi
+    _m=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /M/) m++} END{print m+0}')
+    _a=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /A/) a++} END{print a+0}')
+    _d=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /D/) d++} END{print d+0}')
+    _u=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s == "??") u++} END{print u+0}')
+    _parts=""
+    [ "$_m" -gt 0 ] && _parts="$_parts M:$_m"
+    [ "$_a" -gt 0 ] && _parts="$_parts A:$_a"
+    [ "$_d" -gt 0 ] && _parts="$_parts D:$_d"
+    [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
+    _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
+    if [ "$_pushable" = 1 ]; then
+      _action="add+commit+push"
     else
-      # No my-git-caused dirt → use the classic per-type counts.
-      _m=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /M/) m++} END{print m+0}')
-      _a=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /A/) a++} END{print a+0}')
-      _d=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /D/) d++} END{print d+0}')
-      _u=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s == "??") u++} END{print u+0}')
-      _parts=""
-      [ "$_m" -gt 0 ] && _parts="$_parts M:$_m"
-      [ "$_a" -gt 0 ] && _parts="$_parts A:$_a"
-      [ "$_d" -gt 0 ] && _parts="$_parts D:$_d"
-      [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
-      _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
-    fi
-    # Action: my-git-caused part always auto-commits (no prompt); user
-    # part follows the normal add+commit[+push] flow.
-    _user_action=""
-    if [ "$_user_ct" -gt 0 ]; then
-      if [ "$_pushable" = 1 ]; then
-        _user_action="add+commit+push"
-      else
-        _user_action="add+commit"
-      fi
-    fi
-    if [ "$_bump_ct" -gt 0 ] || [ "$_rec_ct" -gt 0 ]; then
-      _auto_ct=$((_bump_ct + _rec_ct))
-      if [ -n "$_user_action" ]; then
-        _action="auto-commit $_auto_ct + $_user_action"
-      else
-        _action="auto-commit $_auto_ct"
-      fi
-    else
-      _action=$_user_action
-      [ -z "$_action" ] && _action=noop
+      _action="add+commit"
     fi
   fi
 
@@ -1354,11 +1316,7 @@ commit_one() {
       clean-matched|clean-no-remote) MC_N_CLEAN=$((MC_N_CLEAN + 1)) ;;
       clean-ahead) [ "$_pushable" = 1 ] && MC_N_WOULD_PUSH=$((MC_N_WOULD_PUSH + 1)) \
                    || MC_N_CLEAN=$((MC_N_CLEAN + 1)) ;;
-      dirty)
-        [ "${_bump_ct:-0}" -gt 0 ] || [ "${_rec_ct:-0}" -gt 0 ] && \
-          MC_N_WOULD_AUTO=$((MC_N_WOULD_AUTO + 1))
-        [ "${_user_ct:-0}" -gt 0 ] && MC_N_WOULD_USER=$((MC_N_WOULD_USER + 1))
-        ;;
+      dirty)       MC_N_WOULD_COMMIT=$((MC_N_WOULD_COMMIT + 1)) ;;
     esac
     return 0
   fi
@@ -1395,48 +1353,32 @@ commit_one() {
       ;;
   esac
 
-  # Dirty — go mode. Split the work:
-  #   Phase 1: auto-commit my-git-caused dirt (bumps + recorded paths)
-  #            transparently via 'git commit --only' — no prompt.
-  #   Phase 2: if any user-dirt remains, follow the normal -i prompt
-  #            flow (add -A + commit -F + push) on the reduced set.
+  # Dirty — MASS COMMIT: git add -A + git commit -a (+push if pushable).
+  # mc is intentionally simple: commit EVERYTHING currently dirty in
+  # this repo as one mass commit. No auto/user split. If the user has
+  # changes they don't want swept in, they should commit/stash them
+  # outside mc (or use '-i' to review per repo).
   log_major "$_r: $_state_desc — $_action"
-  [ "$VRB" = 1 ] && printf '%s\n' "$_porc" | sed -e 's/^/        /' \
-    | while IFS= read -r _l; do log_medium "$_l"; done
+  [ "$VRB" = 1 ] && while IFS= read -r _l; do log_medium "$_l"; done <<_MC_EOF
+$(printf '%s\n' "$_porc" | sed -e 's/^/        /')
+_MC_EOF
 
-  # Phase 1.
-  if ! _mc_auto_commit_my_git_changes "$_r"; then
-    MC_N_ERROR=$((MC_N_ERROR + 1))
-    return 1
-  fi
-
-  # Re-read porcelain. If auto-commit cleared everything my-git touched,
-  # only user-dirt remains (or nothing).
-  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
-  if [ -z "$_porc" ]; then
-    # Auto-commit handled everything; no user-dirt left.
-    return 0
-  fi
-
-  # Phase 2: normal user-dirt flow on the reduced porcelain.
   _msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.commit-msg.XXXXXX")
   build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1; }
 
   if [ "$INTERACTIVE" = 1 ]; then
-    # Show remaining porcelain + proposed commit subject (first line) before acting.
+    # Show porcelain + proposed commit subject before acting.
     printf '%s\n' "$_porc" | sed -e 's/^/        /'
     _subject=$(sed -n '1p' "$_msgfile" 2>/dev/null)
     printf '    proposed commit subject: %s\n' "$_subject"
-    _user_verb="add+commit"
-    [ "$_pushable" = 1 ] && _user_verb="add+commit+push"
-    _ans=$(_sm_ask "    $_r: $_user_verb (user changes)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    _ans=$(_sm_ask "    $_r: $_action? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
       a|A) rm -f "$_msgfile"; log_major "$_r: [ABORT requested]"; return 77 ;;
-      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (user changes)"; MC_N_SKIPPED=$((MC_N_SKIPPED + 1)); return 0 ;;
+      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped"; MC_N_SKIPPED=$((MC_N_SKIPPED + 1)); return 0 ;;
     esac
   fi
 
-  run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; rm -f "$_msgfile"; return 1; }
+  run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; rm -f "$_msgfile"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1; }
 
   # If we must run git as another user, msgfile needs readable perms + chown.
   _owner=$(file_owner "$_r/.git")
@@ -1450,9 +1392,7 @@ commit_one() {
     fi
   fi
 
-  # -F takes the file as the literal commit message (no editor opens).
-  # Previously -t was used → required interactive editing → failed in
-  # non-interactive contexts.
+  # -F: literal message from file (no editor). -a: also include modified tracked files.
   run_as_owner "$_r" git commit -q -a -F "$_msgfile" || {
     log_error "$_r: git commit failed"
     rm -f "$_msgfile"
@@ -1460,14 +1400,14 @@ commit_one() {
     return 1
   }
   rm -f "$_msgfile"
-  MC_N_USER_COMMITTED=$((MC_N_USER_COMMITTED + 1))
+  MC_N_COMMITTED=$((MC_N_COMMITTED + 1))
   if [ "$_pushable" = 1 ]; then
     run_as_owner "$_r" git push -q --all || {
       log_error "$_r: git push failed"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1;
     }
-    log_major "$_r: DONE :)) (added, committed, pushed)"
+    log_major "$_r: DONE :)) (mass-committed, pushed)"
   else
-    log_major "$_r: DONE :)) (added, committed — no push: $_nopush_reason)"
+    log_major "$_r: DONE :)) (mass-committed — no push: $_nopush_reason)"
   fi
 }
 
@@ -1509,24 +1449,18 @@ cmd_masscommits() {
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to commit"; exit 1; }
 
-  # Reset the per-run list of paths my-git's mc side modified — see
-  # _mc_record_change. commit_one phase-1 auto-commit consumes this.
-  MC_COMMIT_PATHS=""
-
   # Per-run counters (summary at end). commit_one updates these globals
   # at each exit path. Analyze mode uses WOULD_* counters; go mode uses
   # the action counters.
   MC_N_TOTAL=0
   MC_N_CLEAN=0          # noop (already clean, matched remote or no remote)
   MC_N_PUSHED=0         # clean-ahead → pushed
-  MC_N_AUTOCOMMITTED=0  # had a phase-1 auto-commit (bumps+recorded)
-  MC_N_USER_COMMITTED=0 # had a phase-2 user-dirt commit
-  MC_N_SKIPPED=0        # user said [S]kip (push or user-dirt) under -i
+  MC_N_COMMITTED=0      # dirty → mass-committed (go mode)
+  MC_N_SKIPPED=0        # user said [S]kip under -i
   MC_N_IGNORED=0        # carries my-git-submodules.ignore marker → silent skip
   MC_N_ERROR=0          # per-repo error (non-fatal, continued)
   MC_N_WOULD_PUSH=0     # analyze: would push
-  MC_N_WOULD_AUTO=0     # analyze: would auto-commit my-git-caused dirt
-  MC_N_WOULD_USER=0     # analyze: would commit user-dirt
+  MC_N_WOULD_COMMIT=0   # analyze: would mass-commit
 
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
@@ -1594,8 +1528,7 @@ cmd_masscommits() {
     _parts=""
     [ "$MC_N_CLEAN" -gt 0 ]          && _parts="$_parts clean=$MC_N_CLEAN"
     [ "$MC_N_PUSHED" -gt 0 ]         && _parts="$_parts pushed=$MC_N_PUSHED"
-    [ "$MC_N_AUTOCOMMITTED" -gt 0 ]  && _parts="$_parts auto-committed=$MC_N_AUTOCOMMITTED"
-    [ "$MC_N_USER_COMMITTED" -gt 0 ] && _parts="$_parts user-committed=$MC_N_USER_COMMITTED"
+    [ "$MC_N_COMMITTED" -gt 0 ]      && _parts="$_parts committed=$MC_N_COMMITTED"
     [ "$MC_N_SKIPPED" -gt 0 ]        && _parts="$_parts skipped=$MC_N_SKIPPED"
     [ "$MC_N_IGNORED" -gt 0 ]        && _parts="$_parts ignored=$MC_N_IGNORED"
     [ "$MC_N_ERROR" -gt 0 ]          && _parts="$_parts $(c_red "errors=$MC_N_ERROR")"
@@ -1621,8 +1554,7 @@ cmd_masscommits() {
     _wparts=""
     [ "$MC_N_CLEAN" -gt 0 ]      && _wparts="$_wparts clean=$MC_N_CLEAN"
     [ "$MC_N_WOULD_PUSH" -gt 0 ] && _wparts="$_wparts would-push=$MC_N_WOULD_PUSH"
-    [ "$MC_N_WOULD_AUTO" -gt 0 ] && _wparts="$_wparts would-auto-commit=$MC_N_WOULD_AUTO"
-    [ "$MC_N_WOULD_USER" -gt 0 ] && _wparts="$_wparts would-user-commit=$MC_N_WOULD_USER"
+    [ "$MC_N_WOULD_COMMIT" -gt 0 ] && _wparts="$_wparts would-commit=$MC_N_WOULD_COMMIT"
     [ "$MC_N_IGNORED" -gt 0 ]    && _wparts="$_wparts ignored=$MC_N_IGNORED"
     [ -z "$_wparts" ] && _wparts=" (nothing to do)"
     printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$MC_N_TOTAL" "$_wparts" "$C_RESET"
