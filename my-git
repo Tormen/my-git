@@ -93,6 +93,14 @@ CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
 COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
 
+# ─── mc: auto-include untracked files ────────────────────────────────────
+# 1 = treat '??' porcelain entries (new files the user added but didn't
+#     'git add' yet) as auto-committable along with my-git-caused dirt
+#     (submodule gitlink bumps, .claude/.gitignore edits). Rationale:
+#     new files are harmless to add; dragging the user through a prompt
+#     for every new file is noise. Set 0 to prompt for untracked too.
+MC_AUTO_COMMIT_UNTRACKED=1
+
 # ─── Privilege: cross-user policy ───────────────────────────────────────
 # Controls what happens when the current user differs from the repo's
 # .git owner. Running as root ALWAYS just works (plain 'su <owner> -c ...',
@@ -888,16 +896,17 @@ _mc_classify_dirt() {
   _cd_bumps=""; _cd_recorded=""; _cd_user=""
   while IFS= read -r _cd_line; do
     [ -n "$_cd_line" ] || continue
-    # Strip 3-char status prefix.
+    # Capture status prefix (first 2 chars) + path.
+    _cd_st=${_cd_line%"${_cd_line#??}"}
     _cd_p=${_cd_line#???}
     # Strip rename "old -> new" — keep the new path only.
     case "$_cd_p" in *" -> "*) _cd_p=${_cd_p##*" -> "} ;; esac
-    # Submodule?
+    # Submodule gitlink?
     if [ -n "$_cd_submods" ] && printf '%s\n' "$_cd_submods" | grep -qxF "$_cd_p"; then
       _cd_bumps="$_cd_bumps $_cd_p"
       continue
     fi
-    # Recorded by my-git?
+    # Recorded by my-git this run?
     _cd_abs="$_cd_r/$_cd_p"
     case "
 ${MC_COMMIT_PATHS}
@@ -906,6 +915,12 @@ ${MC_COMMIT_PATHS}
 ${_cd_abs}
 "*) _cd_recorded="$_cd_recorded $_cd_p" ; continue ;;
     esac
+    # Untracked file with MC_AUTO_COMMIT_UNTRACKED=1 → treat as auto
+    # (new files are harmless to add; don't make the user confirm each).
+    if [ "$_cd_st" = "??" ] && [ "${MC_AUTO_COMMIT_UNTRACKED:-1}" = 1 ]; then
+      _cd_recorded="$_cd_recorded $_cd_p"
+      continue
+    fi
     _cd_user="$_cd_user $_cd_p"
   done
   printf '%s\n%s\n%s\n' "${_cd_bumps# }" "${_cd_recorded# }" "${_cd_user# }"
@@ -1275,6 +1290,8 @@ cmd_masscommits() {
   # Default is analyze to match 'sm' — only 'go' (or explicit alias) acts.
   _mc_mode=analyze
   MC_FORCE=0
+  # Back-compat default for users whose existing config predates this var.
+  MC_AUTO_COMMIT_UNTRACKED=${MC_AUTO_COMMIT_UNTRACKED:-1}
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
