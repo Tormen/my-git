@@ -1962,7 +1962,7 @@ cmd_flatten() {
       printf '  %s>> %s Nested .git dirs to DELETE (irreversible):%s\n' \
         "$C_BLUE" "$_fl_n_nested" "$C_RESET"
     else
-      printf '  %s>> %s Folders to add to parent repo as content, ignoring the nested .git dirs:%s\n' \
+      printf '  %s>> %s Nested git repos to add to parent as content, ignoring the .git contents:%s\n' \
         "$C_BLUE" "$_fl_n_nested" "$C_RESET"
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
