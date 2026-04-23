@@ -222,6 +222,34 @@ file_owner() {
   stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1" 2>/dev/null
 }
 
+is_managed_path() {
+  # 0 = path is in GIT_REPOS (or a descendant); 1 = foreign.
+  # "Managed" means: my-git is authorized to recursively discover
+  # unregistered nested repos inside this scope. For foreign scopes
+  # (e.g. ~/ which happens to be a git repo but is not in the config
+  # list), my-git stays shallow — shows only the scope root itself,
+  # does not descend looking for embedded / nested repos.
+  # Match BOTH logical (symlink-preserving) and physical paths so a
+  # caller's CWD of '/LINKS/src' matches a GIT_REPOS entry of
+  # '/LINKS/global' via physical '/Users/MINE/system/global'.
+  _im_p=$1
+  _im_log=$(cd "$_im_p" 2>/dev/null && printf '%s' "$PWD") || return 1
+  _im_phys=$(cd "$_im_p" 2>/dev/null && pwd -P) || return 1
+  for _im_base in $GIT_REPOS; do
+    [ -d "$_im_base" ] || continue
+    _im_bl=$(cd "$_im_base" 2>/dev/null && printf '%s' "$PWD") || continue
+    _im_bp=$(cd "$_im_base" 2>/dev/null && pwd -P) || continue
+    # Equal or descendant test in both forms.
+    case "$_im_log" in
+      "$_im_bl"|"$_im_bl"/*) return 0 ;;
+    esac
+    case "$_im_phys" in
+      "$_im_bp"|"$_im_bp"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 is_pushable() {
   # 0 = push allowed, 1 = commit-only.
   # Push is allowed ONLY when the repo's absolute path matches one of
@@ -622,7 +650,17 @@ walk_tree_lines() (
     *ign|stale) return 0 ;;
   esac
   _subs_reg=$(list_direct_submodules "$_root")
-  _subs_unreg=$(list_unregistered_nested "$_root")
+  # Unregistered-nested discovery only for MANAGED scopes (in GIT_REPOS
+  # or a descendant). Foreign scopes (e.g. $HOME happens to be a git
+  # repo but isn't in the config list) stay shallow — registered
+  # submodules still shown, but no auto-discovery of embedded repos.
+  # sm uses list_unregistered_nested directly for its own analysis and
+  # is NOT gated by this flag (discovery IS sm's purpose).
+  if [ "${SCOPE_MANAGED:-1}" = 1 ]; then
+    _subs_unreg=$(list_unregistered_nested "$_root")
+  else
+    _subs_unreg=""
+  fi
   _subs_stale=$(list_stale_submodules "$_root")
   _all=$(printf '%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" "$_subs_stale" | grep -v '^$' | sort -u)
   [ -z "$_all" ] && return 0
@@ -820,6 +858,12 @@ cmd_status() {
         continue
         ;;
     esac
+    # Is this scope a managed repo (in GIT_REPOS or a descendant)?
+    # If yes: walk registered submodules + auto-discover unregistered
+    #         nested repos below. If no (e.g. $HOME happens to be a
+    #         git repo but isn't in GIT_REPOS): stay shallow — show
+    #         only the repo root, no discovery.
+    if is_managed_path "$_root"; then SCOPE_MANAGED=1; else SCOPE_MANAGED=0; fi
     if [ "$VRB" = 1 ]; then
       # Verbose: original per-node porcelain output, indented by depth.
       _nodes=$(walk_submodules "$_root")
