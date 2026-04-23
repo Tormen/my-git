@@ -43,7 +43,7 @@ Search order (first existing wins):
 1. `$MY_GIT_CONFIG` env var (escape hatch)
 2. `--config <FILE>` on the CLI
 3. `/LINKS/default/my-git.conf`
-4. `~/.mygit.conf`
+4. `~/.my-git.conf`
 5. `/etc/my-git.conf`
 6. `/usr/local/etc/my-git.conf`
 

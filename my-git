@@ -12,7 +12,7 @@ ME=$(id -un 2>/dev/null || echo "$USER")
 # ─── Runtime flags ───────────────────────────────────────────────────────
 VRB=0; VERYVRB=0; DBG=0; DEEPDBG=0
 CONFIG_FILE=""
-CONFIG_SEARCH_ORDER="/LINKS/default/my-git.conf $HOME/.mygit.conf /etc/my-git.conf /usr/local/etc/my-git.conf"
+CONFIG_SEARCH_ORDER="/LINKS/default/my-git.conf $HOME/.my-git.conf /etc/my-git.conf /usr/local/etc/my-git.conf"
 DRY_RUN=0
 INTERACTIVE=0
 RECURSIVE=0
@@ -127,28 +127,21 @@ load_config() {
 }
 
 create_config() {
-  # Pick first writable location.
-  _target=""
-  for _c in $CONFIG_SEARCH_ORDER; do
-    _dir=${_c%/*}
-    if [ -d "$_dir" ] && [ -w "$_dir" ] && [ ! -e "$_c" ]; then
-      _target=$_c; break
-    fi
-  done
+  # --create-config           → print default config to stdout (CLI).
+  # --create-config <path>    → write default config to <path> (refuse overwrite).
+  _target=${1:-}
   if [ -z "$_target" ]; then
-    log_error "no writable location for config among:"
-    for _c in $CONFIG_SEARCH_ORDER; do
-      _dir=${_c%/*}
-      if [ -e "$_c" ]; then
-        printf '  %s  (already exists — will not overwrite)\n' "$_c" >&2
-      elif [ ! -d "$_dir" ]; then
-        printf '  %s  (parent %s does not exist)\n' "$_c" "$_dir" >&2
-      else
-        printf '  %s  (parent %s not writable)\n' "$_c" "$_dir" >&2
-      fi
-    done
+    _default_config_content
+    exit 0
+  fi
+  if [ -e "$_target" ]; then
+    log_error "--create-config: refusing to overwrite existing file: $_target"
     exit 3
   fi
+  _dir=${_target%/*}
+  case "$_target" in */*) : ;; *) _dir=. ;; esac
+  [ -d "$_dir" ] || fatal "--create-config: parent directory does not exist: $_dir"
+  [ -w "$_dir" ] || fatal "--create-config: parent directory not writable: $_dir"
   _default_config_content > "$_target" || fatal "could not write $_target"
   log_major "config written: $_target"
   log_medium "edit it, then:  my-git <subcommand>"
@@ -169,6 +162,26 @@ shell_escape() {
 file_owner() {
   # macOS and GNU stat differ — try both.
   stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1" 2>/dev/null
+}
+
+is_pushable() {
+  # 0 = push allowed, 1 = commit-only.
+  # Push is allowed ONLY when the repo's absolute path matches one of
+  # the entries in GIT_REPOS (resolved to absolute). This protects
+  # against pushing to third-party forks (or repos with a ./url local
+  # remote like icfp) during an -R walk. Each super-repo in GIT_REPOS
+  # IS meant to receive pushes; submodules discovered under it during
+  # -R are not.
+  _ip_r=$1
+  _ip_abs=$(cd "$_ip_r" 2>/dev/null && pwd -P) || return 1
+  for _ip_base in $GIT_REPOS; do
+    [ -d "$_ip_base" ] || continue
+    _ip_base_abs=$(cd "$_ip_base" 2>/dev/null && pwd -P) || continue
+    if [ "$_ip_abs" = "$_ip_base_abs" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 need_sudo_for() {
@@ -829,11 +842,21 @@ commit_one() {
 
   _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
 
+  # Push is allowed only for repos explicitly listed in GIT_REPOS. Any
+  # repo outside that list (e.g. walked via -R into a submodule, or a
+  # third-party fork) gets commit-only — protects against pushes to
+  # upstream repos the user can't / doesn't want to push to.
+  if is_pushable "$_r"; then
+    _pushable=1
+  else
+    _pushable=0
+  fi
+
   # ── Classify state ────────────────────────────────────────────────────
   #   state=clean-matched      CLEAN :))                  action: noop
   #   state=clean-no-remote    CLEAN (no remote)          action: noop
-  #   state=clean-ahead        CLEAN, ahead=N             action: push
-  #   state=dirty              DIRTY (N) [M:..  A:..  ??:..]  action: add+commit+push
+  #   state=clean-ahead        CLEAN, ahead=N             action: push  (if pushable) else noop
+  #   state=dirty              DIRTY (N) [M:..  A:..  ??:..]  action: add+commit (+push if pushable)
   _state=""; _state_desc=""; _action=""
   if [ -z "$_porc" ]; then
     _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -853,7 +876,14 @@ commit_one() {
         _ahead=$(printf '%s\n' "$_div" | grep -c . 2>/dev/null || echo 0)
         _state=clean-ahead
         _state_desc="CLEAN, ahead=$_ahead"
-        _action=push
+        if [ "$_pushable" = 1 ]; then
+          _action=push
+        else
+          # Clean-ahead but not in GIT_REPOS → no push allowed. Treat as
+          # noop: commits are already local, we just don't push.
+          _state_desc="$_state_desc  (not in GIT_REPOS → no push)"
+          _action=noop
+        fi
       fi
     fi
   else
@@ -870,7 +900,11 @@ commit_one() {
     [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
     _state=dirty
     _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
-    _action="add+commit+push"
+    if [ "$_pushable" = 1 ]; then
+      _action="add+commit+push"
+    else
+      _action="add+commit"
+    fi
   fi
 
   # ── Analyze mode: print a single concise line per repo and bail ───────
@@ -891,6 +925,10 @@ commit_one() {
       return 0
       ;;
     clean-ahead)
+      if [ "$_pushable" != 1 ]; then
+        log_major "$_r: $_state_desc  (not in GIT_REPOS — no push)"
+        return 0
+      fi
       log_major "$_r: $_state_desc — pushing"
       [ "$VRB" = 1 ] && log_minor "$_div"
       if [ "$INTERACTIVE" = 1 ]; then
@@ -907,8 +945,8 @@ commit_one() {
       ;;
   esac
 
-  # Dirty — add + commit + push.
-  log_major "$_r: $_state_desc — add+commit+push"
+  # Dirty — add + commit (+push if pushable).
+  log_major "$_r: $_state_desc — $_action"
   [ "$VRB" = 1 ] && printf '%s\n' "$_porc" | sed -e 's/^/        /' \
     | while IFS= read -r _l; do log_medium "$_l"; done
 
@@ -920,10 +958,10 @@ commit_one() {
     printf '%s\n' "$_porc" | sed -e 's/^/        /'
     _subject=$(sed -n '1p' "$_msgfile" 2>/dev/null)
     printf '    proposed commit subject: %s\n' "$_subject"
-    _ans=$(_sm_ask "    $_r: add+commit+push? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    _ans=$(_sm_ask "    $_r: $_action? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
       a|A) rm -f "$_msgfile"; echo "Aborted by user." >&2; exit 77 ;;
-      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (add+commit+push)"; return 0 ;;
+      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped ($_action)"; return 0 ;;
     esac
   fi
 
@@ -950,8 +988,12 @@ commit_one() {
     return 1
   }
   rm -f "$_msgfile"
-  run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
-  log_major "$_r: DONE :)) (added, committed, pushed)"
+  if [ "$_pushable" = 1 ]; then
+    run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+    log_major "$_r: DONE :)) (added, committed, pushed)"
+  else
+    log_major "$_r: DONE :)) (added, committed — no push: not in GIT_REPOS)"
+  fi
 }
 
 cmd_masscommits() {
@@ -1356,8 +1398,17 @@ Per-repo output in analyze mode (one line each):
 
 For each repo in scope (go mode):
   1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
-  2. If dirty  — git add -A, auto-generate commit message, git commit -F, git push
-  3. If clean  — checks local-vs-remote; pushes if ahead; else DONE
+  2. If dirty  — git add -A, auto-generate commit message, git commit -F,
+                 and 'git push' ONLY if the repo is in GIT_REPOS (see below).
+  3. If clean  — checks local-vs-remote; pushes if ahead AND pushable; else DONE
+
+Push policy:
+  A repo is PUSHABLE iff its absolute path matches an entry in GIT_REPOS
+  (config). Everything else (submodules walked via -R, third-party forks)
+  gets commit only — no 'git push' attempted. This protects against
+  pushes to repos you don't own or have no upstream configured for.
+  In analyze output, non-pushable repos show as '-> add+commit' (no push)
+  or 'CLEAN, ahead=N  (not in GIT_REPOS → no push)'.
 
 Scope & recursion:
   default             ONE level — act on the current repo only. A changed
@@ -1569,17 +1620,29 @@ Search order (first existing wins):
   1.  \$MY_GIT_CONFIG env var, if set
   2.  --config <FILE>
   3.  /LINKS/default/my-git.conf
-  4.  ~/.mygit.conf
+  4.  ~/.my-git.conf
   5.  /etc/my-git.conf
   6.  /usr/local/etc/my-git.conf
 
 Commands:
-  $US --create-config     Write default config to first writable location
-  $US --config FILE ...   Use specific file (overrides search)
+  $US --create-config            Print default config to stdout
+  $US --create-config <FILE>     Write default config to <FILE> (no overwrite)
+  $US --config <FILE> ...        Use specific file (overrides search)
 
 Variables (defaults live only inside --create-config; at runtime, ALL
 values come from the user's config):
-  GIT_REPOS                   Fallback repo list (used when no CWD repo).
+  GIT_REPOS                   List of super-repos.
+                              - Used as the scope fallback when my-git is
+                                invoked outside any tracked repo and without
+                                explicit path arguments (st / mc / sm / -R
+                                then act on EACH entry as a separate root;
+                                -R recurses INSIDE each entry's tree).
+                              - Also the PUSH allowlist: 'mc go' only pushes
+                                to repos whose absolute path matches an entry
+                                here. Everything else (walked via -R into
+                                submodules, third-party forks) gets commit
+                                only, no push — protects against pushing to
+                                upstream repos you don't own.
   CHECK_CLAUDE_SETUP          Audit .claude/ during 'mc'; 0 disables.
   CLAUDE_PROJECT_DIR_CENTRAL_REPO
                               Central tree where .claude dirs live.
@@ -3556,6 +3619,7 @@ _sm_run_here() {
 main() {
   # ─── Pre-dispatch: peel globals / --config / --create-config / --help ───
   _want_create_config=0
+  _create_config_path=""
   _want_help=""
   _rest=""
   while [ $# -gt 0 ]; do
@@ -3566,7 +3630,19 @@ main() {
       -DD|--deepdbg)     DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       --config)          shift; CONFIG_FILE=${1:-}; [ -n "$CONFIG_FILE" ] || fatal "--config: missing argument" ;;
       --config=*)        CONFIG_FILE=${1#--config=} ;;
-      --create-config)   _want_create_config=1 ;;
+      --create-config)
+        _want_create_config=1
+        # Optional filename: peek next arg. If it exists and doesn't look
+        # like another option, treat it as the target file. Otherwise
+        # print to stdout (CLI).
+        if [ $# -ge 2 ]; then
+          case "$2" in
+            -*|'') : ;;
+            *)     _create_config_path=$2; shift ;;
+          esac
+        fi
+        ;;
+      --create-config=*)  _want_create_config=1; _create_config_path=${1#--create-config=} ;;
       -h|--help)
         # `--help [topic]` — peek next arg
         if [ $# -ge 2 ]; then
@@ -3591,7 +3667,7 @@ main() {
   fi
 
   if [ "$_want_create_config" -eq 1 ]; then
-    create_config
+    create_config "$_create_config_path"
     exit 0
   fi
 
