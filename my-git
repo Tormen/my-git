@@ -1958,31 +1958,17 @@ cmd_flatten() {
     if [ "$_fl_rmgit" = 1 ]; then
       printf '  %s>>%s nested .git dirs to DELETE (%s, irreversible):\n' \
         "$C_BLUE" "$C_RESET" "$_fl_n_nested"
-      printf '     %s(each .git holds that sub-repo'\''s history. Delete = history lost.)%s\n' \
-        "$C_DIM" "$C_RESET"
     else
-      printf '  %s>>%s nested .git dirs — folders will be ADDED to parent git as content (%s):\n' \
+      printf '  %s>>%s folders to add to parent git as content (%s):\n' \
         "$C_BLUE" "$C_RESET" "$_fl_n_nested"
-      printf '     %s(each .git is briefly moved aside so parent ignores it during commit,%s\n' \
-        "$C_DIM" "$C_RESET"
-      printf '     %sthen put back — nothing inside the .git is touched.)%s\n' \
-        "$C_DIM" "$C_RESET"
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
       [ -n "$_n" ] && printf '       %s\n' "$_n"
     done
   fi
   if [ "$_fl_n_orphan" -gt 0 ]; then
-    printf '  %s>>%s orphan gitlinks to UNSTAGE from the outer'\''s index (%s):\n' \
+    printf '  %s>>%s orphan gitlinks to remove from index (%s):\n' \
       "$C_BLUE" "$C_RESET" "$_fl_n_orphan"
-    printf '     %s(a "gitlink" is an index entry pointing to a sub-repo'\''s SHA. "Orphan"%s\n' \
-      "$C_DIM" "$C_RESET"
-    printf '     %smeans it'\''s not listed in .gitmodules — so the outer thinks it'\''s a%s\n' \
-      "$C_DIM" "$C_RESET"
-    printf '     %ssubmodule but there'\''s no proper registration. Unstaging = '\''git rm%s\n' \
-      "$C_DIM" "$C_RESET"
-    printf '     %s--cached'\'' — removes from index only, files on disk are untouched.)%s\n' \
-      "$C_DIM" "$C_RESET"
     printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
       [ -n "$_p" ] && printf '       %s\n' "$_p"
     done
