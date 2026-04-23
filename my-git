@@ -818,7 +818,12 @@ cmd_status() {
             esac >> "$_stcounts_tmp"
           done
     else
-      # Default: compact one-line-per-repo tree.
+      # Default: compact one-line-per-repo tree, PADDED so the state
+      # column lines up. Buffer left-side ('pfx + disp + mark') and
+      # state separately into a tmpfile, compute the max left-width,
+      # then emit padded.
+      _treetmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.XXXXXX")
+      _maxw=0
       walk_tree_lines "$_root" "$_root" "" "" "" \
         | while IFS="$(printf '\t')" read -r _pfx _abs _disp _tag; do
             case "$_tag" in
@@ -833,7 +838,8 @@ cmd_status() {
               reg-ign)   _mark=" [registered, ignored]" ;;
               stale)     _mark=" [STALE REGISTRATION]" ;;
             esac
-            printf '%s%s%s  %s\n' "$_pfx" "$_disp" "$_mark" "$_sum"
+            # Buffer: <left><TAB><sum> so we can align later.
+            printf '%s%s%s\t%s\n' "$_pfx" "$_disp" "$_mark" "$_sum" >> "$_treetmp"
             case "$_sum" in
               "CLEAN :))"*)        echo C ;;
               "CLEAN, ahead"*)     echo A ;;
@@ -845,6 +851,25 @@ cmd_status() {
               *)                   echo E ;;
             esac >> "$_stcounts_tmp"
           done
+      # Align: compute max display-width of left column then pad.
+      # length() in POSIX awk counts BYTES, and box-drawing chars
+      # (│├└─) are 3 bytes each but display as 1 col. Subtract the
+      # 2-byte-per-char excess for each box-drawing occurrence.
+      awk -F'\t' '
+        function dwidth(s,   n, w) {
+          w = length(s)
+          n = gsub(/│/, "", s); w -= 2 * n
+          n = gsub(/├/, "", s); w -= 2 * n
+          n = gsub(/└/, "", s); w -= 2 * n
+          n = gsub(/─/, "", s); w -= 2 * n
+          return w
+        }
+        # pass 1: gather max
+        NR == FNR { d = dwidth($1); if (d > m) m = d; next }
+        # pass 2: emit padded
+        { d = dwidth($1); pad = m - d; printf "%s%*s  %s\n", $1, pad, "", $2 }
+      ' "$_treetmp" "$_treetmp"
+      rm -f "$_treetmp"
     fi
   done < "$_rtmp"
   rm -f "$_rtmp"
@@ -859,7 +884,7 @@ cmd_status() {
     _n_dirty=$(grep -c '^D$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_err=$(grep -c '^E$' "$_stcounts_tmp" 2>/dev/null | head -1)
     echo
-    log_major "st: summary"
+    log_major "Summary"
     _parts=""
     [ "$_n_clean" -gt 0 ]  && _parts="$_parts $(c_green "CLEAN=$_n_clean")"
     [ "$_n_ahead" -gt 0 ]  && _parts="$_parts ahead=$_n_ahead"
