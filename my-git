@@ -893,6 +893,14 @@ commit_one() {
     clean-ahead)
       log_major "$_r: $_state_desc — pushing"
       [ "$VRB" = 1 ] && log_minor "$_div"
+      if [ "$INTERACTIVE" = 1 ]; then
+        printf '%s\n' "$_div" | sed -e 's/^/        /'
+        _ans=$(_sm_ask "    $_r: push $_ahead commit(s)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+        case "$_ans" in
+          a|A) echo "Aborted by user." >&2; exit 77 ;;
+          s|S|n|N) log_major "$_r: skipped (push)"; return 0 ;;
+        esac
+      fi
       run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
       log_major "$_r: DONE :)) (pushed)"
       return 0
@@ -904,10 +912,22 @@ commit_one() {
   [ "$VRB" = 1 ] && printf '%s\n' "$_porc" | sed -e 's/^/        /' \
     | while IFS= read -r _l; do log_medium "$_l"; done
 
-  run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; return 1; }
-
   _msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.commit-msg.XXXXXX")
   build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; return 1; }
+
+  if [ "$INTERACTIVE" = 1 ]; then
+    # Show porcelain + proposed commit subject (first line) before acting.
+    printf '%s\n' "$_porc" | sed -e 's/^/        /'
+    _subject=$(sed -n '1p' "$_msgfile" 2>/dev/null)
+    printf '    proposed commit subject: %s\n' "$_subject"
+    _ans=$(_sm_ask "    $_r: add+commit+push? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    case "$_ans" in
+      a|A) rm -f "$_msgfile"; echo "Aborted by user." >&2; exit 77 ;;
+      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (add+commit+push)"; return 0 ;;
+    esac
+  fi
+
+  run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; rm -f "$_msgfile"; return 1; }
 
   # If we must run git as another user, msgfile needs readable perms + chown.
   _owner=$(file_owner "$_r/.git")
@@ -1359,7 +1379,11 @@ Commit-message template (auto-generated, no editor):
 Options:
   go                                 Actually commit+push (otherwise: analyze)
   -n, -T, --try, --dry, --dry-run    Synonyms for analyze mode (never acts)
-  -i, --interactive                  Prompt before destructive .claude migration
+  -i, --interactive                  Per-repo prompt [Y]es / [S]kip / [A]bort
+                                      before each commit+push or push-only
+                                      action (shows porcelain + commit subject
+                                      for commits; divergence log for pushes).
+                                      Also governs destructive .claude migration
   -R, --recursive                    Walk the full submodule tree bottom-up
   -V, -VV, -D, -DD                   Verbosity / debug
   --help

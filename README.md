@@ -111,6 +111,22 @@ when you want one command to settle a whole nested tree:
 `st` is always recursive because overview IS its job — a multi-level
 tree seen at a glance, no walking required.
 
+### Interactive mode for `mc go`
+
+`-i` on `mc go` makes the run pause at each repo that would act,
+showing what's about to change and prompting `[Y]es / [S]kip / [A]bort`:
+
+- **Before add+commit+push** (dirty repo): prints the porcelain list and
+  the first line of the auto-generated commit subject.
+- **Before push-only** (clean-ahead repo): prints the `git log` of
+  commits about to go upstream.
+- `[S]kip` moves on to the next repo; `[A]bort` stops the whole run
+  with exit code 77 (propagates across `-R`).
+
+Without `-i`, `mc go` runs straight through without any prompts —
+commit message is the auto-generated template, and every actionable
+repo is processed.
+
 ## Verbosity & debug
 
 Two independent axes. Debug implies verbose.
