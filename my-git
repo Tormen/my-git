@@ -842,14 +842,24 @@ commit_one() {
 
   _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
 
-  # Push is allowed only for repos explicitly listed in GIT_REPOS. Any
-  # repo outside that list (e.g. walked via -R into a submodule, or a
-  # third-party fork) gets commit-only — protects against pushes to
-  # upstream repos the user can't / doesn't want to push to.
+  # Push is allowed only when BOTH conditions hold:
+  #   (1) repo path matches an entry in GIT_REPOS (explicit allowlist), AND
+  #   (2) at least one remote is configured ('git remote' non-empty).
+  # Condition (1) protects against third-party-fork pushes; condition (2)
+  # protects against repos with no upstream at all — trying to push would
+  # fail with 'No configured push destination'.
   if is_pushable "$_r"; then
-    _pushable=1
+    _remotes=$(run_as_owner_capture "$_r" git remote 2>/dev/null)
+    if [ -n "$_remotes" ]; then
+      _pushable=1
+      _nopush_reason=""
+    else
+      _pushable=0
+      _nopush_reason="no remote configured"
+    fi
   else
     _pushable=0
+    _nopush_reason="not in GIT_REPOS"
   fi
 
   # ── Classify state ────────────────────────────────────────────────────
@@ -879,9 +889,9 @@ commit_one() {
         if [ "$_pushable" = 1 ]; then
           _action=push
         else
-          # Clean-ahead but not in GIT_REPOS → no push allowed. Treat as
-          # noop: commits are already local, we just don't push.
-          _state_desc="$_state_desc  (not in GIT_REPOS → no push)"
+          # Clean-ahead but not pushable (either not in GIT_REPOS, or no
+          # remote configured). Commits already local; nothing to push to.
+          _state_desc="$_state_desc  ($_nopush_reason → no push)"
           _action=noop
         fi
       fi
@@ -926,7 +936,7 @@ commit_one() {
       ;;
     clean-ahead)
       if [ "$_pushable" != 1 ]; then
-        log_major "$_r: $_state_desc  (not in GIT_REPOS — no push)"
+        log_major "$_r: $_state_desc  ($_nopush_reason — no push)"
         return 0
       fi
       log_major "$_r: $_state_desc — pushing"
@@ -992,7 +1002,7 @@ commit_one() {
     run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
     log_major "$_r: DONE :)) (added, committed, pushed)"
   else
-    log_major "$_r: DONE :)) (added, committed — no push: not in GIT_REPOS)"
+    log_major "$_r: DONE :)) (added, committed — no push: $_nopush_reason)"
   fi
 }
 
@@ -1403,12 +1413,14 @@ For each repo in scope (go mode):
   3. If clean  — checks local-vs-remote; pushes if ahead AND pushable; else DONE
 
 Push policy:
-  A repo is PUSHABLE iff its absolute path matches an entry in GIT_REPOS
-  (config). Everything else (submodules walked via -R, third-party forks)
-  gets commit only — no 'git push' attempted. This protects against
-  pushes to repos you don't own or have no upstream configured for.
+  A repo is PUSHABLE iff BOTH conditions hold:
+    (1) its absolute path matches an entry in GIT_REPOS (the allowlist), AND
+    (2) at least one remote is configured ('git remote' non-empty).
+  Everything else (submodules walked via -R, third-party forks, repos
+  with no configured remote) gets commit only — no 'git push' attempted.
   In analyze output, non-pushable repos show as '-> add+commit' (no push)
-  or 'CLEAN, ahead=N  (not in GIT_REPOS → no push)'.
+  or 'CLEAN, ahead=N  (<reason> → no push)'.
+  Reasons: 'not in GIT_REPOS' | 'no remote configured'.
 
 Scope & recursion:
   default             ONE level — act on the current repo only. A changed
