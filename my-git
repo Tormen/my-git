@@ -964,7 +964,7 @@ commit_one() {
         printf '%s\n' "$_div" | sed -e 's/^/        /'
         _ans=$(_sm_ask "    $_r: push $_ahead commit(s)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
         case "$_ans" in
-          a|A) echo "Aborted by user." >&2; exit 77 ;;
+          a|A) log_major "$_r: [ABORT requested]"; return 77 ;;
           s|S|n|N) log_major "$_r: skipped (push)"; return 0 ;;
         esac
       fi
@@ -989,7 +989,7 @@ commit_one() {
     printf '    proposed commit subject: %s\n' "$_subject"
     _ans=$(_sm_ask "    $_r: $_action? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
-      a|A) rm -f "$_msgfile"; echo "Aborted by user." >&2; exit 77 ;;
+      a|A) rm -f "$_msgfile"; log_major "$_r: [ABORT requested]"; return 77 ;;
       s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped ($_action)"; return 0 ;;
     esac
   fi
@@ -1082,10 +1082,36 @@ cmd_masscommits() {
       # — but we do NOT descend into the submodule's own working tree.
       _nodes=$_root
     fi
-    printf '%s\n' "$_nodes" | while IFS= read -r _node; do
+    # File-redirected while keeps this in the parent shell so an abort
+    # signal from commit_one (via return 77) actually propagates.
+    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
+    printf '%s\n' "$_nodes" > "$_ntmp"
+    _abort_requested=0
+    while IFS= read -r _node; do
       [ -n "$_node" ] || continue
-      commit_one "$_node" || _rc_total=1
-    done
+      if [ "$_abort_requested" = 1 ] && [ "$_node" != "$_root" ]; then
+        # Post-abort: skip every remaining descendant so we can still
+        # process the ROOT as a cleanup commit (capturing any gitlink
+        # bumps from children that already committed before the abort).
+        continue
+      fi
+      commit_one "$_node"
+      _rc=$?
+      case "$_rc" in
+        0)  : ;;
+        77) _abort_requested=1 ;;   # continue loop so root still runs
+        *)  _rc_total=1 ;;
+      esac
+    done < "$_ntmp"
+    rm -f "$_ntmp"
+    if [ "$_abort_requested" = 1 ]; then
+      # Abort propagates to the outer root loop too: remaining roots in
+      # GIT_REPOS-fallback scope are NOT processed. Ctrl+C (SIGINT) still
+      # exits immediately via signal; this is specifically for [A]bort.
+      rm -f "$_rtmp"
+      log_major "mc: ABORT requested — parent cleanup done, stopping."
+      return 77
+    fi
   done < "$_rtmp"
   rm -f "$_rtmp"
 
