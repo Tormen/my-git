@@ -12,9 +12,11 @@ by multiple users and nested several levels deep.
 - **`st`** — a recursive **overview** of every repo in a tree (status,
   divergence, registration state). Always walks the full submodule tree,
   because the whole point is to see everything in one glance.
-- **`mc`** — mass add + commit + push. **Single level by default** (git's
-  own scope); pass `-R` to walk the full submodule tree bottom-up so
-  child commits bubble into parent gitlinks in one run.
+- **`mc`** — mass add + commit + push. **Two-phase like `sm`**: `mc`
+  alone analyzes (one concise line per repo, no writes); `mc go` applies
+  it. Single level by default; pass `-R` for a bottom-up walk so child
+  commits bubble into parent gitlinks in one run. Commit message is
+  generated automatically (never opens `$EDITOR`).
 - **`sm`** — register / rebind / clean up nested repos as proper
   submodules. **Single level by default**; pass `-R` to walk top-down
   through every registered submodule.
@@ -68,8 +70,9 @@ config file.
 ```sh
 my-git st                      # recursive OVERVIEW of current tree (CWD-aware)
 my-git st /LINKS/global        # recursive overview of a specific super-repo tree
-my-git mc                      # commit+push the CURRENT repo only (single level)
-my-git mc -R                   # commit+push THIS repo + every submodule (bottom-up)
+my-git mc                      # analyze: one line per repo, shows what 'mc go' WOULD do
+my-git mc go                   # apply: commit+push the CURRENT repo only (single level)
+my-git mc go -R                # apply: commit+push THIS repo + every submodule (bottom-up)
 my-git sm                      # analyze nested unregistered repos (THIS level)
 my-git sm go                   # register them (THIS level only)
 my-git sm -R go                # register everything, walking the whole tree top-down
@@ -81,7 +84,7 @@ my-git claude-check            # audit .claude/ symlink convention
 | Subcommand      | Aliases        | Recursion | What it does                                                                      |
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
 | `status`        | `st`, `s`      | always    | Compact tree summary (one line per repo); `-V` = per-node porcelain listing       |
-| `masscommits`   | `mc`, `c`, `go`| opt-in `-R` | Add + commit + push; `-R` = bottom-up walk through every submodule              |
+| `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push; `-R` = bottom-up walk               |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos; `-R` = top-down walk                      |
 | `claude-check`  |                | always    | Audit `.claude/` symlink convention (read-only by default)                        |
 | `help`          |                | —         | Show top-level help                                                               |
@@ -231,11 +234,17 @@ registration: DIRTY just means uncommitted file changes, handled by
 # Status of a three-level nested tree (global → src → py/my-plex):
 my-git st /LINKS/global
 
-# Preview what mc would do for the CURRENT repo only (no writes, single level):
-my-git mc --dry-run
+# Preview what mc would do for the CURRENT repo only (default — no writes):
+my-git mc
+
+# Apply for the CURRENT repo only:
+my-git mc go
 
 # Preview what mc -R would do for the whole tree (no writes, bottom-up):
-my-git mc -R --dry-run /LINKS/global
+my-git mc -R /LINKS/global
+
+# Apply bottom-up across the whole tree:
+my-git mc go -R /LINKS/global
 
 # Register everything (THIS repo only) + show what it did verbosely:
 my-git -V sm go

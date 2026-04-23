@@ -828,40 +828,81 @@ commit_one() {
   fi
 
   _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
+
+  # ── Classify state ────────────────────────────────────────────────────
+  #   state=clean-matched      CLEAN :))                  action: noop
+  #   state=clean-no-remote    CLEAN (no remote)          action: noop
+  #   state=clean-ahead        CLEAN, ahead=N             action: push
+  #   state=dirty              DIRTY (N) [M:..  A:..  ??:..]  action: add+commit+push
+  _state=""; _state_desc=""; _action=""
   if [ -z "$_porc" ]; then
-    # Clean — check ahead of remote?
     _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
     _rem_ref=origin/$_branch
     _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null | grep -E "^\s*remotes/$_rem_ref$" || true)
     if [ -z "$_has_remote" ]; then
-      log_major "$_r: CLEAN (no remote tracking for $_branch) — nothing to push"
-      return 0
+      _state=clean-no-remote
+      _state_desc="CLEAN (no remote for $_branch)"
+      _action=noop
+    else
+      _div=$(run_as_owner_capture "$_r" git log --oneline "${_rem_ref}..${_branch}" 2>/dev/null)
+      if [ -z "$_div" ]; then
+        _state=clean-matched
+        _state_desc="CLEAN :))"
+        _action=noop
+      else
+        _ahead=$(printf '%s\n' "$_div" | grep -c . 2>/dev/null || echo 0)
+        _state=clean-ahead
+        _state_desc="CLEAN, ahead=$_ahead"
+        _action=push
+      fi
     fi
-    _div=$(run_as_owner_capture "$_r" git log "${_rem_ref}...${_branch}" 2>/dev/null)
-    if [ -z "$_div" ]; then
-      log_major "$_r: CLEAN :))"
-      return 0
+  else
+    _n=$(printf '%s\n' "$_porc" | grep -c . 2>/dev/null || echo 0)
+    # Classify porcelain codes into counts (M/A/D/R/??)
+    _m=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /M/) m++} END{print m+0}')
+    _a=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /A/) a++} END{print a+0}')
+    _d=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /D/) d++} END{print d+0}')
+    _u=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s == "??") u++} END{print u+0}')
+    _parts=""
+    [ "$_m" -gt 0 ] && _parts="$_parts M:$_m"
+    [ "$_a" -gt 0 ] && _parts="$_parts A:$_a"
+    [ "$_d" -gt 0 ] && _parts="$_parts D:$_d"
+    [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
+    _state=dirty
+    _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
+    _action="add+commit+push"
+  fi
+
+  # ── Analyze mode: print a single concise line per repo and bail ───────
+  if [ "$DRY_RUN" = 1 ]; then
+    printf ' >>> %-60s %-32s -> %s\n' "$_r" "$_state_desc" "$_action"
+    if [ "$VRB" = 1 ] && [ "$_state" = dirty ]; then
+      printf '%s\n' "$_porc" | while IFS= read -r _l; do
+        printf '        %s\n' "$_l"
+      done
     fi
-    log_major "$_r: local ahead of remote — pushing"
-    log_minor "$_div"
-    if [ "$DRY_RUN" = 1 ]; then
-      log_medium "DRY: would push"
-      return 0
-    fi
-    run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
-    log_major "$_r: DONE :)) (pushed)"
     return 0
   fi
+
+  # ── go mode: perform the action ───────────────────────────────────────
+  case "$_state" in
+    clean-matched|clean-no-remote)
+      log_major "$_r: $_state_desc"
+      return 0
+      ;;
+    clean-ahead)
+      log_major "$_r: $_state_desc — pushing"
+      [ "$VRB" = 1 ] && log_minor "$_div"
+      run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+      log_major "$_r: DONE :)) (pushed)"
+      return 0
+      ;;
+  esac
 
   # Dirty — add + commit + push.
-  log_major "$_r: uncommitted changes — add+commit+push"
-  printf '%s\n' "$_porc" | sed -e 's/^/        /' \
+  log_major "$_r: $_state_desc — add+commit+push"
+  [ "$VRB" = 1 ] && printf '%s\n' "$_porc" | sed -e 's/^/        /' \
     | while IFS= read -r _l; do log_medium "$_l"; done
-
-  if [ "$DRY_RUN" = 1 ]; then
-    log_medium "DRY: would git add -A && git commit && git push"
-    return 0
-  fi
 
   run_as_owner "$_r" git add -A || { log_error "$_r: git add -A failed"; return 1; }
 
@@ -880,7 +921,10 @@ commit_one() {
     fi
   fi
 
-  run_as_owner "$_r" git commit -q -a -t "$_msgfile" || {
+  # -F takes the file as the literal commit message (no editor opens).
+  # Previously -t was used → required interactive editing → failed in
+  # non-interactive contexts.
+  run_as_owner "$_r" git commit -q -a -F "$_msgfile" || {
     log_error "$_r: git commit failed"
     rm -f "$_msgfile"
     return 1
@@ -891,6 +935,9 @@ commit_one() {
 }
 
 cmd_masscommits() {
+  # mode: analyze (default, dry-like preview) vs go (actually add+commit+push).
+  # Default is analyze to match 'sm' — only 'go' (or explicit alias) acts.
+  _mc_mode=analyze
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -899,7 +946,8 @@ cmd_masscommits() {
       -VV)          VRB=1; VERYVRB=1 ;;
       -D|--debug)   DBG=1; VRB=1 ;;
       -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
-      -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
+      go)           _mc_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _mc_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1 ;;
       -R|--recursive) RECURSIVE=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
@@ -910,6 +958,12 @@ cmd_masscommits() {
   done
   # shellcheck disable=SC2086
   eval "set -- $_args"
+  # Translate mode → DRY_RUN for commit_one (and friends).
+  if [ "$_mc_mode" = "go" ]; then
+    DRY_RUN=0
+  else
+    DRY_RUN=1
+  fi
 
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to commit"; exit 1; }
@@ -944,11 +998,17 @@ cmd_masscommits() {
   done < "$_rtmp"
   rm -f "$_rtmp"
 
-  # Final status snapshot (mirrors current script's behaviour).
-  echo
-  log_major "all done. final status:"
-  echo
-  cmd_status "$@"
+  # Final status snapshot only after actual action (skip in analyze mode —
+  # the per-repo concise lines already told the user what's there).
+  if [ "$_mc_mode" = "go" ]; then
+    echo
+    log_major "all done. final status:"
+    echo
+    cmd_status "$@"
+  else
+    echo
+    log_major "analyze-only — re-run with 'go' to apply:  $US mc go$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+  fi
   return $_rc_total
 }
 
@@ -1166,7 +1226,8 @@ submodule tree only when you pass -R/--recursive.
 
 Subcommands:
   status | st | s          List status of repo(s) + submodules (always recursive — overview)
-  masscommits | mc | c     Add + commit + push (single level; -R = full bottom-up walk)
+  masscommits | mc | c     Analyze (default) / add + commit + push with 'go'
+                           (single level; -R = full bottom-up walk)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   claude-check             Audit .claude/ setup (read-only by default)
   help                     Show this help
@@ -1255,13 +1316,27 @@ EOF
 
 show_help_masscommits() {
   cat <<EOF
-my-git masscommits  (aliases: mc, c, go)
+my-git masscommits  (aliases: mc, c)
 
-usage: $US [-V|-D] mc [-n|--dry-run] [-i|--interactive] [-R|--recursive] [paths...]
+usage: $US [-V|-D] mc [go] [-i|--interactive] [-R|--recursive] [paths...]
 
-For each repo in scope:
+Modes (two-phase, same pattern as 'sm'):
+  default (no 'go')   ANALYZE — one concise line per repo showing current
+                      state and the action 'mc go' WOULD take. No writes,
+                      no commits, no pushes. Use this first to audit what
+                      would happen.
+  go                  APPLY — actually add+commit+push. Commit message is
+                      produced automatically (never opens \$EDITOR).
+
+Per-repo output in analyze mode (one line each):
+  <path>   CLEAN :))                           -> noop
+  <path>   CLEAN (no remote for <branch>)      -> noop
+  <path>   CLEAN, ahead=<N>                    -> push
+  <path>   DIRTY (N) [M:.. A:.. D:.. ??:..]    -> add+commit+push
+
+For each repo in scope (go mode):
   1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
-  2. If dirty  — git add -A, auto-generate commit message, git commit, git push
+  2. If dirty  — git add -A, auto-generate commit message, git commit -F, git push
   3. If clean  — checks local-vs-remote; pushes if ahead; else DONE
 
 Scope & recursion:
@@ -1276,19 +1351,20 @@ Scope & recursion:
                       run. Use this when you want ONE command to settle a
                       whole tree of nested repos.
 
-Commit-message template:
+Commit-message template (auto-generated, no editor):
   line 1: intro (filename / short file list / 'AUTOMATIC-MASS-COMMIT')
   body:   #-commented block with file list or diffs + last-N commit messages
           (tunables: COMMIT_MSG_LAST_N, COMMIT_MSG_DIFF_MAX_FILES)
 
 Options:
-  -n, -T, --try, --dry, --dry-run   Preview; no writes, no commits, no pushes
+  go                                 Actually commit+push (otherwise: analyze)
+  -n, -T, --try, --dry, --dry-run    Synonyms for analyze mode (never acts)
   -i, --interactive                  Prompt before destructive .claude migration
   -R, --recursive                    Walk the full submodule tree bottom-up
   -V, -VV, -D, -DD                   Verbosity / debug
   --help
 
-Compat:  'go' is accepted as an alias.
+Compat:  'my-git go' is a shortcut for 'my-git mc go'.
 Scope:   see  $US --help
 EOF
 }
@@ -3516,8 +3592,8 @@ main() {
     status|st|s)                cmd_status "$@" ;;
     masscommits|mc|c)           cmd_masscommits "$@" ;;
     go)
-      log_warn "'go' is deprecated; use 'mc' or 'masscommits'"
-      cmd_masscommits "$@" ;;
+      # Back-compat: 'my-git go' = 'my-git mc go' (action).
+      cmd_masscommits go "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     help)                       show_help "${1:-top}" ;;
