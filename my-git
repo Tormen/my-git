@@ -1961,13 +1961,11 @@ cmd_flatten() {
       printf '     %s(each .git holds that sub-repo'\''s history. Delete = history lost.)%s\n' \
         "$C_DIM" "$C_RESET"
     else
-      printf '  %s>>%s nested .git dirs to briefly MOVE ASIDE, commit, then restore (%s):\n' \
+      printf '  %s>>%s nested .git dirs — folders will be ADDED to parent git as content (%s):\n' \
         "$C_BLUE" "$C_RESET" "$_fl_n_nested"
-      printf '     %s(a .git dir marks its parent folder as a sub-repo. Moving it aside%s\n' \
+      printf '     %s(each .git is briefly moved aside so parent ignores it during commit,%s\n' \
         "$C_DIM" "$C_RESET"
-      printf '     %shides the sub-repo from the outer during commit, so outer sees plain%s\n' \
-        "$C_DIM" "$C_RESET"
-      printf '     %sfiles; then we move the .git back — each sub-repo'\''s history stays intact.)%s\n' \
+      printf '     %sthen put back — nothing inside the .git is touched.)%s\n' \
         "$C_DIM" "$C_RESET"
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
