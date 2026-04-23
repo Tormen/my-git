@@ -1388,6 +1388,16 @@ Abort ([A]) in any -i prompt exits the whole run with code 77; under -R
 it propagates up and terminates the entire recursive walk (not just the
 current node).
 
+Auto-commit (go only): at the end of a successful 'sm go', my-git
+commits ONLY the paths it touched in this run — .gitmodules, registered
+submodule gitlinks, removed stale paths, and any .gitignore files where
+a negation was appended via [N]egate. Any unrelated changes the user
+had staged or modified (other submodule gitlink drift, unrelated edits)
+are LEFT ALONE — they stay staged/unstaged exactly as they were. The
+commit message is like 'my-git sm: registered=2 stale-removed=1'. Under
+-i, my-git prints the planned message + path list and prompts [Y]es /
+[S]kip / [A]bort before committing.
+
 Ignore marker:  writes '<nested>/.git/my-git-submodules.ignore' (delete to un-ignore).
 
 Exclude-file sync: at the END of every 'sm go' run (even when nothing was
@@ -1570,6 +1580,55 @@ _sm_ask() {
       "$_prompt" >&2
     exit 4
   fi
+}
+
+_sm_record_change() {
+  # _sm_record_change <path>
+  # Append <path> (a worktree-relative path) to SM_COMMIT_PATHS if not
+  # already present. Used to track the exact set of tracked files my-git
+  # touched in this run, so we can commit ONLY those paths at the end
+  # without dragging in the user's unrelated staged/unstaged changes.
+  _rc_p=$1
+  [ -n "$_rc_p" ] || return 0
+  # Normalize: strip any leading ./
+  case "$_rc_p" in ./*) _rc_p=${_rc_p#./} ;; esac
+  case "
+${SM_COMMIT_PATHS}
+" in
+    *"
+${_rc_p}
+"*) return 0 ;;
+  esac
+  SM_COMMIT_PATHS="${SM_COMMIT_PATHS}${_rc_p}
+"
+}
+
+_sm_append_negation() {
+  # _sm_append_negation <gitignore-file> <path-relative-to-its-dir>
+  # Appends '!<rel>/\n' (with a leading newline if needed). Idempotent:
+  # returns 0 without appending if the exact line is already present.
+  # Returns 1 on write failure.
+  _an_file=$1
+  _an_rel=$2
+  _an_line="!${_an_rel}/"
+  if [ -f "$_an_file" ] && grep -qxF "$_an_line" "$_an_file" 2>/dev/null; then
+    return 2
+  fi
+  if [ -s "$_an_file" ]; then
+    _an_last=$(tail -c1 "$_an_file" 2>/dev/null)
+    if [ "$_an_last" != "" ] && [ "$_an_last" != "
+" ]; then
+      printf '\n' >> "$_an_file" 2>/dev/null || {
+        log_error "could not append to $_an_file — skipping"
+        return 1
+      }
+    fi
+  fi
+  printf '%s\n' "$_an_line" >> "$_an_file" 2>/dev/null || {
+    log_error "could not append to $_an_file — skipping"
+    return 1
+  }
+  return 0
 }
 
 _sm_normalize_url() {
@@ -1971,8 +2030,11 @@ _sm_try_preserve_rebind() {
   # Update the superproject index.
   if git ls-files --error-unmatch -- "$_pr_old" >/dev/null 2>&1; then
     git rm --cached -q -- "$_pr_old" 2>/dev/null || true
+    _sm_record_change "$_pr_old"
   fi
   git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
+  _sm_record_change ".gitmodules"
+  _sm_record_change "$_pr_sp"
   return 0
 }
 
@@ -2695,7 +2757,14 @@ _sm_run_here() {
     # failure — handling it here avoids git's noisy "hint: Use -f if you
     # really want to add them." banner and the misleading ERROR line.
     _ignpath_force=0
-    _ci=$(git -C "$_sm_toplevel" check-ignore -v -- "$_sp" 2>/dev/null | head -1)
+    # Use -q for the verdict: exit 0 iff the path is effectively ignored.
+    # 'check-ignore -v' alone is insufficient because it prints a line even
+    # when the winning pattern is a NEGATION (!pat) — a false positive here.
+    if git -C "$_sm_toplevel" check-ignore -q -- "$_sp" 2>/dev/null; then
+      _ci=$(git -C "$_sm_toplevel" check-ignore -v -- "$_sp" 2>/dev/null | head -1)
+    else
+      _ci=""
+    fi
     if [ -n "$_ci" ]; then
       _ci_lhs=$(printf '%s' "$_ci" | awk -F'\t' '{print $1}')
       _ci_src=${_ci_lhs%%:*}
@@ -2752,30 +2821,75 @@ _sm_run_here() {
         printf '               so its .gitignore stops leaking into this add.\n'
       fi
       printf '    Options:\n'
-      printf '      [N]egate  append "!%s/" to %s, then register  (keeps .gitignore honest)\n' \
+      printf '      [N]egate  append "!%s/" to %s (+ any excluded parent dir),\n' \
         "$_rel_from_gi" "$_ci_src"
+      printf '                then register                      (keeps .gitignore honest)\n'
       printf '      [F]orce   git submodule add -f                (leaves .gitignore stale)\n'
       printf '      [S]kip    respect .gitignore                  (.gitignore IS the marker)\n'
       printf '      [A]bort\n'
       _ans=$(_sm_ask "    Choice? [N/f/s/a]: ")
       case "$_ans" in
         n|N|'')
+          # Append !<rel>/ to the matching .gitignore, AND additionally
+          # unignore every ancestor dir that is itself excluded. Git's
+          # gitignore rule: "It is not possible to re-include a file if
+          # a parent directory of that file is excluded." — so a sole
+          # !<target>/ is silently no-op when the pattern matches the
+          # parent dir (e.g. ',*/' matches ',archive/').
           _gi_file="$_sm_toplevel/$_ci_src"
-          if [ -s "$_gi_file" ]; then
-            _last=$(tail -c1 "$_gi_file" 2>/dev/null)
-            if [ "$_last" != "" ] && [ "$_last" != "
-" ]; then
-              printf '\n' >> "$_gi_file" 2>/dev/null || {
-                log_error "could not append to $_gi_file — skipping"
-                return 1
-              }
+          _sm_append_negation "$_gi_file" "$_rel_from_gi"
+          _an_rc=$?
+          case "$_an_rc" in
+            0) printf '    appended "!%s/" to %s\n' "$_rel_from_gi" "$_ci_src"
+               _sm_record_change "$_ci_src"
+               _sm_negations_added=$((_sm_negations_added + 1)) ;;
+            2) printf '    "!%s/" already present in %s\n' "$_rel_from_gi" "$_ci_src" ;;
+            *) return 1 ;;
+          esac
+          # Walk up from the target; each ignored ancestor gets its own
+          # negation (appended to whichever .gitignore ignores it, which
+          # may differ from the target's). Deepest-first so parents open
+          # up before we recheck.
+          _neg_iter=0
+          while [ "$_neg_iter" -lt 16 ]; do
+            _neg_iter=$((_neg_iter + 1))
+            if ! git -C "$_sm_toplevel" check-ignore -q -- "$_sp" 2>/dev/null; then
+              break
             fi
-          fi
-          printf '!%s/\n' "$_rel_from_gi" >> "$_gi_file" 2>/dev/null || {
-            log_error "could not append to $_gi_file — skipping"
-            return 1
-          }
-          printf '    appended "!%s/" to %s\n' "$_rel_from_gi" "$_ci_src"
+            _anc=$_sp
+            _found_anc=""
+            while : ; do
+              _parent=$(dirname "$_anc")
+              case "$_parent" in ""|"."|"/") break ;; esac
+              if git -C "$_sm_toplevel" check-ignore -q -- "$_parent" 2>/dev/null; then
+                _anc=$_parent
+                _found_anc=$_parent
+              else
+                break
+              fi
+            done
+            [ -z "$_found_anc" ] && break
+            _aci=$(git -C "$_sm_toplevel" check-ignore -v -- "$_found_anc" 2>/dev/null | head -1)
+            [ -z "$_aci" ] && break
+            _aci_lhs=$(printf '%s' "$_aci" | awk -F'\t' '{print $1}')
+            _aci_src=${_aci_lhs%%:*}
+            _aci_gi_file="$_sm_toplevel/$_aci_src"
+            _aci_gi_dir=$(dirname "$_aci_src")
+            case "$_aci_gi_dir" in
+              ""|".") _aci_rel=$_found_anc ;;
+              *)      _aci_rel=${_found_anc#"$_aci_gi_dir"/} ;;
+            esac
+            _sm_append_negation "$_aci_gi_file" "$_aci_rel"
+            _an_rc=$?
+            case "$_an_rc" in
+              0) printf '    also appended "!%s/" to %s (parent dir was excluded)\n' "$_aci_rel" "$_aci_src"
+                 _sm_record_change "$_aci_src"
+                 _sm_negations_added=$((_sm_negations_added + 1)) ;;
+              2) printf '    "!%s/" already present in %s — but parent still ignored, stopping\n' "$_aci_rel" "$_aci_src"
+                 break ;;
+              *) return 1 ;;
+            esac
+          done
           # Fall through — git submodule add will now succeed without -f.
           ;;
         f|F) _ignpath_force=1 ;;
@@ -2804,6 +2918,8 @@ _sm_run_here() {
         rm -rf -- "$_sp"
         mv -- "$_tmp" "$_sp"
         INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+        _sm_record_change ".gitmodules"
+        _sm_record_change "$_sp"
         return 0
       fi
 
@@ -2905,6 +3021,8 @@ _sm_run_here() {
               rm -rf -- "$_sp"
               mv -- "$_tmp" "$_sp"
               INFLIGHT_ORIG=""; INFLIGHT_TMP=""
+              _sm_record_change ".gitmodules"
+              _sm_record_change "$_sp"
               return 0
             fi
             cat "$_errlog" >&2
@@ -2993,6 +3111,9 @@ _sm_run_here() {
   _sm_added=0; _sm_skipped=0; _sm_newly_ignored=0; _sm_rebound=0
   _sm_stale_removed=0
   _sm_skipped_nested_after=0
+  # Reset the per-run list of paths my-git modified. See _sm_record_change.
+  SM_COMMIT_PATHS=""
+  _sm_negations_added=0
   while IFS="$(printf '\t')" read -r action sp url old; do
     # Top-down invariant: if a previous step in this run registered an
     # ancestor of $sp as a submodule, $sp no longer belongs to the super-repo.
@@ -3029,6 +3150,8 @@ _sm_run_here() {
         if [ -n "$old" ]; then
           rm -rf -- ".git/modules/$old" 2>/dev/null || true
         fi
+        _sm_record_change ".gitmodules"
+        _sm_record_change "$sp"
         _sm_stale_removed=$((_sm_stale_removed + 1))
         continue
         ;;
@@ -3076,10 +3199,12 @@ _sm_run_here() {
             _sm_skipped=$((_sm_skipped + 1))
             continue
           }
+          _sm_record_change ".gitmodules"
         fi
         if git ls-files --error-unmatch -- "$old" >/dev/null 2>&1; then
           printf '    git rm --cached -- %s\n' "$old"
           git rm --cached --quiet -- "$old" 2>/dev/null || true
+          _sm_record_change "$old"
         fi
         _stale="$_sm_toplevel/.git/modules/$old"
         if [ -e "$_stale" ]; then
@@ -3153,10 +3278,12 @@ _sm_run_here() {
                 echo "    error: could not edit .gitmodules — skipping" >&2
                 _sm_skipped=$((_sm_skipped + 1)); continue
               }
+              _sm_record_change ".gitmodules"
             fi
             if git ls-files --error-unmatch -- "$old" >/dev/null 2>&1; then
               printf '    git rm --cached -- %s\n' "$old"
               git rm --cached --quiet -- "$old" 2>/dev/null || true
+              _sm_record_change "$old"
             fi
             _stale="$_sm_toplevel/.git/modules/$old"
             if [ -e "$_stale" ]; then
@@ -3219,6 +3346,7 @@ _sm_run_here() {
       add-with-untrack|prompt-url-untrack)
         printf 'UNTRACK  %s\n' "$sp"
         git rm --cached -r --quiet -- "$sp"
+        _sm_record_change "$sp"
         ;;
     esac
 
@@ -3257,8 +3385,67 @@ _sm_run_here() {
   # Always reconcile .git/info/exclude with the current set of ignored nested
   # repos so 'git status' in the super-repo doesn't show them as Untracked.
   _sm_sync_ignore_exclude quiet || true
-  if [ "$_sm_added" -gt 0 ] || [ "$_sm_rebound" -gt 0 ] || [ "$_sm_c_need_untrack" -gt 0 ] || [ "$_sm_stale_removed" -gt 0 ]; then
-    echo "Review and commit:  git status  &&  git commit -m 'Register/rebind nested submodules'"
+  # ─── Commit ONLY the paths my-git touched in this run ──────────────────
+  # Leaves any unrelated staged/unstaged changes the user had alone (e.g.
+  # other submodule gitlink drift, unrelated .gitignore edits).
+  if [ -n "$SM_COMMIT_PATHS" ] && [ "$_sm_mode" = "go" ]; then
+    # Build positional args from the newline-separated list.
+    _oldIFS=$IFS
+    IFS="
+"
+    # shellcheck disable=SC2086
+    set -- $SM_COMMIT_PATHS
+    IFS=$_oldIFS
+    # `git add -A` handles both modifications and deletions (e.g. when
+    # $sp was rm-cached and no longer exists on disk). For sibling
+    # .gitmodules edits made via `git config --remove-section` (which
+    # doesn't auto-stage), this brings the worktree into the index.
+    git add -A -- "$@" 2>/dev/null || true
+    if git diff --cached --quiet -- "$@" 2>/dev/null; then
+      printf '\n >>> sm: nothing to commit (paths my-git touched have no net diff vs HEAD)\n'
+    else
+      # Build a short, descriptive commit subject.
+      _cm_parts=""
+      [ "$_sm_added" -gt 0 ]         && _cm_parts="$_cm_parts registered=$_sm_added"
+      [ "$_sm_rebound" -gt 0 ]       && _cm_parts="$_cm_parts rebound=$_sm_rebound"
+      [ "$_sm_stale_removed" -gt 0 ] && _cm_parts="$_cm_parts stale-removed=$_sm_stale_removed"
+      [ "${_sm_negations_added:-0}" -gt 0 ] && _cm_parts="$_cm_parts gitignore-negations=$_sm_negations_added"
+      [ -n "$_cm_parts" ] || _cm_parts=" (misc)"
+      _cm_subject="my-git sm:${_cm_parts}"
+      _do_commit=1
+      if [ "$_sm_interactive" -eq 1 ]; then
+        printf '\n >>> sm: ready to commit my-git''s changes only:\n'
+        printf '  >> message:  %s\n' "$_cm_subject"
+        printf '  >> paths:\n'
+        for _p in "$@"; do
+          printf '       %s\n' "$_p"
+        done
+        _ans=$(_sm_ask "    [Y]es commit / [S]kip (leave staged) / [A]bort? [Y/s/a]: ")
+        case "$_ans" in
+          a|A) echo "Aborted by user." >&2; exit 77 ;;
+          s|S|n|N)
+            printf '  >> skipped — my-git''s changes remain staged for you to commit manually.\n'
+            _do_commit=0 ;;
+          *) : ;;
+        esac
+      fi
+      if [ "$_do_commit" -eq 1 ]; then
+        _cmlog=$(mktemp "${TMPDIR:-/tmp}/sm-commit.XXXXXX")
+        if git commit --only -m "$_cm_subject" -- "$@" >"$_cmlog" 2>&1; then
+          _sha=$(git rev-parse --short HEAD 2>/dev/null)
+          printf '\n >>> sm: committed my-git''s changes only (%s)\n' "$_sha"
+          printf '  >> %s\n' "$_cm_subject"
+          rm -f "$_cmlog"
+        else
+          printf '\n >>> sm: commit failed — output:\n' >&2
+          cat "$_cmlog" >&2
+          rm -f "$_cmlog"
+        fi
+      fi
+    fi
+  elif [ -n "$SM_COMMIT_PATHS" ] && [ "$_sm_mode" = "dry" ]; then
+    printf '\n >>> sm: (dry-run) would commit %s path(s)\n' \
+      "$(printf '%s' "$SM_COMMIT_PATHS" | grep -c . 2>/dev/null || echo 0)"
   fi
 }
 

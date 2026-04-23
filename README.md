@@ -157,6 +157,31 @@ just the current node).
 - reuses a stale `.git/modules/<name>/` rather than erroring out.
 - skips the suspicious-URL guard.
 
+### Auto-commit at end of `sm go`
+
+`sm go` commits **only** the paths my-git touched in this run:
+
+- `.gitmodules`
+- registered submodule gitlinks (new adds, rebinds, stale-removals)
+- any `.gitignore` files where a negation was appended via `[N]egate`
+
+Unrelated changes the user had staged or modified (other submodule
+gitlink drift, unrelated `.gitignore` / `.DS_Store` edits, etc.) are
+**left alone** — they stay staged/unstaged exactly as they were. The
+commit is created with `git commit --only -- <paths>`, so the user's
+other index state is preserved.
+
+Commit subject example: `my-git sm: registered=2 stale-removed=1 gitignore-negations=1`.
+
+Under `-i`, my-git prints the planned subject and path list and prompts
+`[Y]es / [S]kip / [A]bort` before committing. Skipping leaves my-git's
+changes staged for manual commit.
+
+This also closes a prior gap where stale-section removal
+(`git config -f .gitmodules --remove-section`) edited `.gitmodules`
+without staging it, leaving the removal unstaged until the user
+re-staged manually.
+
 ## Status output
 
 Default is a one-line-per-repo ascii-art tree. Each line renders the repo's
