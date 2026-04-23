@@ -73,9 +73,14 @@ my-git st /LINKS/global        # recursive overview of a specific super-repo tre
 my-git mc                      # analyze: one line per repo, shows what 'mc go' WOULD do
 my-git mc go                   # apply: commit+push the CURRENT repo only (single level)
 my-git mc go -R                # apply: commit+push THIS repo + every submodule (bottom-up)
+my-git pull                    # analyze: fetch + report who's behind (no merge)
+my-git pull go -R              # fetch + fast-forward everywhere
+my-git fetch -R                # refs-only update across the tree (never merges)
 my-git sm                      # analyze nested unregistered repos (THIS level)
 my-git sm go                   # register them (THIS level only)
 my-git sm -R go                # register everything, walking the whole tree top-down
+my-git sync go -R              # one-shot: sm → pull → mc across the tree
+my-git remote --check -R       # audit remotes (⚠ on suspicious URLs)
 my-git claude-check            # audit .claude/ symlink convention
 ```
 
@@ -83,9 +88,12 @@ my-git claude-check            # audit .claude/ symlink convention
 
 | Subcommand      | Aliases        | Recursion | What it does                                                                      |
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
-| `status`        | `st`, `s`      | always    | Compact tree summary (one line per repo); `-V` = per-node porcelain listing       |
+| `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
 | `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push; `-R` = bottom-up walk               |
+| `pull`          | `pl`, `fetch`  | opt-in `-R` | Fetch origin + fast-forward clean+behind repos; `fetch` = `pull --fetch-only`   |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos; `-R` = top-down walk                      |
+| `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`. Settles the whole tree in one command.         |
+| `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
 | `claude-check`  |                | always    | Audit `.claude/` symlink convention (read-only by default)                        |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
