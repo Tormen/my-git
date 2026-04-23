@@ -1981,8 +1981,8 @@ cmd_flatten() {
   if [ "$_fl_mode" != "go" ]; then
     echo
     log_major "analyze-only — re-run with 'go' to apply:"
-    printf '  %s>>   default (history preserved):  %s flatten go%s\n' "$C_BLUE" "$US" "$C_RESET"
-    printf '  %s>>   irreversible delete:          %s flatten go --rm-git%s\n' "$C_BLUE" "$US" "$C_RESET"
+    printf '  %s>>   %s flatten go           (preserves child git repos)%s\n' "$C_BLUE" "$US" "$C_RESET"
+    printf '  %s>>   %s flatten go --rm-git  (irreversible delete)%s\n' "$C_BLUE" "$US" "$C_RESET"
     exit 0
   fi
 
