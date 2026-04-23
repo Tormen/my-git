@@ -773,7 +773,10 @@ cmd_status() {
   # Iterate roots in the PARENT shell (via a for-loop over a tmpfile) so
   # that priv_gate's fatal() actually aborts the whole run on policy=fail.
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
-  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
+  # Per-repo state counts are collected into a separate tmp (one char
+  # per repo: C=clean, A=ahead, B=behind, V=diverged, D=dirty, E=error/skip).
+  _stcounts_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stcounts.XXXXXX")
+  trap 'rm -f "$_rtmp" "$_stcounts_tmp"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   _first=1
   while IFS= read -r _root; do
@@ -783,10 +786,12 @@ cmd_status() {
     _first=0
     case "$PRIV_ACTION" in
       skip)
+        echo E >> "$_stcounts_tmp"
         continue
         ;;
       warn)
         printf '%s  [SKIPPED — cross-user policy]\n' "$_root"
+        echo E >> "$_stcounts_tmp"
         continue
         ;;
     esac
@@ -800,6 +805,17 @@ cmd_status() {
             [ -n "$_node" ] || continue
             _d=$(depth_of "$_root" "$_node")
             status_one "$_node" "$_d"
+            # Classify for counters.
+            _s=$(status_summary "$_node" 2>/dev/null)
+            case "$_s" in
+              "CLEAN :))"*)        echo C ;;
+              "CLEAN, ahead"*)     echo A ;;
+              "CLEAN, behind"*)    echo B ;;
+              "DIVERGED"*)         echo V ;;
+              "DIRTY"*)            echo D ;;
+              "CLEAN (no remote"*) echo C ;;
+              *)                   echo E ;;
+            esac >> "$_stcounts_tmp"
           done
     else
       # Default: compact one-line-per-repo tree.
@@ -818,10 +834,42 @@ cmd_status() {
               stale)     _mark=" [STALE REGISTRATION]" ;;
             esac
             printf '%s%s%s  %s\n' "$_pfx" "$_disp" "$_mark" "$_sum"
+            case "$_sum" in
+              "CLEAN :))"*)        echo C ;;
+              "CLEAN, ahead"*)     echo A ;;
+              "CLEAN, behind"*)    echo B ;;
+              "DIVERGED"*)         echo V ;;
+              "DIRTY"*)            echo D ;;
+              "CLEAN (no remote"*) echo C ;;
+              "[no directory"*)    echo E ;;
+              *)                   echo E ;;
+            esac >> "$_stcounts_tmp"
           done
     fi
   done < "$_rtmp"
   rm -f "$_rtmp"
+
+  # ─── Summary ─────────────────────────────────────────────────────────
+  _st_total=$(grep -c . "$_stcounts_tmp" 2>/dev/null | head -1)
+  if [ "$_st_total" -gt 1 ]; then
+    _n_clean=$(grep -c '^C$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_ahead=$(grep -c '^A$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_behind=$(grep -c '^B$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_div=$(grep -c '^V$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_dirty=$(grep -c '^D$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_err=$(grep -c '^E$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    echo
+    log_major "st: summary"
+    _parts=""
+    [ "$_n_clean" -gt 0 ]  && _parts="$_parts $(c_green "CLEAN=$_n_clean")"
+    [ "$_n_ahead" -gt 0 ]  && _parts="$_parts ahead=$_n_ahead"
+    [ "$_n_behind" -gt 0 ] && _parts="$_parts behind=$_n_behind"
+    [ "$_n_div" -gt 0 ]    && _parts="$_parts $(c_yellow "diverged=$_n_div")"
+    [ "$_n_dirty" -gt 0 ]  && _parts="$_parts $(c_yellow "DIRTY=$_n_dirty")"
+    [ "$_n_err" -gt 0 ]    && _parts="$_parts $(c_red "err/skip=$_n_err")"
+    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$_st_total" "$_parts"
+  fi
+  rm -f "$_stcounts_tmp"
 }
 
 # ─── Masscommits subcommand ─────────────────────────────────────────────
@@ -1085,7 +1133,7 @@ commit_one() {
         _state_desc="CLEAN :))"
         _action=noop
       else
-        _ahead=$(printf '%s\n' "$_div" | grep -c . 2>/dev/null || echo 0)
+        _ahead=$(printf '%s\n' "$_div" | grep -c . 2>/dev/null | head -1)
         _state=clean-ahead
         _state_desc="CLEAN, ahead=$_ahead"
         if [ "$_pushable" = 1 ]; then
@@ -1099,7 +1147,7 @@ commit_one() {
       fi
     fi
   else
-    _n=$(printf '%s\n' "$_porc" | grep -c . 2>/dev/null || echo 0)
+    _n=$(printf '%s\n' "$_porc" | grep -c . 2>/dev/null | head -1)
     _state=dirty
     # Split dirt into buckets: bumps + recorded (my-git-caused) vs user.
     _cls=$(printf '%s\n' "$_porc" | _mc_classify_dirt "$_r")
@@ -4072,7 +4120,7 @@ _sm_run_here() {
     fi
   elif [ -n "$SM_COMMIT_PATHS" ] && [ "$_sm_mode" = "dry" ]; then
     printf '\n >>> sm: (dry-run) would commit %s path(s)\n' \
-      "$(printf '%s' "$SM_COMMIT_PATHS" | grep -c . 2>/dev/null || echo 0)"
+      "$(printf '%s' "$SM_COMMIT_PATHS" | grep -c . 2>/dev/null | head -1)"
   fi
 }
 
