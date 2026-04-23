@@ -650,13 +650,15 @@ walk_tree_lines() (
     *ign|stale) return 0 ;;
   esac
   _subs_reg=$(list_direct_submodules "$_root")
-  # Unregistered-nested discovery only for MANAGED scopes (in GIT_REPOS
-  # or a descendant). Foreign scopes (e.g. $HOME happens to be a git
-  # repo but isn't in the config list) stay shallow — registered
-  # submodules still shown, but no auto-discovery of embedded repos.
+  # Unregistered-nested discovery is automatic for MANAGED scopes (in
+  # GIT_REPOS or a descendant). For FOREIGN scopes (e.g. $HOME happens
+  # to be a git repo but isn't in the config list) we stay shallow by
+  # default — UNLESS the user explicitly passes -R / --recursive, which
+  # is the opt-in override for "yes I do want you to walk this foreign
+  # tree too". Registered submodules are ALWAYS shown regardless.
   # sm uses list_unregistered_nested directly for its own analysis and
-  # is NOT gated by this flag (discovery IS sm's purpose).
-  if [ "${SCOPE_MANAGED:-1}" = 1 ]; then
+  # is NOT gated by these flags (discovery IS sm's purpose).
+  if [ "${SCOPE_MANAGED:-1}" = 1 ] || [ "${RECURSIVE:-0}" = 1 ]; then
     _subs_unreg=$(list_unregistered_nested "$_root")
   else
     _subs_unreg=""
@@ -2348,8 +2350,11 @@ Global options:
   -VV                      Verbosity level 2
   -D, --debug              Debug level 1  (implies -V)
   -DD, --deepdbg           Debug level 2  (implies -VV; enables set -x)
-  -R, --recursive          For 'mc' and 'sm': walk the full submodule tree.
-                           (st already recurses by default; -R is a no-op there.)
+  -R, --recursive          Force-recurse. For 'mc'/'sm': walk the full
+                           submodule tree. For 'st': force discovery of
+                           unregistered nested repos in a FOREIGN scope
+                           (one outside GIT_REPOS) — managed scopes
+                           recurse by default, -R is a no-op there.
   --config <FILE>          Use specific config file
   --create-config          Write default config to first writable location
   -h, --help [TOPIC]       Show help (topic = subcommand or option)
@@ -4852,6 +4857,7 @@ main() {
       -VV)               VRB=1; VERYVRB=1 ;;
       -D|--debug)        DBG=1; VRB=1 ;;
       -DD|--deepdbg)     DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -R|--recursive)    RECURSIVE=1 ;;
       --config)          shift; CONFIG_FILE=${1:-}; [ -n "$CONFIG_FILE" ] || fatal "--config: missing argument" ;;
       --config=*)        CONFIG_FILE=${1#--config=} ;;
       --create-config)
