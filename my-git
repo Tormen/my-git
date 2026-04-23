@@ -1967,7 +1967,7 @@ cmd_flatten() {
     done
   fi
   if [ "$_fl_n_orphan" -gt 0 ]; then
-    printf '  %s>>%s orphan gitlinks to remove from index (%s):\n' \
+    printf '  %s>>%s orphan gitlinks to remove (%s):\n' \
       "$C_BLUE" "$C_RESET" "$_fl_n_orphan"
     printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
       [ -n "$_p" ] && printf '       %s\n' "$_p"
@@ -1991,7 +1991,7 @@ cmd_flatten() {
   # Unstage orphan gitlinks first (safe regardless of .git handling).
   printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
     [ -n "$_p" ] || continue
-    log_medium "UNSTAGE  $_p"
+    log_medium "remove   $_p"
     run git rm --cached -rf -- "$_p" >/dev/null 2>&1 || \
       log_warn "git rm --cached failed for $_p"
   done
@@ -2020,7 +2020,7 @@ cmd_flatten() {
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
       [ -n "$_n" ] || continue
-      log_medium "RM       $_n"
+      log_medium "delete   $_n"
       run rm -rf -- "$_n" || log_warn "rm failed for $_n"
     done
     log_major "staging & committing flattened content..."
@@ -2063,7 +2063,7 @@ cmd_flatten() {
     _fl_i=$((_fl_i + 1))
     _fl_save_path="$_fl_save_root/$_fl_i"
     printf '%s\t%s\n' "$_fl_top/$_n" "$_fl_save_path" >> "$_fl_manifest"
-    log_medium "MOVE-OUT $_n  ->  $_fl_save_path"
+    log_medium "move aside $_n  ->  $_fl_save_path"
     run mv -- "$_n" "$_fl_save_path" || {
       log_error "move-out failed for $_n"
       _fl_restore
