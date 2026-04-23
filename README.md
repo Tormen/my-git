@@ -119,7 +119,7 @@ separately:
 
 | Bucket | What counts | Handling |
 |--------|-------------|----------|
-| my-git-caused | submodule gitlink bumps (super recording a new child SHA); edits to `.gitignore`/`.gitmodules`/`.claude` made by my-git in this run | **auto-committed** via `git commit --only -- <paths>` with subject `my-git <mc|sm>: auto-commit (bumps=N recorded=M)` — no prompt, even under `-i`. Pushed if the repo is pushable. |
+| my-git-caused | submodule gitlink bumps (super recording a new child SHA); edits to `.gitignore`/`.gitmodules`/`.claude` made by my-git in this run | **auto-committed** via `git commit --only -- <paths>` with subject `my-git <mc\|sm>: auto-commit (bumps=N recorded=M)` — no prompt, even under `-i`. Pushed if the repo is pushable. |
 | user | everything else (your own edits, new files, etc.) | normal flow — prompted under `-i`, committed straight through without `-i`. |
 
 `git commit --only` guarantees the two buckets become two separate
@@ -143,6 +143,28 @@ The my-git-caused phase is always silent — it runs before the prompt.
 Without `-i`, `mc go` runs straight through without any prompts —
 commit message is the auto-generated template, and every actionable
 repo is processed.
+
+### Ignore marker (respected by both `sm` and `mc`)
+
+A nested repo that carries `.git/my-git-submodules.ignore` is treated
+as **leave alone** by both subcommands. `mc` silently skips such repos
+(counted as `ignored=N` in the summary). Pass `--force` to override the
+markers for a single run — identical semantics to `sm --force`.
+
+### End-of-run summary
+
+Instead of printing a full status tree, `mc` ends with a one-line-plus
+summary of what was done / what's left:
+
+```text
+ >>> mc: summary
+  >> total=23: clean=14 pushed=1 auto-committed=3 user-committed=2 skipped=2 ignored=1
+  >> left to do: 2 repo(s) skipped under -i; 1 ignored (--force to override markers)
+  >> for details:  my-git st
+```
+
+Analyze mode prints an equivalent "would-do" summary. The detailed tree
+is intentionally left to `my-git st`.
 
 ## Verbosity & debug
 

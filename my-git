@@ -957,6 +957,7 @@ _mc_auto_commit_my_git_changes() {
     return 1
   fi
   log_major "$_ac_r: $(c_green 'DONE :))') (auto-committed my-git changes)"
+  MC_N_AUTOCOMMITTED=$((${MC_N_AUTOCOMMITTED:-0} + 1))
 
   # Push if pushable (gitlink bumps should propagate upstream).
   if is_pushable "$_ac_r"; then
@@ -972,6 +973,21 @@ _mc_auto_commit_my_git_changes() {
 # commit_one <repo>  — if dirty, add -A + commit + push; if ahead, push.
 commit_one() {
   _r=$1
+  MC_N_TOTAL=$((MC_N_TOTAL + 1))
+
+  # Honor the 'my-git-submodules.ignore' marker: if a nested repo is
+  # flagged as "leave alone" for sm, mc respects the same signal.
+  # --force (MC_FORCE=1) overrides — matches 'sm --force' semantics.
+  _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
+  if [ -n "$_gd_for_marker" ] && [ -e "$_gd_for_marker/$_sm_IGNORE_MARKER" ]; then
+    if [ "${MC_FORCE:-0}" -eq 1 ]; then
+      log_medium "$_r: ignore marker present, OVERRIDDEN by --force"
+    else
+      [ "$VRB" = 1 ] && log_medium "$_r: [ignored marker — skipping]"
+      MC_N_IGNORED=$((MC_N_IGNORED + 1))
+      return 0
+    fi
+  fi
 
   # Cross-user policy. Deep nodes run inside a pipeline subshell, so
   # fatal() can't abort the whole run from here — root-level fails are
@@ -981,13 +997,16 @@ commit_one() {
   case "$_action" in
     fail:*)
       log_error "${_action#fail:}"
+      MC_N_ERROR=$((MC_N_ERROR + 1))
       return 1
       ;;
     skip)
+      MC_N_SKIPPED=$((MC_N_SKIPPED + 1))
       return 0
       ;;
     warn)
       log_major "$_r: [SKIPPED — cross-user policy]"
+      MC_N_SKIPPED=$((MC_N_SKIPPED + 1))
       return 0
       ;;
   esac
@@ -996,6 +1015,7 @@ commit_one() {
   if [ "$CHECK_CLAUDE_SETUP" = 1 ]; then
     ensure_claude_setup "$_r" || {
       log_error "$_r: .claude setup check failed (see above)"
+      MC_N_ERROR=$((MC_N_ERROR + 1))
       return 1
     }
   fi
@@ -1128,6 +1148,17 @@ commit_one() {
         printf '        %s\n' "$_l"
       done
     fi
+    # Counters for analyze-mode summary.
+    case "$_state" in
+      clean-matched|clean-no-remote) MC_N_CLEAN=$((MC_N_CLEAN + 1)) ;;
+      clean-ahead) [ "$_pushable" = 1 ] && MC_N_WOULD_PUSH=$((MC_N_WOULD_PUSH + 1)) \
+                   || MC_N_CLEAN=$((MC_N_CLEAN + 1)) ;;
+      dirty)
+        [ "${_bump_ct:-0}" -gt 0 ] || [ "${_rec_ct:-0}" -gt 0 ] && \
+          MC_N_WOULD_AUTO=$((MC_N_WOULD_AUTO + 1))
+        [ "${_user_ct:-0}" -gt 0 ] && MC_N_WOULD_USER=$((MC_N_WOULD_USER + 1))
+        ;;
+    esac
     return 0
   fi
 
@@ -1135,11 +1166,13 @@ commit_one() {
   case "$_state" in
     clean-matched|clean-no-remote)
       log_major "$_r: $_state_desc"
+      MC_N_CLEAN=$((MC_N_CLEAN + 1))
       return 0
       ;;
     clean-ahead)
       if [ "$_pushable" != 1 ]; then
         log_major "$_r: $_state_desc  ($_nopush_reason — no push)"
+        MC_N_CLEAN=$((MC_N_CLEAN + 1))
         return 0
       fi
       log_major "$_r: $_state_desc — pushing"
@@ -1149,11 +1182,14 @@ commit_one() {
         _ans=$(_sm_ask "    $_r: push $_ahead commit(s)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
         case "$_ans" in
           a|A) log_major "$_r: [ABORT requested]"; return 77 ;;
-          s|S|n|N) log_major "$_r: skipped (push)"; return 0 ;;
+          s|S|n|N) log_major "$_r: skipped (push)"; MC_N_SKIPPED=$((MC_N_SKIPPED + 1)); return 0 ;;
         esac
       fi
-      run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+      run_as_owner "$_r" git push -q --all || {
+        log_error "$_r: git push failed"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1;
+      }
       log_major "$_r: DONE :)) (pushed)"
+      MC_N_PUSHED=$((MC_N_PUSHED + 1))
       return 0
       ;;
   esac
@@ -1169,6 +1205,7 @@ commit_one() {
 
   # Phase 1.
   if ! _mc_auto_commit_my_git_changes "$_r"; then
+    MC_N_ERROR=$((MC_N_ERROR + 1))
     return 1
   fi
 
@@ -1182,7 +1219,7 @@ commit_one() {
 
   # Phase 2: normal user-dirt flow on the reduced porcelain.
   _msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.commit-msg.XXXXXX")
-  build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; return 1; }
+  build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1; }
 
   if [ "$INTERACTIVE" = 1 ]; then
     # Show remaining porcelain + proposed commit subject (first line) before acting.
@@ -1194,7 +1231,7 @@ commit_one() {
     _ans=$(_sm_ask "    $_r: $_user_verb (user changes)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
       a|A) rm -f "$_msgfile"; log_major "$_r: [ABORT requested]"; return 77 ;;
-      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (user changes)"; return 0 ;;
+      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (user changes)"; MC_N_SKIPPED=$((MC_N_SKIPPED + 1)); return 0 ;;
     esac
   fi
 
@@ -1218,11 +1255,15 @@ commit_one() {
   run_as_owner "$_r" git commit -q -a -F "$_msgfile" || {
     log_error "$_r: git commit failed"
     rm -f "$_msgfile"
+    MC_N_ERROR=$((MC_N_ERROR + 1))
     return 1
   }
   rm -f "$_msgfile"
+  MC_N_USER_COMMITTED=$((MC_N_USER_COMMITTED + 1))
   if [ "$_pushable" = 1 ]; then
-    run_as_owner "$_r" git push -q --all || { log_error "$_r: git push failed"; return 1; }
+    run_as_owner "$_r" git push -q --all || {
+      log_error "$_r: git push failed"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1;
+    }
     log_major "$_r: DONE :)) (added, committed, pushed)"
   else
     log_major "$_r: DONE :)) (added, committed — no push: $_nopush_reason)"
@@ -1233,6 +1274,7 @@ cmd_masscommits() {
   # mode: analyze (default, dry-like preview) vs go (actually add+commit+push).
   # Default is analyze to match 'sm' — only 'go' (or explicit alias) acts.
   _mc_mode=analyze
+  MC_FORCE=0
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1245,6 +1287,7 @@ cmd_masscommits() {
       -n|-T|--try|--dry|--dry-run) _mc_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1 ;;
       -R|--recursive) RECURSIVE=1 ;;
+      --force)      MC_FORCE=1 ;;  # bypass per-repo my-git-submodules.ignore markers
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "masscommits: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -1266,6 +1309,21 @@ cmd_masscommits() {
   # Reset the per-run list of paths my-git's mc side modified — see
   # _mc_record_change. commit_one phase-1 auto-commit consumes this.
   MC_COMMIT_PATHS=""
+
+  # Per-run counters (summary at end). commit_one updates these globals
+  # at each exit path. Analyze mode uses WOULD_* counters; go mode uses
+  # the action counters.
+  MC_N_TOTAL=0
+  MC_N_CLEAN=0          # noop (already clean, matched remote or no remote)
+  MC_N_PUSHED=0         # clean-ahead → pushed
+  MC_N_AUTOCOMMITTED=0  # had a phase-1 auto-commit (bumps+recorded)
+  MC_N_USER_COMMITTED=0 # had a phase-2 user-dirt commit
+  MC_N_SKIPPED=0        # user said [S]kip (push or user-dirt) under -i
+  MC_N_IGNORED=0        # carries my-git-submodules.ignore marker → silent skip
+  MC_N_ERROR=0          # per-repo error (non-fatal, continued)
+  MC_N_WOULD_PUSH=0     # analyze: would push
+  MC_N_WOULD_AUTO=0     # analyze: would auto-commit my-git-caused dirt
+  MC_N_WOULD_USER=0     # analyze: would commit user-dirt
 
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
@@ -1323,16 +1381,52 @@ cmd_masscommits() {
   done < "$_rtmp"
   rm -f "$_rtmp"
 
-  # Final status snapshot only after actual action (skip in analyze mode —
-  # the per-repo concise lines already told the user what's there).
+  # ─── Concise summary ────────────────────────────────────────────────
+  # Detailed tree is intentionally left to 'my-git st' — summary gives
+  # "what was done / what's left" in one screen.
+  echo
   if [ "$_mc_mode" = "go" ]; then
-    echo
-    log_major "all done. final status:"
-    echo
-    cmd_status "$@"
+    # What WAS done.
+    log_major "mc: summary"
+    _parts=""
+    [ "$MC_N_CLEAN" -gt 0 ]          && _parts="$_parts clean=$MC_N_CLEAN"
+    [ "$MC_N_PUSHED" -gt 0 ]         && _parts="$_parts pushed=$MC_N_PUSHED"
+    [ "$MC_N_AUTOCOMMITTED" -gt 0 ]  && _parts="$_parts auto-committed=$MC_N_AUTOCOMMITTED"
+    [ "$MC_N_USER_COMMITTED" -gt 0 ] && _parts="$_parts user-committed=$MC_N_USER_COMMITTED"
+    [ "$MC_N_SKIPPED" -gt 0 ]        && _parts="$_parts skipped=$MC_N_SKIPPED"
+    [ "$MC_N_IGNORED" -gt 0 ]        && _parts="$_parts ignored=$MC_N_IGNORED"
+    [ "$MC_N_ERROR" -gt 0 ]          && _parts="$_parts $(c_red "errors=$MC_N_ERROR")"
+    [ -z "$_parts" ] && _parts=" (nothing to do)"
+    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$MC_N_TOTAL" "$_parts"
+    # What's LEFT to do.
+    _left_hint=""
+    [ "$MC_N_SKIPPED" -gt 0 ] && _left_hint="$MC_N_SKIPPED repo(s) skipped under -i"
+    [ "$MC_N_IGNORED" -gt 0 ] && {
+      [ -n "$_left_hint" ] && _left_hint="$_left_hint; "
+      _left_hint="${_left_hint}$MC_N_IGNORED ignored (--force to override markers)"
+    }
+    [ "$MC_N_ERROR" -gt 0 ] && {
+      [ -n "$_left_hint" ] && _left_hint="$_left_hint; "
+      _left_hint="${_left_hint}$MC_N_ERROR error(s)"
+    }
+    [ -n "$_left_hint" ] && printf '  %s>>%s left to do: %s\n' "$C_BLUE" "$C_RESET" "$_left_hint"
+    printf '  %s>>%s for details:  %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
   else
-    echo
-    log_major "analyze-only — re-run with 'go' to apply:  $US mc go$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    # Analyze mode: "what would be done".
+    log_major "mc: analyze summary"
+    _wparts=""
+    [ "$MC_N_CLEAN" -gt 0 ]      && _wparts="$_wparts clean=$MC_N_CLEAN"
+    [ "$MC_N_WOULD_PUSH" -gt 0 ] && _wparts="$_wparts would-push=$MC_N_WOULD_PUSH"
+    [ "$MC_N_WOULD_AUTO" -gt 0 ] && _wparts="$_wparts would-auto-commit=$MC_N_WOULD_AUTO"
+    [ "$MC_N_WOULD_USER" -gt 0 ] && _wparts="$_wparts would-user-commit=$MC_N_WOULD_USER"
+    [ "$MC_N_IGNORED" -gt 0 ]    && _wparts="$_wparts ignored=$MC_N_IGNORED"
+    [ -z "$_wparts" ] && _wparts=" (nothing to do)"
+    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$MC_N_TOTAL" "$_wparts"
+    printf '  %s>>%s apply:       %s mc go%s\n' "$C_BLUE" "$C_RESET" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    printf '  %s>>%s for details: %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
   fi
   return $_rc_total
 }
@@ -1747,6 +1841,11 @@ Commit-message template (auto-generated, no editor):
   body:   #-commented block with file list or diffs + last-N commit messages
           (tunables: COMMIT_MSG_LAST_N, COMMIT_MSG_DIFF_MAX_FILES)
 
+Ignore marker (same signal as 'sm'):
+  A nested repo carrying '.git/my-git-submodules.ignore' is treated
+  as "leave alone" — mc silently skips it (counted as ignored=N in
+  the summary). Use --force to bypass all markers (matches 'sm --force').
+
 Options:
   go                                 Actually commit+push (otherwise: analyze)
   -n, -T, --try, --dry, --dry-run    Synonyms for analyze mode (never acts)
@@ -1756,8 +1855,14 @@ Options:
                                       for commits; divergence log for pushes).
                                       Also governs destructive .claude migration
   -R, --recursive                    Walk the full submodule tree bottom-up
+  --force                            Bypass per-repo my-git-submodules.ignore
+                                      markers (same as 'sm --force')
   -V, -VV, -D, -DD                   Verbosity / debug
   --help
+
+End-of-run summary:
+  mc prints a concise summary (not a full tree) of what was done /
+  what's left. For a detailed per-repo status tree, run '$US st'.
 
 Compat:  'my-git go' is a shortcut for 'my-git mc go'.
 Scope:   see  $US --help
