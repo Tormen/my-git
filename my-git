@@ -101,6 +101,13 @@ COMMIT_MSG_DIFF_MAX_FILES=10
 #     for every new file is noise. Set 0 to prompt for untracked too.
 MC_AUTO_COMMIT_UNTRACKED=1
 
+# ─── st / sm: directory basenames to prune during unregistered-nested
+#     discovery. Without this, walking from ~/ descends into package
+#     caches that have tens of thousands of cloned .git dirs and takes
+#     tens of seconds. These basenames are '-prune'd in the find walk.
+#     Add more if you have other noisy cache/build roots.
+ST_EXCLUDE_DIRS=".cache node_modules .npm .venv .tox __pycache__ .cargo .gradle .m2 .yarn Library .Trash"
+
 # ─── Privilege: cross-user policy ───────────────────────────────────────
 # Controls what happens when the current user differs from the repo's
 # .git owner. Running as root ALWAYS just works (plain 'su <owner> -c ...',
@@ -171,6 +178,10 @@ load_config() {
   # Apply defaults from config to runtime flags (CLI flags can still escalate).
   [ "$DEFAULT_VERBOSE" = 1 ] && [ "$VRB" = 0 ] && VRB=1
   [ "$DEFAULT_DEBUG"   = 1 ] && [ "$DBG" = 0 ] && DBG=1
+  # Back-compat defaults for vars newer than a user's existing config file.
+  # New knobs: keep them conservative so upgrades don't surprise users.
+  : "${MC_AUTO_COMMIT_UNTRACKED:=1}"
+  : "${ST_EXCLUDE_DIRS:=.cache node_modules .npm .venv .tox __pycache__ .cargo .gradle .m2 .yarn Library .Trash}"
 }
 
 create_config() {
@@ -436,8 +447,22 @@ list_unregistered_nested() {
     --get-regexp '^submodule\..*\.path$' 2>/dev/null \
     | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
   ( cd "$_r" 2>/dev/null || exit 0
-    # -prune after .git so find doesn't descend into .git/ internals.
-    find . -mindepth 2 -name .git -print -prune 2>/dev/null
+    # Prune:
+    #   - './.git' (the scope root itself — we only want NESTED repos)
+    #   - every basename in ST_EXCLUDE_DIRS (cache/build roots that
+    #     otherwise contain thousands of cloned .git dirs and make a
+    #     walk from ~/ take 30+ seconds).
+    # IMPORTANT: use the root-repo exclusion as a -path, and cache
+    # names as -name (match at any depth). Do NOT use -mindepth here:
+    # -mindepth is a global filter applied before -prune, which means
+    # any directory shallower than the mindepth is NEVER examined for
+    # pruning and find happily descends into it.
+    _pex='-path ./.git'
+    for _ed in ${ST_EXCLUDE_DIRS:-}; do
+      _pex="$_pex -o -name $_ed"
+    done
+    # shellcheck disable=SC2086
+    eval "find . \\( $_pex \\) -prune -o -name .git -print 2>/dev/null"
   ) | sed -e 's|^\./||' -e 's|/\.git$||' | sort | awk -v reg="$_regtmp" '
       BEGIN {
         nr = 0
