@@ -111,17 +111,34 @@ when you want one command to settle a whole nested tree:
 `st` is always recursive because overview IS its job — a multi-level
 tree seen at a glance, no walking required.
 
+### Auto-commit of my-git-caused changes (both `mc` and `sm`)
+
+my-git **never asks** the user to confirm a change it made itself. Both
+`sm go` and `mc go` split dirt into two buckets and commit them
+separately:
+
+| Bucket | What counts | Handling |
+|--------|-------------|----------|
+| my-git-caused | submodule gitlink bumps (super recording a new child SHA); edits to `.gitignore`/`.gitmodules`/`.claude` made by my-git in this run | **auto-committed** via `git commit --only -- <paths>` with subject `my-git <mc|sm>: auto-commit (bumps=N recorded=M)` — no prompt, even under `-i`. Pushed if the repo is pushable. |
+| user | everything else (your own edits, new files, etc.) | normal flow — prompted under `-i`, committed straight through without `-i`. |
+
+`git commit --only` guarantees the two buckets become two separate
+commits; user state is never dragged into the my-git-caused commit, and
+my-git-caused state is never dragged into the user commit.
+
 ### Interactive mode for `mc go`
 
-`-i` on `mc go` makes the run pause at each repo that would act,
-showing what's about to change and prompting `[Y]es / [S]kip / [A]bort`:
+`-i` on `mc go` makes the **user-bucket phase** pause at each repo,
+showing what's about to change and prompting `[Y]es / [S]kip / [A]bort`.
+The my-git-caused phase is always silent — it runs before the prompt.
 
-- **Before add+commit+push** (dirty repo): prints the porcelain list and
-  the first line of the auto-generated commit subject.
+- **Before add+commit+push** (user-dirty repo): prints the porcelain list
+  and the first line of the auto-generated commit subject.
 - **Before push-only** (clean-ahead repo): prints the `git log` of
   commits about to go upstream.
-- `[S]kip` moves on to the next repo; `[A]bort` stops the whole run
-  with exit code 77 (propagates across `-R`).
+- `[S]kip` moves on to the next repo; `[A]bort` stops the walk with
+  exit code 77 (propagates across `-R`) but the my-git-caused commits
+  already made are kept.
 
 Without `-i`, `mc go` runs straight through without any prompts —
 commit message is the auto-generated template, and every actionable
@@ -131,17 +148,32 @@ repo is processed.
 
 Two independent axes. Debug implies verbose.
 
-| Prefix  | Level    | Shown at            |
-|---------|----------|---------------------|
-| ` >>> ` | MAJOR    | always (milestones) |
-| `  >> ` | medium   | `-V` `-VV` `-D` `-DD` |
-| `    > `| minor    | `-VV` `-DD`         |
-| ` ~~~ ` | debug    | `-D` `-DD` (stderr) |
-| `  ~~ ` | debug    | `-D` `-DD` (stderr) |
-| `   ~ ` | deep     | `-DD` only (stderr) |
+| Prefix  | Color        | Level  | Shown at              |
+|---------|--------------|--------|-----------------------|
+| ` >>> ` | bold cyan    | MAJOR  | always (milestones)   |
+| `  >> ` | blue         | medium | `-V` `-VV` `-D` `-DD` |
+| `    > `| default      | minor  | `-VV` `-DD`           |
+| ` ~~~ ` | dim (grey)   | debug  | `-D` `-DD` (stderr)   |
+| `  ~~ ` | dim (grey)   | debug  | `-D` `-DD` (stderr)   |
+| `   ~ ` | dim (grey)   | deep   | `-DD` only (stderr)   |
+| `$ cmd` | dim (grey)   | trace  | `-V` `-VV` `-D` `-DD` (stderr) |
 
-`-DD` also enables `set -x` for deep tracing. Never design output that only
-makes sense for a specific `-V + -D` combo — pick one axis per block.
+Inline status markers inside headlines: `DONE :))` / `CLEAN :))` in
+green, `DIRTY (...)` / `[ABORT ...]` in yellow, `ERROR`/`FAIL` in red.
+
+**Grey command trace (`-V`)**: every subprocess my-git runs (git, sudo,
+mv, ln, …) is echoed as `$ <cmd>` in dim grey to stderr **before** it
+executes. Mirrors [my-appleRAID](../my-appleRAID/my-appleRAID)'s
+`run()` helper. Stderr placement keeps `$()` captures clean — pipe
+stdout anywhere, the trace still shows on your terminal.
+
+Colors are **TTY-gated**: on non-TTY stdout (pipes, redirects, capture
+buffers) all escape codes collapse to empty strings — logs stay plain
+ASCII.
+
+`-DD` also enables `set -x` for deep tracing of my-git itself. Never
+design output that only makes sense for a specific `-V + -D` combo —
+pick one axis per block.
 
 ## `sm go` decision table
 
@@ -267,6 +299,9 @@ my-git -V sm go
 
 # Register everything across the whole tree, top-down, verbose:
 my-git -V sm -R go /LINKS/global
+
+# See every subprocess my-git runs (grey '$ cmd' trace to stderr):
+my-git -V mc go
 
 # Deep debug on a single repo, no pager:
 my-git -DD st /LINKS/global/src

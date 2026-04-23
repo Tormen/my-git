@@ -17,15 +17,54 @@ DRY_RUN=0
 INTERACTIVE=0
 RECURSIVE=0
 
+# ─── Colors (TTY only) ───────────────────────────────────────────────────
+# Mirrors my-appleRAID. Empty on non-TTY so no escape codes leak into
+# pipes / log files / subshell captures.
+if [ -t 1 ]; then
+  C_BOLD=$(printf '\033[1m')
+  C_DIM=$(printf '\033[2m')
+  C_RED=$(printf '\033[31m')
+  C_GREEN=$(printf '\033[32m')
+  C_YELLOW=$(printf '\033[33m')
+  C_BLUE=$(printf '\033[34m')
+  C_CYAN=$(printf '\033[36m')
+  C_RESET=$(printf '\033[0m')
+else
+  C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_RESET=''
+fi
+
 # ─── Logging ─────────────────────────────────────────────────────────────
-log_major()     { printf ' >>> %s\n' "$*"; }
-log_medium()    { [ "$VRB"      = 1 ] && printf '  >> %s\n' "$*"; return 0; }
+# MILESTONE / major info → bold cyan.
+log_major()     { printf ' %s>>>%s %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$*"; }
+# Medium info → blue, only at -V / -VV / -D / -DD.
+log_medium()    { [ "$VRB"      = 1 ] && printf '  %s>>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; return 0; }
+# Minor detail → default color, only at -VV / -DD.
 log_minor()     { [ "$VERYVRB"  = 1 ] && printf '    > %s\n' "$*"; return 0; }
-log_dbg_major() { [ "$DBG"      = 1 ] && printf ' ~~~ %s\n' "$*" >&2; return 0; }
-log_dbg_med()   { [ "$DBG"      = 1 ] && printf '  ~~ %s\n' "$*" >&2; return 0; }
-log_dbg_minor() { [ "$DEEPDBG"  = 1 ] && printf '   ~ %s\n' "$*" >&2; return 0; }
-log_warn()      { printf 'WARN:  %s\n' "$*" >&2; }
-log_error()     { printf 'ERROR: %s\n' "$*" >&2; }
+# Debug output → dim/grey, stderr.
+log_dbg_major() { [ "$DBG"      = 1 ] && printf ' %s~~~ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
+log_dbg_med()   { [ "$DBG"      = 1 ] && printf '  %s~~ %s%s\n'  "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
+log_dbg_minor() { [ "$DEEPDBG"  = 1 ] && printf '   %s~ %s%s\n'   "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
+log_warn()      { printf '%sWARN: %s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
+log_error()     { printf '%sERROR:%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
+
+# ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
+# run: echo command in grey at -V, then execute. Preserves exit code.
+# show: print a "would run" command in grey (always shown at callsite —
+#   callsite decides when to use it, e.g. for dry-run illustrations).
+run() {
+  # Trace goes to stderr so stdout-captured callers (run_as_owner_capture,
+  # $(...) wrappers) stay clean. Only visible at -V (and therefore -D, -DD).
+  [ "$VRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&2
+  "$@"
+}
+show() {
+  printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET"
+}
+# Inline status colorizers used inside longer strings.
+c_green() { printf '%s%s%s' "$C_GREEN"  "$1" "$C_RESET"; }
+c_yellow(){ printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET"; }
+c_red()   { printf '%s%s%s' "$C_RED"    "$1" "$C_RESET"; }
+c_dim()   { printf '%s%s%s' "$C_DIM"    "$1" "$C_RESET"; }
 
 fatal() {
   _ec=${2:-1}
@@ -286,10 +325,10 @@ _xuser_exec() {
   _repo_q=$(shell_escape "$_repo")
   if [ "$ME" = "root" ]; then
     log_dbg_med "su $_tgt -c \"cd $_repo && $_cmdstr\""
-    su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+    run su "$_tgt" -c "cd $_repo_q && $_cmdstr"
   else
     log_dbg_med "sudo su $_tgt -c \"cd $_repo && $_cmdstr\""
-    sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+    run sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr"
   fi
 }
 
@@ -313,7 +352,7 @@ run_as_owner() {
   _owner=$(file_owner "$_gitdir")
   log_dbg_minor "run_as_owner: repo=$_repo owner=$_owner me=$ME cmd=$*"
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
-    ( cd "$_repo" && "$@" )
+    ( cd "$_repo" && run "$@" )
     return $?
   fi
   _xuser_exec "$_owner" "$_repo" "$@"
@@ -327,7 +366,7 @@ run_as_owner_capture() {
   [ -e "$_gitdir" ] || return 1
   _owner=$(file_owner "$_gitdir")
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
-    ( cd "$_repo" && "$@" )
+    ( cd "$_repo" && run "$@" )
     return $?
   fi
   _xuser_exec "$_owner" "$_repo" "$@"
@@ -828,6 +867,108 @@ $(run_as_owner_capture "$_r" git log "-${COMMIT_MSG_LAST_N}" 2>/dev/null)"
   printf '%s%s\n' "$_diffs" "$_cmtMsgs" | sed -e 's/^/#   /'
 }
 
+# _mc_classify_dirt <repo> <porcelain>
+# Reads porcelain via stdin (newline-separated) and prints 3 lines to
+# stdout (each may be empty):
+#    <bump-paths-space-sep>
+#    <recorded-paths-space-sep>
+#    <user-paths-space-sep>
+# where:
+#    bumps    = paths that appear in <repo>/.gitmodules (submodule gitlink bumps)
+#    recorded = paths whose abs form is in MC_COMMIT_PATHS
+#               (my-git-side edits to .gitignore, .claude, etc.)
+#    user     = everything else (the user's own dirt)
+_mc_classify_dirt() {
+  _cd_r=$1
+  _cd_submods=""
+  if [ -f "$_cd_r/.gitmodules" ]; then
+    _cd_submods=$(run_as_owner_capture "$_cd_r" git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+                  | awk '{print $2}')
+  fi
+  _cd_bumps=""; _cd_recorded=""; _cd_user=""
+  while IFS= read -r _cd_line; do
+    [ -n "$_cd_line" ] || continue
+    # Strip 3-char status prefix.
+    _cd_p=${_cd_line#???}
+    # Strip rename "old -> new" — keep the new path only.
+    case "$_cd_p" in *" -> "*) _cd_p=${_cd_p##*" -> "} ;; esac
+    # Submodule?
+    if [ -n "$_cd_submods" ] && printf '%s\n' "$_cd_submods" | grep -qxF "$_cd_p"; then
+      _cd_bumps="$_cd_bumps $_cd_p"
+      continue
+    fi
+    # Recorded by my-git?
+    _cd_abs="$_cd_r/$_cd_p"
+    case "
+${MC_COMMIT_PATHS}
+" in
+      *"
+${_cd_abs}
+"*) _cd_recorded="$_cd_recorded $_cd_p" ; continue ;;
+    esac
+    _cd_user="$_cd_user $_cd_p"
+  done
+  printf '%s\n%s\n%s\n' "${_cd_bumps# }" "${_cd_recorded# }" "${_cd_user# }"
+}
+
+# _mc_auto_commit_my_git_changes <repo>
+# Phase-1 of commit_one (go mode only): detect dirt caused BY my-git
+# (submodule gitlink bumps + paths in MC_COMMIT_PATHS) and commit it
+# transparently via 'git commit --only' — NO user prompt.
+# Returns 0 on success (including no-op), 1 on error.
+_mc_auto_commit_my_git_changes() {
+  _ac_r=$1
+  [ "$DRY_RUN" = 1 ] && return 0
+  _ac_porc=$(run_as_owner_capture "$_ac_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
+  [ -z "$_ac_porc" ] && return 0
+
+  _ac_cls=$(printf '%s\n' "$_ac_porc" | _mc_classify_dirt "$_ac_r")
+  _ac_bumps=$(printf '%s\n' "$_ac_cls" | sed -n '1p')
+  _ac_recorded=$(printf '%s\n' "$_ac_cls" | sed -n '2p')
+
+  # Nothing my-git-caused → nothing to auto-commit.
+  [ -z "$_ac_bumps" ] && [ -z "$_ac_recorded" ] && return 0
+
+  if [ -z "$_ac_bumps" ]; then _ac_bump_count=0; else _ac_bump_count=$(printf '%s' "$_ac_bumps" | awk '{print NF}'); fi
+  if [ -z "$_ac_recorded" ]; then _ac_rec_count=0; else _ac_rec_count=$(printf '%s' "$_ac_recorded" | awk '{print NF}'); fi
+
+  # Build positional args (paths) for --only.
+  _ac_all="$_ac_bumps $_ac_recorded"
+  log_major "$_ac_r: auto-commit my-git-caused (bumps=$_ac_bump_count recorded=$_ac_rec_count)"
+  if [ "$VRB" = 1 ]; then
+    for _ac_p in $_ac_all; do
+      log_medium "  $_ac_p"
+    done
+  fi
+
+  # Stage exactly those paths.
+  # shellcheck disable=SC2086
+  run_as_owner "$_ac_r" git add -- $_ac_all 2>/dev/null || {
+    log_error "$_ac_r: auto-commit: git add failed"
+    return 1
+  }
+  # Compose commit subject.
+  _ac_cm="my-git mc: auto-commit (bumps=$_ac_bump_count recorded=$_ac_rec_count)"
+  # Commit ONLY these paths; --only ignores any other staged changes
+  # (which would be user-dirt that the user may later want to prompt on).
+  # shellcheck disable=SC2086
+  if ! run_as_owner "$_ac_r" git commit --only -m "$_ac_cm" -- $_ac_all >/dev/null 2>&1; then
+    log_error "$_ac_r: auto-commit failed"
+    return 1
+  fi
+  log_major "$_ac_r: $(c_green 'DONE :))') (auto-committed my-git changes)"
+
+  # Push if pushable (gitlink bumps should propagate upstream).
+  if is_pushable "$_ac_r"; then
+    _ac_remotes=$(run_as_owner_capture "$_ac_r" git remote 2>/dev/null)
+    if [ -n "$_ac_remotes" ]; then
+      run_as_owner "$_ac_r" git push -q --all 2>/dev/null \
+        || log_warn "$_ac_r: auto-commit push failed (commit kept locally)"
+    fi
+  fi
+  return 0
+}
+
 # commit_one <repo>  — if dirty, add -A + commit + push; if ahead, push.
 commit_one() {
   _r=$1
@@ -924,22 +1065,58 @@ commit_one() {
     fi
   else
     _n=$(printf '%s\n' "$_porc" | grep -c . 2>/dev/null || echo 0)
-    # Classify porcelain codes into counts (M/A/D/R/??)
-    _m=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /M/) m++} END{print m+0}')
-    _a=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /A/) a++} END{print a+0}')
-    _d=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /D/) d++} END{print d+0}')
-    _u=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s == "??") u++} END{print u+0}')
-    _parts=""
-    [ "$_m" -gt 0 ] && _parts="$_parts M:$_m"
-    [ "$_a" -gt 0 ] && _parts="$_parts A:$_a"
-    [ "$_d" -gt 0 ] && _parts="$_parts D:$_d"
-    [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
     _state=dirty
-    _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
-    if [ "$_pushable" = 1 ]; then
-      _action="add+commit+push"
+    # Split dirt into buckets: bumps + recorded (my-git-caused) vs user.
+    _cls=$(printf '%s\n' "$_porc" | _mc_classify_dirt "$_r")
+    _bumps=$(printf '%s\n' "$_cls" | sed -n '1p')
+    _recorded=$(printf '%s\n' "$_cls" | sed -n '2p')
+    _userp=$(printf '%s\n' "$_cls" | sed -n '3p')
+    # awk '{print NF}' on an empty string outputs nothing (no input
+    # line), which breaks '[ -gt 0 ]' later. Guard with explicit 0.
+    if [ -z "$_bumps" ]; then _bump_ct=0; else _bump_ct=$(printf '%s' "$_bumps" | awk '{print NF}'); fi
+    if [ -z "$_recorded" ]; then _rec_ct=0; else _rec_ct=$(printf '%s' "$_recorded" | awk '{print NF}'); fi
+    if [ -z "$_userp" ]; then _user_ct=0; else _user_ct=$(printf '%s' "$_userp" | awk '{print NF}'); fi
+    # Description: show bumps/user split when bumps+recorded > 0.
+    if [ "$_bump_ct" -gt 0 ] || [ "$_rec_ct" -gt 0 ]; then
+      _auto_ct=$((_bump_ct + _rec_ct))
+      if [ "$_user_ct" -gt 0 ]; then
+        _state_desc="DIRTY ($_n) [auto:$_auto_ct user:$_user_ct]"
+      else
+        _state_desc="DIRTY ($_n) [auto:$_auto_ct]"
+      fi
     else
-      _action="add+commit"
+      # No my-git-caused dirt → use the classic per-type counts.
+      _m=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /M/) m++} END{print m+0}')
+      _a=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /A/) a++} END{print a+0}')
+      _d=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s ~ /D/) d++} END{print d+0}')
+      _u=$(printf '%s\n' "$_porc" | awk '{s=substr($0,1,2); if (s == "??") u++} END{print u+0}')
+      _parts=""
+      [ "$_m" -gt 0 ] && _parts="$_parts M:$_m"
+      [ "$_a" -gt 0 ] && _parts="$_parts A:$_a"
+      [ "$_d" -gt 0 ] && _parts="$_parts D:$_d"
+      [ "$_u" -gt 0 ] && _parts="$_parts ??:$_u"
+      _state_desc="DIRTY ($_n) [$(printf '%s' "$_parts" | sed 's/^ //')]"
+    fi
+    # Action: my-git-caused part always auto-commits (no prompt); user
+    # part follows the normal add+commit[+push] flow.
+    _user_action=""
+    if [ "$_user_ct" -gt 0 ]; then
+      if [ "$_pushable" = 1 ]; then
+        _user_action="add+commit+push"
+      else
+        _user_action="add+commit"
+      fi
+    fi
+    if [ "$_bump_ct" -gt 0 ] || [ "$_rec_ct" -gt 0 ]; then
+      _auto_ct=$((_bump_ct + _rec_ct))
+      if [ -n "$_user_action" ]; then
+        _action="auto-commit $_auto_ct + $_user_action"
+      else
+        _action="auto-commit $_auto_ct"
+      fi
+    else
+      _action=$_user_action
+      [ -z "$_action" ] && _action=noop
     fi
   fi
 
@@ -981,23 +1158,43 @@ commit_one() {
       ;;
   esac
 
-  # Dirty — add + commit (+push if pushable).
+  # Dirty — go mode. Split the work:
+  #   Phase 1: auto-commit my-git-caused dirt (bumps + recorded paths)
+  #            transparently via 'git commit --only' — no prompt.
+  #   Phase 2: if any user-dirt remains, follow the normal -i prompt
+  #            flow (add -A + commit -F + push) on the reduced set.
   log_major "$_r: $_state_desc — $_action"
   [ "$VRB" = 1 ] && printf '%s\n' "$_porc" | sed -e 's/^/        /' \
     | while IFS= read -r _l; do log_medium "$_l"; done
 
+  # Phase 1.
+  if ! _mc_auto_commit_my_git_changes "$_r"; then
+    return 1
+  fi
+
+  # Re-read porcelain. If auto-commit cleared everything my-git touched,
+  # only user-dirt remains (or nothing).
+  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
+  if [ -z "$_porc" ]; then
+    # Auto-commit handled everything; no user-dirt left.
+    return 0
+  fi
+
+  # Phase 2: normal user-dirt flow on the reduced porcelain.
   _msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.commit-msg.XXXXXX")
   build_commit_message "$_r" > "$_msgfile" || { log_error "$_r: message build failed"; rm -f "$_msgfile"; return 1; }
 
   if [ "$INTERACTIVE" = 1 ]; then
-    # Show porcelain + proposed commit subject (first line) before acting.
+    # Show remaining porcelain + proposed commit subject (first line) before acting.
     printf '%s\n' "$_porc" | sed -e 's/^/        /'
     _subject=$(sed -n '1p' "$_msgfile" 2>/dev/null)
     printf '    proposed commit subject: %s\n' "$_subject"
-    _ans=$(_sm_ask "    $_r: $_action? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    _user_verb="add+commit"
+    [ "$_pushable" = 1 ] && _user_verb="add+commit+push"
+    _ans=$(_sm_ask "    $_r: $_user_verb (user changes)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
       a|A) rm -f "$_msgfile"; log_major "$_r: [ABORT requested]"; return 77 ;;
-      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped ($_action)"; return 0 ;;
+      s|S|n|N) rm -f "$_msgfile"; log_major "$_r: skipped (user changes)"; return 0 ;;
     esac
   fi
 
@@ -1065,6 +1262,10 @@ cmd_masscommits() {
 
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to commit"; exit 1; }
+
+  # Reset the per-run list of paths my-git's mc side modified — see
+  # _mc_record_change. commit_one phase-1 auto-commit consumes this.
+  MC_COMMIT_PATHS=""
 
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
@@ -1155,6 +1356,26 @@ claude_dest_for() {
   printf '%s/misc/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_r##*/}"
 }
 
+# _mc_record_change <abs-path>
+# Append <abs-path> to MC_COMMIT_PATHS if not already there. Mirror of
+# _sm_record_change. Used by mc helpers that mutate tracked files so
+# the end-of-node auto-commit can include exactly those paths (and
+# NOTHING the user edited) in a 'git commit --only' call.
+_mc_record_change() {
+  _rc_p=$1
+  [ -n "$_rc_p" ] || return 0
+  case "$_rc_p" in ./*) _rc_p=${_rc_p#./} ;; esac
+  case "
+${MC_COMMIT_PATHS}
+" in
+    *"
+${_rc_p}
+"*) return 0 ;;
+  esac
+  MC_COMMIT_PATHS="${MC_COMMIT_PATHS}${_rc_p}
+"
+}
+
 # Ensure '.claude/' appears in <repo>/.gitignore (safe, idempotent).
 # Return 0 on success, 1 on failure.
 ensure_claude_gitignore() {
@@ -1183,6 +1404,8 @@ ensure_claude_gitignore() {
   if ! printf '.claude/\n' >> "$_gi" 2>/dev/null; then
     printf '.claude/\n' | sudo tee -a "$_gi" >/dev/null || return 1
   fi
+  # Record the .gitignore path so commit_one phase-1 auto-commit picks it up.
+  _mc_record_change "$_gi"
   return 0
 }
 
@@ -1290,6 +1513,9 @@ ensure_claude_setup() {
   fi
   ln -s "$_rel" "$_cl" || { log_error "ln -s failed"; return 1; }
   log_major "$_r/.claude -> $_rel  (migration complete)"
+  # Record the migrated .claude symlink so commit_one phase-1 auto-commit
+  # picks it up (it's a tracked file change caused by my-git, not user).
+  _mc_record_change "$_cl"
   return 0
 }
 
@@ -1381,6 +1607,12 @@ Recursion (mc / sm):
                            child commits bubble into parent gitlinks; sm:
                            top-down so parent rebinds settle first).
 
+Output:
+  Colored on TTY (cyan headlines, blue medium info, grey debug/trace,
+  green/yellow/red status tags). Non-TTY stdout is plain ASCII. Pass -V
+  to see every subprocess my-git runs echoed as '\$ <cmd>' in grey to
+  stderr. See 'my-git --help verbose' for the full legend.
+
 Run 'my-git --help <topic>' for details on any subcommand or option.
 Config file search order and variables:  my-git --help config
 EOF
@@ -1457,12 +1689,36 @@ Per-repo output in analyze mode (one line each):
   <path>   CLEAN (no remote for <branch>)      -> noop
   <path>   CLEAN, ahead=<N>                    -> push
   <path>   DIRTY (N) [M:.. A:.. D:.. ??:..]    -> add+commit+push
+  <path>   DIRTY (N) [auto:A user:U]           -> auto-commit A + add+commit[+push]
+  <path>   DIRTY (N) [auto:A]                  -> auto-commit A
 
 For each repo in scope (go mode):
   1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
-  2. If dirty  — git add -A, auto-generate commit message, git commit -F,
-                 and 'git push' ONLY if the repo is in GIT_REPOS (see below).
+  2. If dirty:
+       Phase 1 (auto) — bumps + recorded paths are committed TRANSPARENTLY
+                        via 'git commit --only', no prompt. See 'Auto-commit
+                        of my-git-caused changes' below.
+       Phase 2 (user) — anything left is user-dirt: git add -A,
+                        auto-generate commit message, git commit -F,
+                        and 'git push' ONLY if the repo is in GIT_REPOS.
+                        Under -i, this phase prompts [Y]es / [S]kip / [A]bort.
   3. If clean  — checks local-vs-remote; pushes if ahead AND pushable; else DONE
+
+Auto-commit of my-git-caused changes (phase 1):
+  my-git must never ASK the user to confirm a change my-git itself made.
+  Two categories qualify as my-git-caused:
+    (a) Submodule gitlink BUMPS — a path in <repo>/.gitmodules whose
+        porcelain entry is 'M'. Super-repo recording a new child SHA is
+        housekeeping, not a user decision. Under -R bottom-up walk this
+        is the common case: children commit, parent's gitlinks advance.
+    (b) PATHS explicitly recorded via _mc_record_change during this mc
+        run: .gitignore (when ensure_claude_gitignore appends '.claude/')
+        and <repo>/.claude (when ensure_claude_setup migrates a real dir
+        to a symlink).
+  Both are auto-staged and committed together with subject
+      my-git mc: auto-commit (bumps=N recorded=M)
+  via 'git commit --only -- <paths>', then pushed if pushable. Nothing
+  else is committed in phase 1 — user-dirt stays untouched for phase 2.
 
 Push policy:
   A repo is PUSHABLE iff BOTH conditions hold:
@@ -1740,16 +1996,29 @@ show_help_verbose() {
 my-git verbosity: -V / -VV
 
 -V / --verbose    Verbosity level 1. Enables '>>' medium info lines and
-                  per-repo narration.
+                  per-repo narration. Also enables the GREY command trace:
+                  every subprocess my-git spawns is echoed as '\$ <cmd>'
+                  in dim/grey to stderr, just before it runs. Mirrors
+                  my-appleRAID's run() helper.
 -VV               Verbosity level 2. Adds '>' minor detail lines.
 
-Output prefix legend:
-   >>> MAJOR     Always shown. Milestone / headline. First in each block.
-    >> medium    Shown at -V, -VV, -D, -DD.
-     > minor     Shown at -VV, -DD.
-   ~~~ debug     Shown at -D, -DD. On stderr.
-    ~~ debug     Shown at -D, -DD. On stderr.
-     ~ debug     Shown at -DD only. On stderr.
+Output prefix legend + color conventions (TTY only — colors are
+suppressed on non-TTY stdout so logs/captures stay clean):
+   >>> MAJOR     bold cyan.   Milestone / headline. First in each block.
+    >> medium    blue.         Shown at -V, -VV, -D, -DD.
+     > minor     default.      Shown at -VV, -DD.
+   ~~~ debug     dim (grey).   Shown at -D, -DD. On stderr.
+    ~~ debug     dim (grey).   Shown at -D, -DD. On stderr.
+     ~ debug     dim (grey).   Shown at -DD only. On stderr.
+  \$ cmd        dim (grey).   -V command trace (stderr). Echoed by run()
+                              just before exec; does NOT contaminate stdout
+                              captures (\$(...)) because the trace is on fd 2.
+  ERROR:        red.          stderr. Always shown.
+  WARN:         yellow.       stderr. Always shown.
+  DONE :))      green inline. Success completion tag inside a headline.
+  CLEAN :))     green inline. Repo-state marker.
+  DIRTY (..)    yellow inline. Repo-state marker (in st / mc status lines).
+  [ABORT ..]    yellow inline. User-triggered abort marker.
 
 Verbose and debug are independent axes. Debug implies verbose (-D enables -V;
 -DD enables -VV). No single output block may be gated across both axes.
@@ -1920,14 +2189,14 @@ _sm_mark_ignored() {
 _sm_safe_git() {
   _repo=$1; shift
   _sg_log=$(mktemp "${TMPDIR:-/tmp}/safegit.XXXXXX")
-  git "$@" 2>"$_sg_log"
+  run git "$@" 2>"$_sg_log"
   _sg_rc=$?
   if [ "$_sg_rc" -ne 0 ] && [ "$SM_AUTO_SAFE_DIRECTORY" -eq 1 ] \
      && grep -q 'detected dubious ownership' "$_sg_log" 2>/dev/null; then
     _abs=$(cd "$_repo" 2>/dev/null && pwd -P) || _abs=$_repo
     printf 'INFO   registering safe.directory exception for %s\n' "$_abs" >&2
-    if git config --global --add safe.directory "$_abs" >/dev/null 2>&1; then
-      git "$@" 2>"$_sg_log"
+    if run git config --global --add safe.directory "$_abs" >/dev/null 2>&1; then
+      run git "$@" 2>"$_sg_log"
       _sg_rc=$?
     else
       printf 'WARN   could not add safe.directory exception\n' >&2
