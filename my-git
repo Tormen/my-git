@@ -3690,21 +3690,28 @@ _sm_run_here() {
   # ─── --flatten ─────────────────────────────────────────────────────
   # Convert every nested .git tree under the CURRENT super-repo into
   # plain content of the super. The user's mental model: "all files
-  # under <this repo> belong here; I don't care about nested histories".
+  # under <this repo> belong here; future changes live in the outer".
   #
-  # Steps (atomic):
-  #   1. Ensure '.git/' is in <repo>/.gitignore (cosmetic: future git
-  #      commands skip nested .git dirs).
-  #   2. Unstage orphan gitlinks (mode 160000 entries that aren't
-  #      submodules registered in .gitmodules).
-  #   3. Rename every NESTED .git to .git.bak (or with --rm-git, delete).
-  #      This disables git's embedded-repo auto-detection so 'git add -A'
-  #      treats each nested tree as plain content.
-  #   4. 'git add -A' + 'git commit' — one atomic flatten commit.
+  # DEFAULT: each nested .git is briefly MOVED OUT of the outer
+  # worktree (to a temp dir), 'git add -A && git commit' is run (so
+  # git sees only content, no embedded repos), then each .git is
+  # RESTORED to its original location. Net effect:
+  #   - outer commits the nested files as regular content
+  #   - nested histories remain intact (you can still 'cd nested &&
+  #     git log' afterwards)
+  #   - future edits to nested files flow into the outer repo as
+  #     normal modifications — git's embedded-repo check no longer
+  #     fires because the outer's index already tracks those files
+  #     as regular content, so the directory isn't "new"
+  # With --rm-git: each nested .git is DELETED instead of moved/
+  # restored. Irreversible; only use when nested history is genuinely
+  # disposable.
   #
-  # Safety: MUST be run from the repo's toplevel (not inside a subdir,
-  # and not outside a git repo at all). Refuses to flatten anything
-  # that is itself a registered submodule of a parent super-repo.
+  # Orphan gitlinks (mode 160000 in index, not in .gitmodules) are
+  # unstaged in both modes.
+  #
+  # Safety: MUST be run from the repo's toplevel. A 'trap' restores
+  # every moved .git back to its original path on any error/signal.
   if [ "$_sm_flatten" -eq 1 ]; then
     _fl_top=$(git rev-parse --show-toplevel 2>/dev/null)
     [ -n "$_fl_top" ] || fatal "sm --flatten: not inside a git repo" 1
@@ -3713,11 +3720,10 @@ _sm_run_here() {
       fatal "sm --flatten: must be run from the repo's toplevel: $_fl_top" 1
     fi
 
-    # Find nested .git (both dirs and files — submodule gitdirs use
-    # a '.git' FILE containing 'gitdir: ...'). Exclude the outer .git.
+    # Nested .git (dirs AND files — submodule-pointer .git files).
     _fl_nested=$(find . -path ./.git -prune -o \( -name .git -a \( -type d -o -type f \) \) -print 2>/dev/null | sed 's|^\./||' | sort)
 
-    # Orphan gitlinks (mode-160000 index entries NOT in .gitmodules).
+    # Orphan gitlinks.
     _fl_embedded=$(_sm_safe_git . ls-files -s 2>/dev/null | awk '$1 == "160000" {print}' | cut -f2- | sort)
     _fl_reg=''
     [ -f .gitmodules ] && _fl_reg=$(
@@ -3740,7 +3746,11 @@ _sm_run_here() {
 
     log_major "$_fl_top: flatten plan"
     if [ "$_fl_n_nested" -gt 0 ]; then
-      log_medium "nested .git to $([ "$_sm_rmgit" = 1 ] && echo REMOVE || echo RENAME to .git.bak) ($_fl_n_nested):"
+      if [ "$_sm_rmgit" = 1 ]; then
+        log_medium "nested .git to REMOVE ($_fl_n_nested, irreversible):"
+      else
+        log_medium "nested .git to briefly move-out-and-restore ($_fl_n_nested; history preserved):"
+      fi
       printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
         [ -n "$_n" ] && log_minor "  $_n"
       done
@@ -3762,23 +3772,7 @@ _sm_run_here() {
       case "$_ans" in a|A) echo "Aborted."; exit 77 ;; esac
     fi
 
-    # 1. Add '.git/' to .gitignore (cosmetic: future git ops ignore
-    # nested .git). Without renaming the dirs this wouldn't help, but
-    # renaming removes the problem and keeps the gitignore entry as a
-    # guard against future nested clones.
-    if [ -f .gitignore ] && grep -Eq '^/?\.git/?$' .gitignore; then
-      :
-    else
-      [ -f .gitignore ] && [ -s .gitignore ] && {
-        _last=$(tail -c1 .gitignore 2>/dev/null)
-        [ "$_last" != "" ] && [ "$_last" != "
-" ] && printf '\n' >> .gitignore
-      }
-      printf '# flatten: hide nested .git dirs from outer repo\n.git/\n' >> .gitignore
-      log_major "appended '.git/' to $_fl_top/.gitignore"
-    fi
-
-    # 2. Unstage orphan gitlinks.
+    # Unstage orphan gitlinks first (safe regardless of .git handling).
     printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
       [ -n "$_p" ] || continue
       log_medium "UNSTAGE  $_p"
@@ -3786,36 +3780,91 @@ _sm_run_here() {
         log_warn "git rm --cached failed for $_p"
     done
 
-    # 3. Rename or remove each nested .git.
-    printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
-      [ -n "$_n" ] || continue
-      if [ "$_sm_rmgit" = 1 ]; then
+    if [ "$_sm_rmgit" = 1 ]; then
+      # Destructive path: rm -rf each nested .git.
+      printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
         log_medium "RM       $_n"
         run rm -rf -- "$_n" || log_warn "rm failed for $_n"
-      else
-        _bak="${_n}.bak"
-        # Avoid clobbering an existing backup.
-        _i=1
-        while [ -e "$_bak" ]; do
-          _bak="${_n}.bak.$_i"
-          _i=$((_i + 1))
-        done
-        log_medium "RENAME   $_n -> $_bak"
-        run mv -- "$_n" "$_bak" || log_warn "mv failed for $_n"
-      fi
-    done
+      done
+    else
+      # Preserve-history path: move each nested .git OUTSIDE the outer
+      # worktree, commit, then restore. A manifest file records the
+      # pairs and a trap restores on any error.
+      _fl_save_root=$(mktemp -d "${TMPDIR:-/tmp}/${US}.flatten.XXXXXX") \
+        || { log_error "mktemp failed"; exit 1; }
+      _fl_manifest="$_fl_save_root/.manifest"
+      : > "$_fl_manifest"
+      # Restore function — reads manifest in REVERSE to handle any
+      # deep-first ordering.
+      _fl_restore() {
+        [ -s "$_fl_manifest" ] || return 0
+        awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_fl_manifest" \
+          | while IFS="$(printf '\t')" read -r _orig _saved; do
+              [ -e "$_saved" ] || continue
+              [ -e "$_orig" ] && rm -rf -- "$_orig" 2>/dev/null
+              mv -- "$_saved" "$_orig" 2>/dev/null || \
+                log_warn "restore failed: $_saved -> $_orig"
+            done
+      }
+      trap '_fl_restore; rm -rf "$_fl_save_root"; exit 1' INT TERM HUP
+      # Move each nested .git out.
+      _fl_i=0
+      printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+        [ -n "$_n" ] || continue
+        _fl_i=$((_fl_i + 1))
+        _fl_save_path="$_fl_save_root/$_fl_i"
+        printf '%s\t%s\n' "$_fl_top/$_n" "$_fl_save_path" >> "$_fl_manifest"
+        log_medium "MOVE-OUT $_n  ->  $_fl_save_path"
+        run mv -- "$_n" "$_fl_save_path" || {
+          log_error "move-out failed for $_n"
+          _fl_restore
+          rm -rf "$_fl_save_root"
+          exit 1
+        }
+      done
 
-    # 4. Stage + commit the flatten as one atomic commit.
+      # Stage + commit content.
+      log_major "staging & committing flattened content..."
+      if ! run git add -A; then
+        log_error "git add -A failed; restoring .git dirs..."
+        _fl_restore
+        rm -rf "$_fl_save_root"
+        exit 1
+      fi
+      _fl_msg="my-git sm --flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged"
+      _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
+      if ! run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
+        log_error "flatten commit failed:"
+        cat "$_fl_commit_log" >&2
+        rm -f "$_fl_commit_log"
+        _fl_restore
+        rm -rf "$_fl_save_root"
+        exit 1
+      fi
+      rm -f "$_fl_commit_log"
+
+      # Restore nested .git dirs to their original locations.
+      log_major "restoring nested .git dirs..."
+      _fl_restore
+      rm -rf "$_fl_save_root"
+      trap - INT TERM HUP
+      log_major "$_fl_top: $(c_green 'DONE :))') (flattened; nested histories preserved)"
+      exit 0
+    fi
+
+    # --rm-git path falls through here.
     log_major "staging & committing flattened content..."
     run git add -A || { log_error "git add -A failed"; exit 1; }
-    _fl_msg="my-git sm --flatten: $_fl_n_nested nested .git $([ "$_sm_rmgit" = 1 ] && echo removed || echo renamed-to-.bak), $_fl_n_orphan orphan gitlink(s) unstaged"
-    if run git commit -q -m "$_fl_msg" 2>/tmp/flatten-commit-$$.log; then
-      log_major "$_fl_top: $(c_green 'DONE :))') (flattened)"
-      rm -f /tmp/flatten-commit-$$.log
+    _fl_msg="my-git sm --flatten --rm-git: $_fl_n_nested nested .git removed, $_fl_n_orphan orphan gitlink(s) unstaged"
+    _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
+    if run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
+      rm -f "$_fl_commit_log"
+      log_major "$_fl_top: $(c_green 'DONE :))') (flattened; nested histories DELETED)"
     else
       log_error "flatten commit failed:"
-      cat /tmp/flatten-commit-$$.log >&2
-      rm -f /tmp/flatten-commit-$$.log
+      cat "$_fl_commit_log" >&2
+      rm -f "$_fl_commit_log"
       exit 1
     fi
     exit 0
