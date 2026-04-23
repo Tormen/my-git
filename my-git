@@ -1952,22 +1952,39 @@ cmd_flatten() {
 
   log_major "$_fl_top: flatten plan"
   # Plan details: always visible (not -V-gated) — the user needs to see
-  # WHAT would be touched before deciding whether to run 'go'.
+  # WHAT would be touched before deciding whether to run 'go'. Git jargon
+  # is explained inline so a non-git-expert can follow.
   if [ "$_fl_n_nested" -gt 0 ]; then
     if [ "$_fl_rmgit" = 1 ]; then
-      printf '  %s>>%s nested .git to REMOVE (%s, irreversible):\n' \
+      printf '  %s>>%s nested .git dirs to DELETE (%s, irreversible):\n' \
         "$C_BLUE" "$C_RESET" "$_fl_n_nested"
+      printf '     %s(each .git holds that sub-repo'\''s history. Delete = history lost.)%s\n' \
+        "$C_DIM" "$C_RESET"
     else
-      printf '  %s>>%s nested .git to briefly move-out-and-restore (%s; history preserved):\n' \
+      printf '  %s>>%s nested .git dirs to briefly MOVE ASIDE, commit, then restore (%s):\n' \
         "$C_BLUE" "$C_RESET" "$_fl_n_nested"
+      printf '     %s(a .git dir marks its parent folder as a sub-repo. Moving it aside%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '     %shides the sub-repo from the outer during commit, so outer sees plain%s\n' \
+        "$C_DIM" "$C_RESET"
+      printf '     %sfiles; then we move the .git back — each sub-repo'\''s history stays intact.)%s\n' \
+        "$C_DIM" "$C_RESET"
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
       [ -n "$_n" ] && printf '       %s\n' "$_n"
     done
   fi
   if [ "$_fl_n_orphan" -gt 0 ]; then
-    printf '  %s>>%s orphan gitlinks to unstage (%s):\n' \
+    printf '  %s>>%s orphan gitlinks to UNSTAGE from the outer'\''s index (%s):\n' \
       "$C_BLUE" "$C_RESET" "$_fl_n_orphan"
+    printf '     %s(a "gitlink" is an index entry pointing to a sub-repo'\''s SHA. "Orphan"%s\n' \
+      "$C_DIM" "$C_RESET"
+    printf '     %smeans it'\''s not listed in .gitmodules — so the outer thinks it'\''s a%s\n' \
+      "$C_DIM" "$C_RESET"
+    printf '     %ssubmodule but there'\''s no proper registration. Unstaging = '\''git rm%s\n' \
+      "$C_DIM" "$C_RESET"
+    printf '     %s--cached'\'' — removes from index only, files on disk are untouched.)%s\n' \
+      "$C_DIM" "$C_RESET"
     printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
       [ -n "$_p" ] && printf '       %s\n' "$_p"
     done
