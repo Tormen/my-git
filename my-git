@@ -34,18 +34,21 @@ else
 fi
 
 # ─── Logging ─────────────────────────────────────────────────────────────
+# Convention: the ENTIRE line is colored (prefix + message). Color reset
+# goes at the very end, right before \n — so pipes/paging that strip
+# trailing whitespace still terminate the escape cleanly.
 # MILESTONE / major info → bold cyan.
-log_major()     { printf ' %s>>>%s %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$*"; }
-# Medium info → blue, only at -V / -VV / -D / -DD.
-log_medium()    { [ "$VRB"      = 1 ] && printf '  %s>>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; return 0; }
+log_major()     { printf ' %s>>> %s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"; }
+# Medium info → bright blue, only at -V / -VV / -D / -DD.
+log_medium()    { [ "$VRB"      = 1 ] && printf '  %s>> %s%s\n' "$C_BLUE" "$*" "$C_RESET"; return 0; }
 # Minor detail → default color, only at -VV / -DD.
 log_minor()     { [ "$VERYVRB"  = 1 ] && printf '    > %s\n' "$*"; return 0; }
 # Debug output → dim/grey, stderr.
 log_dbg_major() { [ "$DBG"      = 1 ] && printf ' %s~~~ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
 log_dbg_med()   { [ "$DBG"      = 1 ] && printf '  %s~~ %s%s\n'  "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
 log_dbg_minor() { [ "$DEEPDBG"  = 1 ] && printf '   %s~ %s%s\n'   "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
-log_warn()      { printf '%sWARN: %s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
-log_error()     { printf '%sERROR:%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
+log_warn()      { printf '%sWARN:  %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+log_error()     { printf '%sERROR: %s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
 
 # ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
 # run: echo command in grey at -V, then execute. Preserves exit code.
@@ -1002,7 +1005,7 @@ cmd_status() {
     [ "$_n_div" -gt 0 ]    && _parts="$_parts $(c_yellow "diverged=$_n_div")"
     [ "$_n_dirty" -gt 0 ]  && _parts="$_parts $(c_yellow "DIRTY=$_n_dirty")"
     [ "$_n_err" -gt 0 ]    && _parts="$_parts $(c_red "err/skip=$_n_err")"
-    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$_st_total" "$_parts"
+    printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$_st_total" "$_parts" "$C_RESET"
   fi
   rm -f "$_stcounts_tmp"
 }
@@ -1597,7 +1600,7 @@ cmd_masscommits() {
     [ "$MC_N_IGNORED" -gt 0 ]        && _parts="$_parts ignored=$MC_N_IGNORED"
     [ "$MC_N_ERROR" -gt 0 ]          && _parts="$_parts $(c_red "errors=$MC_N_ERROR")"
     [ -z "$_parts" ] && _parts=" (nothing to do)"
-    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$MC_N_TOTAL" "$_parts"
+    printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$MC_N_TOTAL" "$_parts" "$C_RESET"
     # What's LEFT to do.
     _left_hint=""
     [ "$MC_N_SKIPPED" -gt 0 ] && _left_hint="$MC_N_SKIPPED repo(s) skipped under -i"
@@ -1609,9 +1612,9 @@ cmd_masscommits() {
       [ -n "$_left_hint" ] && _left_hint="$_left_hint; "
       _left_hint="${_left_hint}$MC_N_ERROR error(s)"
     }
-    [ -n "$_left_hint" ] && printf '  %s>>%s left to do: %s\n' "$C_BLUE" "$C_RESET" "$_left_hint"
-    printf '  %s>>%s for details:  %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
-      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    [ -n "$_left_hint" ] && printf '  %s>> left to do: %s%s\n' "$C_BLUE" "$_left_hint" "$C_RESET"
+    printf '  %s>> for details:  %s st%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')" "$C_RESET"
   else
     # Analyze mode: "what would be done".
     log_major "mc: analyze summary"
@@ -1622,11 +1625,11 @@ cmd_masscommits() {
     [ "$MC_N_WOULD_USER" -gt 0 ] && _wparts="$_wparts would-user-commit=$MC_N_WOULD_USER"
     [ "$MC_N_IGNORED" -gt 0 ]    && _wparts="$_wparts ignored=$MC_N_IGNORED"
     [ -z "$_wparts" ] && _wparts=" (nothing to do)"
-    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$MC_N_TOTAL" "$_wparts"
-    printf '  %s>>%s apply:       %s mc go%s\n' "$C_BLUE" "$C_RESET" "$US" \
-      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
-    printf '  %s>>%s for details: %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
-      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$MC_N_TOTAL" "$_wparts" "$C_RESET"
+    printf '  %s>> apply:       %s mc go%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')" "$C_RESET"
+    printf '  %s>> for details: %s st%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')" "$C_RESET"
   fi
   return $_rc_total
 }
@@ -1863,7 +1866,7 @@ cmd_pull() {
     [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
     [ "$PL_N_ERROR" -gt 0 ]    && _p="$_p $(c_red "errors=$PL_N_ERROR")"
     [ -z "$_p" ] && _p=" (nothing to do)"
-    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$PL_N_TOTAL" "$_p"
+    printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$PL_N_TOTAL" "$_p" "$C_RESET"
   else
     log_major "pull: analyze summary"
     _p=""
@@ -1873,11 +1876,11 @@ cmd_pull() {
     [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
     [ "$PL_N_ERROR" -gt 0 ]    && _p="$_p $(c_red "errors=$PL_N_ERROR")"
     [ -z "$_p" ] && _p=" (nothing to do)"
-    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$PL_N_TOTAL" "$_p"
-    printf '  %s>>%s apply:       %s pull go%s\n' "$C_BLUE" "$C_RESET" "$US" \
-      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
-    printf '  %s>>%s for details: %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
-      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$PL_N_TOTAL" "$_p" "$C_RESET"
+    printf '  %s>> apply:       %s pull go%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')" "$C_RESET"
+    printf '  %s>> for details: %s st%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')" "$C_RESET"
   fi
   return $_rc_total
 }
@@ -1977,9 +1980,9 @@ cmd_flatten() {
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
     echo
-    printf '  %s>>%s analyze-only — re-run with '\''go'\'' to apply:\n' "$C_BLUE" "$C_RESET"
-    printf '  %s>>%s   default (history preserved):  %s flatten go\n' "$C_BLUE" "$C_RESET" "$US"
-    printf '  %s>>%s   irreversible delete:          %s flatten go --rm-git\n' "$C_BLUE" "$C_RESET" "$US"
+    printf '  %s>> analyze-only — re-run with '\''go'\'' to apply:%s\n' "$C_BLUE" "$C_RESET"
+    printf '  %s>>   default (history preserved):  %s flatten go%s\n' "$C_BLUE" "$US" "$C_RESET"
+    printf '  %s>>   irreversible delete:          %s flatten go --rm-git%s\n' "$C_BLUE" "$US" "$C_RESET"
     exit 0
   fi
 
@@ -2237,8 +2240,8 @@ cmd_remote() {
   [ "$RM_N_NOREMOTE" -gt 0 ] && _p="$_p $(c_red "no-remote=$RM_N_NOREMOTE")"
   [ "$RM_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$RM_N_IGNORED"
   [ "$RM_CHECK" = 1 ] && [ "$RM_N_SUS" -gt 0 ] && _p="$_p $(c_yellow "suspicious=$RM_N_SUS")"
-  printf '  %s>>%s %s\n' "$C_BLUE" "$C_RESET" "$_p"
-  [ "$RM_CHECK" = 0 ] && printf '  %s>>%s run with --check to flag suspicious urls\n' "$C_BLUE" "$C_RESET"
+  printf '  %s>> %s%s\n' "$C_BLUE" "$_p" "$C_RESET"
+  [ "$RM_CHECK" = 0 ] && printf '  %s>> run with --check to flag suspicious urls%s\n' "$C_BLUE" "$C_RESET"
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -5054,11 +5057,11 @@ _sm_run_here() {
   [ "$_sm_skipped" -gt 0 ]       && _sm_parts="$_sm_parts skipped=$_sm_skipped"
   [ "$_sm_newly_ignored" -gt 0 ] && _sm_parts="$_sm_parts newly-ignored=$_sm_newly_ignored"
   [ -z "$_sm_parts" ] && _sm_parts=" (nothing to do)"
-  printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$_sm_total" "$_sm_parts"
+  printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$_sm_total" "$_sm_parts" "$C_RESET"
   if [ "$_sm_skipped_nested_after" -gt 0 ]; then
-    printf '  %s>>%s   of skipped: %s became nested-in-parent after a rebind/add in this run —\n' \
-      "$C_BLUE" "$C_RESET" "$_sm_skipped_nested_after"
-    printf '  %s>>%s   register those from inside the parent submodule\n' \
+    printf '  %s>>   of skipped: %s became nested-in-parent after a rebind/add in this run —%s\n' \
+      "$C_BLUE" "$_sm_skipped_nested_after" "$C_RESET"
+    printf '  %s>>   register those from inside the parent submodule%s\n' \
       "$C_BLUE" "$C_RESET"
   fi
   # Cross-submodule: report unregistered nested repos found inside registered
