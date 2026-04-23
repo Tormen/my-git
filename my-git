@@ -832,14 +832,15 @@ cmd_status() {
             esac
             _mark=""
             case "$_tag" in
-              reg)       _mark=" [registered]" ;;
-              unreg)     _mark=" [unregistered]" ;;
-              unreg-ign) _mark=" [unregistered, ignored]" ;;
-              reg-ign)   _mark=" [registered, ignored]" ;;
-              stale)     _mark=" [STALE REGISTRATION]" ;;
+              reg)       _mark="[registered]" ;;
+              unreg)     _mark="[unregistered]" ;;
+              unreg-ign) _mark="[unregistered, ignored]" ;;
+              reg-ign)   _mark="[registered, ignored]" ;;
+              stale)     _mark="[STALE REGISTRATION]" ;;
             esac
-            # Buffer: <left><TAB><sum> so we can align later.
-            printf '%s%s%s\t%s\n' "$_pfx" "$_disp" "$_mark" "$_sum" >> "$_treetmp"
+            # Buffer: <pfx+disp><TAB><mark><TAB><sum> — three columns so
+            # we can align name, registration tag, and state independently.
+            printf '%s%s\t%s\t%s\n' "$_pfx" "$_disp" "$_mark" "$_sum" >> "$_treetmp"
             case "$_sum" in
               "CLEAN :))"*)        echo C ;;
               "CLEAN, ahead"*)     echo A ;;
@@ -851,10 +852,10 @@ cmd_status() {
               *)                   echo E ;;
             esac >> "$_stcounts_tmp"
           done
-      # Align: compute max display-width of left column then pad.
-      # length() in POSIX awk counts BYTES, and box-drawing chars
-      # (│├└─) are 3 bytes each but display as 1 col. Subtract the
-      # 2-byte-per-char excess for each box-drawing occurrence.
+      # Align: compute max display-width of col1 (name) and col2 (mark)
+      # then pad. length() in POSIX awk counts BYTES, and box-drawing
+      # chars (│├└─) are 3 bytes each but display as 1 col — subtract
+      # the 2-byte-per-char excess.
       awk -F'\t' '
         function dwidth(s,   n, w) {
           w = length(s)
@@ -864,10 +865,24 @@ cmd_status() {
           n = gsub(/─/, "", s); w -= 2 * n
           return w
         }
-        # pass 1: gather max
-        NR == FNR { d = dwidth($1); if (d > m) m = d; next }
-        # pass 2: emit padded
-        { d = dwidth($1); pad = m - d; printf "%s%*s  %s\n", $1, pad, "", $2 }
+        # pass 1: gather max widths of col1 and col2
+        NR == FNR {
+          d1 = dwidth($1); if (d1 > m1) m1 = d1
+          d2 = dwidth($2); if (d2 > m2) m2 = d2
+          next
+        }
+        # pass 2: emit padded, 2-space gaps.
+        # If no entry anywhere has a col2 mark (single-repo scope), skip
+        # the empty mark column entirely.
+        {
+          d1 = dwidth($1); p1 = m1 - d1
+          if (m2 > 0) {
+            d2 = dwidth($2); p2 = m2 - d2
+            printf "%s%*s  %s%*s  %s\n", $1, p1, "", $2, p2, "", $3
+          } else {
+            printf "%s%*s  %s\n", $1, p1, "", $3
+          }
+        }
       ' "$_treetmp" "$_treetmp"
       rm -f "$_treetmp"
     fi
