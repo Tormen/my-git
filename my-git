@@ -1747,6 +1747,101 @@ cmd_pull() {
   return $_rc_total
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# ═══ SYNC ════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+#
+# my-git sync [go] [-R|-i|--force] [paths...]
+#
+# Composite "settle the tree" pipeline: sm → pull → mc.
+#   Phase 1: sm     — register new nested repos, rebind moved ones,
+#                     clean stale .gitmodules entries, .claude fixes.
+#   Phase 2: pull   — fetch + fast-forward.
+#   Phase 3: mc     — commit (auto + user-dirt) + push where allowed.
+# Same flags apply uniformly to all three phases. Analyze by default.
+cmd_sync() {
+  _sy_mode=analyze
+  _sy_rec=0; _sy_int=0; _sy_force=0
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help sync; exit 0 ;;
+      go)           _sy_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _sy_mode=analyze ;;
+      -R|--recursive)   _sy_rec=1 ;;
+      -i|--interactive) _sy_int=1 ;;
+      --force)          _sy_force=1 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "sync: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+
+  _phase_flags=""
+  [ "$_sy_mode" = "go" ]  && _phase_flags="$_phase_flags go"
+  [ "$_sy_rec" = 1 ]      && _phase_flags="$_phase_flags -R"
+  [ "$_sy_int" = 1 ]      && _phase_flags="$_phase_flags -i"
+  [ "$_sy_force" = 1 ]    && _phase_flags="$_phase_flags --force"
+
+  # Resolve the scope once; sm doesn't accept path args, so we cd into
+  # each resolved root and run sm + pull + mc from there.
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "sync: no repositories to process"; exit 1; }
+  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.sync.roots.XXXXXX")
+  printf '%s\n' "$_roots" > "$_rtmp"
+
+  _worst=0
+  # NOTE: use a distinct loop variable name. cmd_pull / cmd_masscommits
+  # internally use their own 'while read _root' loops which would clobber
+  # an outer '_root' mid-iteration.
+  while IFS= read -r _sy_root; do
+    [ -n "$_sy_root" ] || continue
+    echo
+    log_major "sync: ── $_sy_root ──"
+
+    echo
+    log_major "sync: phase 1/3 — sm (register / rebind / stale cleanup / .claude)"
+    echo
+    # sm operates on CWD, so cd in; subshell to keep outer $PWD untouched.
+    # shellcheck disable=SC2086
+    ( cd "$_sy_root" && cmd_submodules $_phase_flags )
+    _rc1=$?
+    [ "$_rc1" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in sm phase."; return 77; }
+
+    echo
+    log_major "sync: phase 2/3 — pull (fetch + fast-forward)"
+    echo
+    # shellcheck disable=SC2086
+    cmd_pull $_phase_flags "$_sy_root"
+    _rc2=$?
+    [ "$_rc2" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in pull phase."; return 77; }
+
+    echo
+    log_major "sync: phase 3/3 — mc (commit + push)"
+    echo
+    # shellcheck disable=SC2086
+    cmd_masscommits $_phase_flags "$_sy_root"
+    _rc3=$?
+    [ "$_rc3" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in mc phase."; return 77; }
+
+    for _rcx in "$_rc1" "$_rc2" "$_rc3"; do
+      [ "$_rcx" -gt "$_worst" ] && _worst=$_rcx
+    done
+  done < "$_rtmp"
+  rm -f "$_rtmp"
+
+  echo
+  log_major "sync: all phases complete"
+  return $_worst
+}
+
 # ─── .claude setup enforcement ──────────────────────────────────────────
 # Compute where in the central repo a project's .claude should live.
 claude_dest_for() {
@@ -1991,6 +2086,7 @@ Subcommands:
   pull | pl                Fetch + fast-forward merge (analyze / 'go'; -R top-down)
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
+  sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   claude-check             Audit .claude/ setup (read-only by default)
   help                     Show this help
 
@@ -2227,6 +2323,41 @@ Decisions per repo:
 Analyze always fetches (read-only) so the output reflects real upstream
 state. Set '--fetch-only' for a repeatable "update refs, don't touch
 worktree" pass; the 'fetch' subcommand alias does this.
+EOF
+}
+
+show_help_sync() {
+  cat <<EOF
+my-git sync  (alias: syn)
+
+usage: $US [-V|-D] sync [go] [-R|-i|--force] [paths...]
+
+Composite "settle the tree" — runs sm → pull → mc in order. Each
+phase receives the flags you passed to sync.
+
+  Phase 1: sm    register new nested repos, rebind moved ones, clean
+                 stale .gitmodules entries, .claude setup fixes.
+  Phase 2: pull  fetch origin everywhere; fast-forward clean+behind.
+  Phase 3: mc    auto-commit my-git-caused dirt (gitlink bumps from
+                 phases 1+2, .gitignore/.claude fixes), then prompt-
+                 gate user-dirt under -i; push where allowed.
+
+Order rationale: sm first so registration is authoritative before
+fetch; pull second so we pick up remote changes before committing
+local; mc last so any gitlink bumps from earlier phases get captured
+in the super's cleanup commit.
+
+Options (all forwarded to each phase verbatim):
+  go                 Actually act; otherwise analyze all 3 phases.
+  -R, --recursive    Walk full submodule tree (sm top-down, mc bottom-up,
+                     pull top-down — each phase handles its own order).
+  -i, --interactive  Prompt where applicable in each phase.
+  --force            Bypass per-repo my-git-submodules.ignore markers.
+  -V, -VV, -D, -DD   Verbosity / debug.
+  --help
+
+Abort ([A]) in any phase stops the whole sync (exit 77). Earlier-phase
+effects already committed stay — my-git's "never undo user commits" rule.
 EOF
 }
 
@@ -2511,6 +2642,7 @@ show_help() {
     status|st|s)         show_help_status ;;
     masscommits|mc|c|go) show_help_masscommits ;;
     pull|pl|fetch)       show_help_pull ;;
+    sync|syn)            show_help_sync ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     config|--config|--create-config) show_help_config ;;
@@ -4505,6 +4637,7 @@ main() {
       cmd_masscommits go "$@" ;;
     pull|pl)                    cmd_pull "$@" ;;
     fetch)                      cmd_pull --fetch-only "$@" ;;
+    sync|syn)                   cmd_sync "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     help)                       show_help "${1:-top}" ;;
