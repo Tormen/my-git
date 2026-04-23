@@ -1916,10 +1916,12 @@ cmd_flatten() {
     shift
   done
 
-  _fl_top=$(git rev-parse --show-toplevel 2>/dev/null)
+  # Use logical toplevel (symlink-preserving). 'git rev-parse
+  # --show-toplevel' dereferences symlinks, which confuses the user
+  # who typed '/LINKS/src' but would then see '/Users/MINE/...'.
+  _fl_top=$(git_toplevel_of "$PWD")
   [ -n "$_fl_top" ] || fatal "flatten: not inside a git repo" 1
-  _fl_cwd=$(pwd)
-  if [ "$(cd "$_fl_cwd" && pwd -P)" != "$(cd "$_fl_top" && pwd -P)" ]; then
+  if [ "$(cd "$PWD" 2>/dev/null && pwd -P)" != "$(cd "$_fl_top" 2>/dev/null && pwd -P)" ]; then
     fatal "flatten: must be run from the repo's toplevel: $_fl_top" 1
   fi
   cd "$_fl_top" || fatal "flatten: cannot cd to $_fl_top" 1
