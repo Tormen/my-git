@@ -641,7 +641,12 @@ resolve_scope() {
 #   Does NOT descend into repos that cross-user policy says we can't read.
 walk_tree_lines() (
   _root=$1; _display=$2; _pfx=$3; _cpfx=$4; _tag=$5
-  printf '%s\t%s\t%s\t%s\n' "$_pfx" "$_root" "$_display" "$_tag"
+  # Emit 3 TAB-sep fields: <pfx+display>\t<abs>\t<tag>. Combining pfx
+  # and display up-front avoids POSIX 'read' eating a leading empty
+  # field when _pfx is "" (read treats TAB as IFS-whitespace and
+  # strips leading whitespace; so the root, with _pfx="", would have
+  # its display shifted into the pfx slot downstream).
+  printf '%s%s\t%s\t%s\n' "$_pfx" "$_display" "$_root" "$_tag"
   _action=$(check_priv "$_root")
   [ "$_action" = "exec" ] || return 0
   # Don't descend into a subtree marked as ignored (opt-out) or stale
@@ -889,18 +894,26 @@ cmd_status() {
             esac >> "$_stcounts_tmp"
           done
     else
-      # Default: compact one-line-per-repo tree, PADDED so the state
-      # column lines up. Buffer left-side ('pfx + disp + mark') and
-      # state separately into a tmpfile, compute the max left-width,
-      # then emit padded.
-      _treetmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.XXXXXX")
-      _maxw=0
+      # Default: compact one-line-per-repo tree. Output streams line-
+      # by-line so the user sees progress in big trees instead of a
+      # long stall followed by everything at once.
+      #
+      # Phase A (fast): structural walk only — gather every entry's
+      #   (pfx+disp, mark, tag, abs) into a tmpfile. NO status calls;
+      #   this is just 'find' + .gitmodules lookups.
+      # Phase B (fast): compute the max display-widths of col1 and col2
+      #   from the tmpfile (one awk pass) and emit each row with the
+      #   LEFT side already padded so phase C just appends the state.
+      # Phase C (slow, streaming): read the padded file line by line;
+      #   for each row call status_summary (the expensive git call)
+      #   and print '<padded-left>  <state>' immediately. User sees
+      #   the tree fill in as status completes per repo.
+      _rawtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.raw.XXXXXX")
+      _padtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.pad.XXXXXX")
+
+      # Phase A.  walk_tree_lines emits: <pfx+display>\t<abs>\t<tag>
       walk_tree_lines "$_root" "$_root" "" "" "" \
-        | while IFS="$(printf '\t')" read -r _pfx _abs _disp _tag; do
-            case "$_tag" in
-              stale)     _sum="[no directory on disk — run 'sm go' to clean]" ;;
-              *)         _sum=$(status_summary "$_abs") ;;
-            esac
+        | while IFS="$(printf '\t')" read -r _left _abs _tag; do
             _mark=""
             case "$_tag" in
               reg)       _mark="[registered]" ;;
@@ -909,24 +922,12 @@ cmd_status() {
               reg-ign)   _mark="[registered, ignored]" ;;
               stale)     _mark="[STALE REGISTRATION]" ;;
             esac
-            # Buffer: <pfx+disp><TAB><mark><TAB><sum> — three columns so
-            # we can align name, registration tag, and state independently.
-            printf '%s%s\t%s\t%s\n' "$_pfx" "$_disp" "$_mark" "$_sum" >> "$_treetmp"
-            case "$_sum" in
-              "CLEAN :))"*)        echo C ;;
-              "CLEAN, ahead"*)     echo A ;;
-              "CLEAN, behind"*)    echo B ;;
-              "DIVERGED"*)         echo V ;;
-              "DIRTY"*)            echo D ;;
-              "CLEAN (no remote"*) echo C ;;
-              "[no directory"*)    echo E ;;
-              *)                   echo E ;;
-            esac >> "$_stcounts_tmp"
+            # Columns for awk: <left> TAB <mark> TAB <tag> TAB <abs>
+            printf '%s\t%s\t%s\t%s\n' "$_left" "$_mark" "$_tag" "$_abs" >> "$_rawtmp"
           done
-      # Align: compute max display-width of col1 (name) and col2 (mark)
-      # then pad. length() in POSIX awk counts BYTES, and box-drawing
-      # chars (│├└─) are 3 bytes each but display as 1 col — subtract
-      # the 2-byte-per-char excess.
+
+      # Phase B — compute widths + emit each line with left-side padded.
+      # Output to $_padtmp: "<padded-left><TAB><tag><TAB><abs>".
       awk -F'\t' '
         function dwidth(s,   n, w) {
           w = length(s)
@@ -936,26 +937,49 @@ cmd_status() {
           n = gsub(/─/, "", s); w -= 2 * n
           return w
         }
-        # pass 1: gather max widths of col1 and col2
+        # pass 1: gather max widths of col1 (name) and col2 (mark)
         NR == FNR {
           d1 = dwidth($1); if (d1 > m1) m1 = d1
           d2 = dwidth($2); if (d2 > m2) m2 = d2
           next
         }
-        # pass 2: emit padded, 2-space gaps.
-        # If no entry anywhere has a col2 mark (single-repo scope), skip
-        # the empty mark column entirely.
+        # pass 2: emit padded left + TAB + abs + TAB + tag.
+        # Tag is LAST because it can be empty (root) and POSIX read
+        # collapses consecutive separators for middle-whitespace fields;
+        # a trailing empty field reads correctly as "".
         {
           d1 = dwidth($1); p1 = m1 - d1
           if (m2 > 0) {
             d2 = dwidth($2); p2 = m2 - d2
-            printf "%s%*s  %s%*s  %s\n", $1, p1, "", $2, p2, "", $3
+            left = sprintf("%s%*s  %s%*s", $1, p1, "", $2, p2, "")
           } else {
-            printf "%s%*s  %s\n", $1, p1, "", $3
+            left = sprintf("%s%*s", $1, p1, "")
           }
+          printf "%s\t%s\t%s\n", left, $4, $3
         }
-      ' "$_treetmp" "$_treetmp"
-      rm -f "$_treetmp"
+      ' "$_rawtmp" "$_rawtmp" > "$_padtmp"
+      rm -f "$_rawtmp"
+
+      # Phase C — stream status per line (progress visible).
+      while IFS="$(printf '\t')" read -r _left _abs _tag; do
+        [ -n "$_abs" ] || continue
+        case "$_tag" in
+          stale) _sum="[no directory on disk — run 'sm go' to clean]" ;;
+          *)     _sum=$(status_summary "$_abs") ;;
+        esac
+        printf '%s  %s\n' "$_left" "$_sum"
+        case "$_sum" in
+          "CLEAN :))"*)        echo C ;;
+          "CLEAN, ahead"*)     echo A ;;
+          "CLEAN, behind"*)    echo B ;;
+          "DIVERGED"*)         echo V ;;
+          "DIRTY"*)            echo D ;;
+          "CLEAN (no remote"*) echo C ;;
+          "[no directory"*)    echo E ;;
+          *)                   echo E ;;
+        esac >> "$_stcounts_tmp"
+      done < "$_padtmp"
+      rm -f "$_padtmp"
     fi
   done < "$_rtmp"
   rm -f "$_rtmp"
