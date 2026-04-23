@@ -1980,7 +1980,7 @@ cmd_flatten() {
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
     echo
-    log_major "analyze-only — re-run with 'go' to apply:"
+    log_major "This was analyze-only — re-run with 'go' to apply:"
     printf '  %s>>   %s flatten go           (keep child repos)%s\n' "$C_BLUE" "$US" "$C_RESET"
     printf '  %s>>   %s flatten go --rm-git  (delete child repos)%s\n' "$C_BLUE" "$US" "$C_RESET"
     exit 0
