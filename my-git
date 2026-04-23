@@ -1748,6 +1748,149 @@ cmd_pull() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════
+# ═══ REMOTE (list / check) ══════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+#
+# my-git remote [--check] [-R] [paths...]
+#
+# LIST (default): one line per repo: '<path>   <remote> -> <url>'.
+#   If the repo has multiple remotes, prints one line each.
+#   If it has NO remote: '<path>   (no remotes)' — flagged red.
+# CHECK (--check): list + add a ⚠ tag for suspicious urls.
+#   Heuristics (all yellow-flagged, none fatal):
+#     - relative path (./foo, ../foo)
+#     - file:// scheme
+#     - plain http:// (should usually be https or ssh)
+#     - no origin remote at all (but other remotes exist)
+
+_mg_remote_flag() {
+  # Return " ⚠ <reason>" if the url is suspicious, else empty.
+  _u=$1
+  case "$_u" in
+    ./*|../*)  printf ' %s⚠ relative path%s' "$C_YELLOW" "$C_RESET" ;;
+    file://*)  printf ' %s⚠ file:// scheme%s' "$C_YELLOW" "$C_RESET" ;;
+    http://*)  printf ' %s⚠ plain http%s'     "$C_YELLOW" "$C_RESET" ;;
+  esac
+}
+
+remote_one() {
+  _r=$1
+  RM_N_TOTAL=$((RM_N_TOTAL + 1))
+  # Honor ignore marker so scoped audits don't spam known-ignored repos.
+  _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
+  if [ -n "$_gd_for_marker" ] && [ -e "$_gd_for_marker/$_sm_IGNORE_MARKER" ]; then
+    if [ "${RM_FORCE:-0}" -ne 1 ]; then
+      [ "$VRB" = 1 ] && log_medium "$_r: [ignored marker — skipping]"
+      RM_N_IGNORED=$((RM_N_IGNORED + 1))
+      return 0
+    fi
+  fi
+  _remotes=$(run_as_owner_capture "$_r" git remote 2>/dev/null)
+  if [ -z "$_remotes" ]; then
+    printf ' >>> %-60s %s(no remotes)%s\n' "$_r" "$C_RED" "$C_RESET"
+    RM_N_NOREMOTE=$((RM_N_NOREMOTE + 1))
+    return 0
+  fi
+  _has_origin=0
+  _sus=0
+  printf '%s\n' "$_remotes" | while IFS= read -r _rem; do
+    [ -n "$_rem" ] || continue
+    _url=$(run_as_owner_capture "$_r" git remote get-url "$_rem" 2>/dev/null)
+    _flag=""
+    if [ "${RM_CHECK:-0}" = 1 ]; then
+      _flag=$(_mg_remote_flag "$_url")
+    fi
+    printf ' >>> %-60s %-10s -> %s%s\n' "$_r" "$_rem" "$_url" "$_flag"
+  done
+  # Origin-missing check (only when --check and repo has remotes but no origin).
+  if [ "${RM_CHECK:-0}" = 1 ]; then
+    if ! printf '%s\n' "$_remotes" | grep -qx 'origin'; then
+      printf ' >>> %-60s %s⚠ no '\''origin'\'' remote%s\n' "$_r" "$C_YELLOW" "$C_RESET"
+      RM_N_SUS=$((RM_N_SUS + 1))
+    fi
+    # Count suspicious urls.
+    printf '%s\n' "$_remotes" | while IFS= read -r _rem; do
+      _url=$(run_as_owner_capture "$_r" git remote get-url "$_rem" 2>/dev/null)
+      case "$_url" in ./*|../*|file://*|http://*) echo S ;; esac
+    done >> "$_rm_sus_tmp"
+  fi
+}
+
+cmd_remote() {
+  RM_CHECK=0
+  RM_FORCE=0
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help remote; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      --check)      RM_CHECK=1 ;;
+      -R|--recursive) RECURSIVE=1 ;;
+      --force)      RM_FORCE=1 ;;
+      list)         : ;;      # optional explicit 'list' subword
+      check)        RM_CHECK=1 ;;  # alias for --check
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "remote: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "no repositories to inspect"; exit 1; }
+
+  RM_N_TOTAL=0; RM_N_NOREMOTE=0; RM_N_IGNORED=0; RM_N_SUS=0
+  _rm_sus_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmsus.XXXXXX")
+  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmroots.XXXXXX")
+  trap 'rm -f "$_rm_sus_tmp" "$_rtmp"' EXIT INT TERM HUP
+  printf '%s\n' "$_roots" > "$_rtmp"
+
+  while IFS= read -r _rm_root; do
+    [ -n "$_rm_root" ] || continue
+    priv_gate "$_rm_root"
+    case "$PRIV_ACTION" in
+      skip) continue ;;
+      warn) log_major "$_rm_root: [SKIPPED — cross-user policy]"; continue ;;
+    esac
+    if [ "$RECURSIVE" = 1 ]; then
+      _nodes=$(walk_submodules "$_rm_root" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}')
+    else
+      _nodes=$_rm_root
+    fi
+    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmnodes.XXXXXX")
+    printf '%s\n' "$_nodes" > "$_ntmp"
+    while IFS= read -r _rm_node; do
+      [ -n "$_rm_node" ] || continue
+      remote_one "$_rm_node"
+    done < "$_ntmp"
+    rm -f "$_ntmp"
+  done < "$_rtmp"
+  rm -f "$_rtmp"
+
+  # Count suspicious from file.
+  if [ -s "$_rm_sus_tmp" ]; then
+    RM_N_SUS=$((RM_N_SUS + $(grep -c '^S$' "$_rm_sus_tmp" 2>/dev/null | head -1)))
+  fi
+  rm -f "$_rm_sus_tmp"
+
+  # Summary.
+  echo
+  log_major "remote: summary"
+  _p=""
+  _p="$_p total=$RM_N_TOTAL"
+  [ "$RM_N_NOREMOTE" -gt 0 ] && _p="$_p $(c_red "no-remote=$RM_N_NOREMOTE")"
+  [ "$RM_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$RM_N_IGNORED"
+  [ "$RM_CHECK" = 1 ] && [ "$RM_N_SUS" -gt 0 ] && _p="$_p $(c_yellow "suspicious=$RM_N_SUS")"
+  printf '  %s>>%s %s\n' "$C_BLUE" "$C_RESET" "$_p"
+  [ "$RM_CHECK" = 0 ] && printf '  %s>>%s run with --check to flag suspicious urls\n' "$C_BLUE" "$C_RESET"
+}
+
+# ═════════════════════════════════════════════════════════════════════════
 # ═══ SYNC ════════════════════════════════════════════════════════════════
 # ═════════════════════════════════════════════════════════════════════════
 #
@@ -2087,6 +2230,7 @@ Subcommands:
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
+  remote | rem             List / audit git remotes across the tree (--check for warnings)
   claude-check             Audit .claude/ setup (read-only by default)
   help                     Show this help
 
@@ -2323,6 +2467,35 @@ Decisions per repo:
 Analyze always fetches (read-only) so the output reflects real upstream
 state. Set '--fetch-only' for a repeatable "update refs, don't touch
 worktree" pass; the 'fetch' subcommand alias does this.
+EOF
+}
+
+show_help_remote() {
+  cat <<EOF
+my-git remote  (alias: rem)
+
+usage: $US [-V|-D] remote [list | check] [--check] [-R|--force] [paths...]
+
+List / audit git remotes across the scoped tree.
+
+Modes:
+  list (default)    One line per remote per repo:
+                      >>> <path>   <remote>   -> <url>
+                    Repos with no remotes show in RED as '(no remotes)'.
+  check / --check   Same listing, plus ⚠ flags on suspicious URLs:
+                      - relative path  (./foo, ../foo)
+                      - file:// scheme
+                      - plain http://  (usually should be https or ssh)
+                      - repo has remotes but none named 'origin'
+
+Options:
+  -R, --recursive   Walk the full submodule tree.
+  --force           Include repos carrying my-git-submodules.ignore (normally
+                    silently skipped).
+  -V, -VV, -D, -DD  Verbosity / debug.
+
+End-of-run summary: total=N [no-remote=X ignored=Y suspicious=Z].
+Suspicious count only shown under --check.
 EOF
 }
 
@@ -2643,6 +2816,7 @@ show_help() {
     masscommits|mc|c|go) show_help_masscommits ;;
     pull|pl|fetch)       show_help_pull ;;
     sync|syn)            show_help_sync ;;
+    remote|rem)          show_help_remote ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     config|--config|--create-config) show_help_config ;;
@@ -4638,6 +4812,7 @@ main() {
     pull|pl)                    cmd_pull "$@" ;;
     fetch)                      cmd_pull --fetch-only "$@" ;;
     sync|syn)                   cmd_sync "$@" ;;
+    remote|rem)                 cmd_remote "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     help)                       show_help "${1:-top}" ;;
