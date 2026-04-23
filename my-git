@@ -822,7 +822,7 @@ cmd_status() {
       -VV)          VRB=1; VERYVRB=1 ;;
       -D|--debug)   DBG=1; VRB=1 ;;
       -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
-      -R|--recursive) : ;;  # st is always recursive — accepted for symmetry
+      -R|--recursive) RECURSIVE=1 ;;  # -R forces discovery in foreign scopes too
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "status: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
