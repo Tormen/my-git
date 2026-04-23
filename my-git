@@ -2063,7 +2063,7 @@ cmd_flatten() {
     _fl_i=$((_fl_i + 1))
     _fl_save_path="$_fl_save_root/$_fl_i"
     printf '%s\t%s\n' "$_fl_top/$_n" "$_fl_save_path" >> "$_fl_manifest"
-    log_medium "move aside $_n  ->  $_fl_save_path"
+    log_medium "MOVE-OUT $_n  ->  $_fl_save_path"
     run mv -- "$_n" "$_fl_save_path" || {
       log_error "move-out failed for $_n"
       _fl_restore
