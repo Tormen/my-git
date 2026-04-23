@@ -3534,6 +3534,8 @@ _sm_run_here() {
   _sm_sync_gitignore=0
   _sm_emit_gitignore=0
   _sm_unstage_embedded=0
+  _sm_flatten=0
+  _sm_rmgit=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3550,6 +3552,8 @@ _sm_run_here() {
       --sync-gitignore)      _sm_sync_gitignore=1 ;;
       --emit-gitignore)      _sm_emit_gitignore=1 ;;
       --unstage-embedded)    _sm_unstage_embedded=1 ;;
+      --flatten)             _sm_flatten=1 ;;
+      --rm-git)              _sm_rmgit=1 ;;
       -R|--recursive)        RECURSIVE=1 ;;
       -h|--help)             show_help submodules; exit 0 ;;
       --)                    shift; break ;;
@@ -3680,6 +3684,140 @@ _sm_run_here() {
     echo
     echo "Done. Working tree is unchanged."
     echo "Tip: run '$US sm --sync-gitignore' to prevent 'git add' from re-staging them."
+    exit 0
+  fi
+
+  # ─── --flatten ─────────────────────────────────────────────────────
+  # Convert every nested .git tree under the CURRENT super-repo into
+  # plain content of the super. The user's mental model: "all files
+  # under <this repo> belong here; I don't care about nested histories".
+  #
+  # Steps (atomic):
+  #   1. Ensure '.git/' is in <repo>/.gitignore (cosmetic: future git
+  #      commands skip nested .git dirs).
+  #   2. Unstage orphan gitlinks (mode 160000 entries that aren't
+  #      submodules registered in .gitmodules).
+  #   3. Rename every NESTED .git to .git.bak (or with --rm-git, delete).
+  #      This disables git's embedded-repo auto-detection so 'git add -A'
+  #      treats each nested tree as plain content.
+  #   4. 'git add -A' + 'git commit' — one atomic flatten commit.
+  #
+  # Safety: MUST be run from the repo's toplevel (not inside a subdir,
+  # and not outside a git repo at all). Refuses to flatten anything
+  # that is itself a registered submodule of a parent super-repo.
+  if [ "$_sm_flatten" -eq 1 ]; then
+    _fl_top=$(git rev-parse --show-toplevel 2>/dev/null)
+    [ -n "$_fl_top" ] || fatal "sm --flatten: not inside a git repo" 1
+    _fl_cwd=$(pwd)
+    if [ "$(cd "$_fl_cwd" && pwd -P)" != "$(cd "$_fl_top" && pwd -P)" ]; then
+      fatal "sm --flatten: must be run from the repo's toplevel: $_fl_top" 1
+    fi
+
+    # Find nested .git (both dirs and files — submodule gitdirs use
+    # a '.git' FILE containing 'gitdir: ...'). Exclude the outer .git.
+    _fl_nested=$(find . -path ./.git -prune -o \( -name .git -a \( -type d -o -type f \) \) -print 2>/dev/null | sed 's|^\./||' | sort)
+
+    # Orphan gitlinks (mode-160000 index entries NOT in .gitmodules).
+    _fl_embedded=$(_sm_safe_git . ls-files -s 2>/dev/null | awk '$1 == "160000" {print}' | cut -f2- | sort)
+    _fl_reg=''
+    [ -f .gitmodules ] && _fl_reg=$(
+      _sm_safe_git . config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+        | sed 's/^[^ ]* //')
+    _fl_orphan=$(printf '%s\n' "$_fl_embedded" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      if ! printf '%s\n' "$_fl_reg" | grep -Fxq "$_p"; then
+        printf '%s\n' "$_p"
+      fi
+    done)
+
+    _fl_n_nested=$(printf '%s' "$_fl_nested" | grep -c .)
+    _fl_n_orphan=$(printf '%s' "$_fl_orphan" | grep -c .)
+
+    if [ "$_fl_n_nested" -eq 0 ] && [ "$_fl_n_orphan" -eq 0 ]; then
+      log_major "$_fl_top: nothing to flatten (no nested .git, no orphan gitlinks)"
+      exit 0
+    fi
+
+    log_major "$_fl_top: flatten plan"
+    if [ "$_fl_n_nested" -gt 0 ]; then
+      log_medium "nested .git to $([ "$_sm_rmgit" = 1 ] && echo REMOVE || echo RENAME to .git.bak) ($_fl_n_nested):"
+      printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+        [ -n "$_n" ] && log_minor "  $_n"
+      done
+    fi
+    if [ "$_fl_n_orphan" -gt 0 ]; then
+      log_medium "orphan gitlinks to unstage ($_fl_n_orphan):"
+      printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
+        [ -n "$_p" ] && log_minor "  $_p"
+      done
+    fi
+
+    if [ "$_sm_mode" = dry ]; then
+      log_major "dry-run — nothing changed. Re-run with 'sm --flatten go' to apply."
+      exit 0
+    fi
+
+    if [ "$_sm_interactive" -eq 1 ]; then
+      _ans=$(_sm_ask "Proceed with flatten? [Y]es / [A]bort [Y/a]: ")
+      case "$_ans" in a|A) echo "Aborted."; exit 77 ;; esac
+    fi
+
+    # 1. Add '.git/' to .gitignore (cosmetic: future git ops ignore
+    # nested .git). Without renaming the dirs this wouldn't help, but
+    # renaming removes the problem and keeps the gitignore entry as a
+    # guard against future nested clones.
+    if [ -f .gitignore ] && grep -Eq '^/?\.git/?$' .gitignore; then
+      :
+    else
+      [ -f .gitignore ] && [ -s .gitignore ] && {
+        _last=$(tail -c1 .gitignore 2>/dev/null)
+        [ "$_last" != "" ] && [ "$_last" != "
+" ] && printf '\n' >> .gitignore
+      }
+      printf '# flatten: hide nested .git dirs from outer repo\n.git/\n' >> .gitignore
+      log_major "appended '.git/' to $_fl_top/.gitignore"
+    fi
+
+    # 2. Unstage orphan gitlinks.
+    printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      log_medium "UNSTAGE  $_p"
+      run git rm --cached -rf -- "$_p" >/dev/null 2>&1 || \
+        log_warn "git rm --cached failed for $_p"
+    done
+
+    # 3. Rename or remove each nested .git.
+    printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
+      [ -n "$_n" ] || continue
+      if [ "$_sm_rmgit" = 1 ]; then
+        log_medium "RM       $_n"
+        run rm -rf -- "$_n" || log_warn "rm failed for $_n"
+      else
+        _bak="${_n}.bak"
+        # Avoid clobbering an existing backup.
+        _i=1
+        while [ -e "$_bak" ]; do
+          _bak="${_n}.bak.$_i"
+          _i=$((_i + 1))
+        done
+        log_medium "RENAME   $_n -> $_bak"
+        run mv -- "$_n" "$_bak" || log_warn "mv failed for $_n"
+      fi
+    done
+
+    # 4. Stage + commit the flatten as one atomic commit.
+    log_major "staging & committing flattened content..."
+    run git add -A || { log_error "git add -A failed"; exit 1; }
+    _fl_msg="my-git sm --flatten: $_fl_n_nested nested .git $([ "$_sm_rmgit" = 1 ] && echo removed || echo renamed-to-.bak), $_fl_n_orphan orphan gitlink(s) unstaged"
+    if run git commit -q -m "$_fl_msg" 2>/tmp/flatten-commit-$$.log; then
+      log_major "$_fl_top: $(c_green 'DONE :))') (flattened)"
+      rm -f /tmp/flatten-commit-$$.log
+    else
+      log_error "flatten commit failed:"
+      cat /tmp/flatten-commit-$$.log >&2
+      rm -f /tmp/flatten-commit-$$.log
+      exit 1
+    fi
     exit 0
   fi
 
