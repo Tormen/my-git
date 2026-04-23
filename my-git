@@ -1496,6 +1496,257 @@ cmd_masscommits() {
   return $_rc_total
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# ═══ PULL / FETCH ════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+#
+# my-git pull [go] [-R|-i|--force|--fetch-only] [paths...]
+#
+# Two-phase like mc/sm: default analyze, 'go' acts.
+#   * fetches origin on every scoped repo (always, even in analyze — fetch
+#     is read-only wrt the worktree)
+#   * with 'go' AND when clean + behind: fast-forward merges
+#   * clean + diverged → refuses (user resolves manually)
+#   * dirty or ignored → skipped
+# --fetch-only: stops after fetch; never merges. Use when you just want
+#   refs updated.
+
+# pull_one <repo>
+# Returns:
+#   0 = success (clean, ff'd, or noop)
+#   1 = error (fetch failed / merge failed)
+#  77 = abort requested via -i prompt
+pull_one() {
+  _r=$1
+  PL_N_TOTAL=$((PL_N_TOTAL + 1))
+
+  # Honor the ignore marker.
+  _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
+  if [ -n "$_gd_for_marker" ] && [ -e "$_gd_for_marker/$_sm_IGNORE_MARKER" ]; then
+    if [ "${PL_FORCE:-0}" -eq 1 ]; then
+      log_medium "$_r: ignore marker present, OVERRIDDEN by --force"
+    else
+      [ "$VRB" = 1 ] && log_medium "$_r: [ignored marker — skipping]"
+      PL_N_IGNORED=$((PL_N_IGNORED + 1))
+      return 0
+    fi
+  fi
+
+  # No remote → nothing to fetch.
+  _remotes=$(run_as_owner_capture "$_r" git remote 2>/dev/null)
+  if [ -z "$_remotes" ]; then
+    [ "$VRB" = 1 ] && log_medium "$_r: [no remote — skipping]"
+    PL_N_NOREMOTE=$((PL_N_NOREMOTE + 1))
+    return 0
+  fi
+
+  # Fetch (always runs — read-only).
+  if [ "$_pl_mode" = "go" ] || [ "${PL_FETCH_ONLY:-0}" = 1 ] || [ "$DRY_RUN" != 1 ]; then
+    # In analyze mode we also fetch so the ff/diverged/behind status
+    # reflects the real upstream — otherwise analyze is meaningless
+    # when stale. Only skipped when user asks for pure no-network mode
+    # (not currently exposed; all modes fetch).
+    if ! run_as_owner "$_r" git fetch --quiet --all --prune 2>/dev/null; then
+      log_error "$_r: git fetch failed"
+      PL_N_ERROR=$((PL_N_ERROR + 1))
+      return 1
+    fi
+  fi
+
+  # Compute ahead/behind vs current branch's tracked remote.
+  _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  _rem_ref=origin/$_branch
+  _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null \
+    | grep -E "^[[:space:]]*remotes/$_rem_ref$" || true)
+  if [ -z "$_has_remote" ]; then
+    _desc="fetched; no origin/$_branch tracking ref"
+    _action=noop
+  else
+    _ab=$(run_as_owner_capture "$_r" git rev-list --left-right --count \
+      "${_rem_ref}...${_branch}" 2>/dev/null)
+    _behind=$(printf '%s' "$_ab" | awk '{print $1+0}')
+    _ahead=$(printf '%s' "$_ab" | awk '{print $2+0}')
+    # Worktree dirty?
+    _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
+    if [ -n "$_porc" ]; then
+      _desc="DIRTY (${_ahead:-0}/${_behind:-0} ahead/behind)"
+      _action="skip (worktree dirty)"
+    elif [ "${_behind:-0}" -gt 0 ] && [ "${_ahead:-0}" -gt 0 ]; then
+      _desc="DIVERGED (ahead=$_ahead behind=$_behind)"
+      _action="skip (manual merge needed)"
+    elif [ "${_behind:-0}" -gt 0 ]; then
+      _desc="behind=$_behind"
+      _action="ff-merge"
+    elif [ "${_ahead:-0}" -gt 0 ]; then
+      _desc="ahead=$_ahead"
+      _action="noop (nothing to pull)"
+    else
+      _desc="CLEAN :))"
+      _action=noop
+    fi
+  fi
+
+  # Analyze mode — print and bail.
+  if [ "$DRY_RUN" = 1 ]; then
+    printf ' >>> %-60s %-32s -> %s\n' "$_r" "$_desc" "$_action"
+    case "$_action" in
+      noop*|"skip (worktree dirty)"|"skip (manual merge needed)")
+        PL_N_CLEAN=$((PL_N_CLEAN + 1)) ;;
+      ff-merge)
+        PL_N_WOULD_FF=$((PL_N_WOULD_FF + 1)) ;;
+    esac
+    return 0
+  fi
+
+  # go mode.
+  case "$_action" in
+    noop*)
+      log_major "$_r: $_desc"
+      PL_N_CLEAN=$((PL_N_CLEAN + 1))
+      return 0
+      ;;
+    "skip (worktree dirty)")
+      log_major "$_r: $_desc (dirty — commit or stash, then re-run)"
+      PL_N_SKIPPED=$((PL_N_SKIPPED + 1))
+      return 0
+      ;;
+    "skip (manual merge needed)")
+      log_major "$_r: $_desc (resolve manually: git merge / git rebase)"
+      PL_N_SKIPPED=$((PL_N_SKIPPED + 1))
+      return 0
+      ;;
+  esac
+
+  # ff-merge.
+  if [ "${PL_FETCH_ONLY:-0}" = 1 ]; then
+    log_major "$_r: fetched ($_desc), --fetch-only → not merging"
+    PL_N_CLEAN=$((PL_N_CLEAN + 1))
+    return 0
+  fi
+  if [ "$INTERACTIVE" = 1 ]; then
+    _ans=$(_sm_ask "    $_r: fast-forward $_behind commit(s)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    case "$_ans" in
+      a|A) log_major "$_r: [ABORT requested]"; return 77 ;;
+      s|S|n|N) log_major "$_r: skipped (ff-merge)"; PL_N_SKIPPED=$((PL_N_SKIPPED + 1)); return 0 ;;
+    esac
+  fi
+  if run_as_owner "$_r" git merge --ff-only --quiet "$_rem_ref" 2>/dev/null; then
+    log_major "$_r: $(c_green 'DONE :))') (fast-forwarded $_behind commit(s))"
+    PL_N_FFD=$((PL_N_FFD + 1))
+    return 0
+  else
+    log_error "$_r: ff-merge failed"
+    PL_N_ERROR=$((PL_N_ERROR + 1))
+    return 1
+  fi
+}
+
+cmd_pull() {
+  _pl_mode=analyze
+  PL_FORCE=0
+  PL_FETCH_ONLY=0
+  _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help pull; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV)          VRB=1; VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      go)           _pl_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _pl_mode=analyze ;;
+      -i|--interactive) INTERACTIVE=1 ;;
+      -R|--recursive)   RECURSIVE=1 ;;
+      --force)          PL_FORCE=1 ;;
+      --fetch-only)     PL_FETCH_ONLY=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "pull: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+  if [ "$_pl_mode" = "go" ]; then DRY_RUN=0; else DRY_RUN=1; fi
+
+  _roots=$(resolve_scope "$@") || exit 1
+  [ -z "$_roots" ] && { log_error "no repositories to pull"; exit 1; }
+
+  PL_N_TOTAL=0; PL_N_CLEAN=0; PL_N_FFD=0; PL_N_WOULD_FF=0
+  PL_N_SKIPPED=0; PL_N_IGNORED=0; PL_N_NOREMOTE=0; PL_N_ERROR=0
+
+  _rc_total=0
+  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
+  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
+  printf '%s\n' "$_roots" > "$_rtmp"
+  while IFS= read -r _root; do
+    [ -n "$_root" ] || continue
+    priv_gate "$_root"
+    case "$PRIV_ACTION" in
+      skip) continue ;;
+      warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
+    esac
+    if [ "$RECURSIVE" = 1 ]; then
+      # Top-down: parents fetch first (so submodule refs are resolvable).
+      # walk_submodules is post-order; reverse for top-down.
+      _nodes=$(walk_submodules "$_root" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}')
+    else
+      _nodes=$_root
+    fi
+    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
+    printf '%s\n' "$_nodes" > "$_ntmp"
+    _abort_requested=0
+    while IFS= read -r _node; do
+      [ -n "$_node" ] || continue
+      [ "$_abort_requested" = 1 ] && continue
+      pull_one "$_node"
+      _rc=$?
+      case "$_rc" in
+        0)  : ;;
+        77) _abort_requested=1 ;;
+        *)  _rc_total=1 ;;
+      esac
+    done < "$_ntmp"
+    rm -f "$_ntmp"
+    if [ "$_abort_requested" = 1 ]; then
+      rm -f "$_rtmp"
+      log_major "pull: ABORT requested — stopping."
+      return 77
+    fi
+  done < "$_rtmp"
+  rm -f "$_rtmp"
+
+  # Summary.
+  echo
+  if [ "$_pl_mode" = "go" ]; then
+    log_major "pull: summary"
+    _p=""
+    [ "$PL_N_CLEAN" -gt 0 ]    && _p="$_p clean=$PL_N_CLEAN"
+    [ "$PL_N_FFD" -gt 0 ]      && _p="$_p fast-forwarded=$PL_N_FFD"
+    [ "$PL_N_SKIPPED" -gt 0 ]  && _p="$_p skipped=$PL_N_SKIPPED"
+    [ "$PL_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$PL_N_IGNORED"
+    [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
+    [ "$PL_N_ERROR" -gt 0 ]    && _p="$_p $(c_red "errors=$PL_N_ERROR")"
+    [ -z "$_p" ] && _p=" (nothing to do)"
+    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$PL_N_TOTAL" "$_p"
+  else
+    log_major "pull: analyze summary"
+    _p=""
+    [ "$PL_N_CLEAN" -gt 0 ]    && _p="$_p clean=$PL_N_CLEAN"
+    [ "$PL_N_WOULD_FF" -gt 0 ] && _p="$_p would-ff=$PL_N_WOULD_FF"
+    [ "$PL_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$PL_N_IGNORED"
+    [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
+    [ "$PL_N_ERROR" -gt 0 ]    && _p="$_p $(c_red "errors=$PL_N_ERROR")"
+    [ -z "$_p" ] && _p=" (nothing to do)"
+    printf '  %s>>%s total=%s:%s\n' "$C_BLUE" "$C_RESET" "$PL_N_TOTAL" "$_p"
+    printf '  %s>>%s apply:       %s pull go%s\n' "$C_BLUE" "$C_RESET" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+    printf '  %s>>%s for details: %s st%s\n' "$C_BLUE" "$C_RESET" "$US" \
+      "$([ "$RECURSIVE" = 1 ] && echo ' -R')"
+  fi
+  return $_rc_total
+}
+
 # ─── .claude setup enforcement ──────────────────────────────────────────
 # Compute where in the central repo a project's .claude should live.
 claude_dest_for() {
@@ -1737,6 +1988,8 @@ Subcommands:
   status | st | s          List status of repo(s) + submodules (always recursive — overview)
   masscommits | mc | c     Analyze (default) / add + commit + push with 'go'
                            (single level; -R = full bottom-up walk)
+  pull | pl                Fetch + fast-forward merge (analyze / 'go'; -R top-down)
+  fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   claude-check             Audit .claude/ setup (read-only by default)
   help                     Show this help
@@ -1931,6 +2184,49 @@ End-of-run summary:
 
 Compat:  'my-git go' is a shortcut for 'my-git mc go'.
 Scope:   see  $US --help
+EOF
+}
+
+show_help_pull() {
+  cat <<EOF
+my-git pull  (aliases: pl;  'fetch' = pull --fetch-only)
+
+usage: $US [-V|-D] pull [go] [-R|-i|--force|--fetch-only] [paths...]
+
+Fetch origin on every scoped repo; with 'go', fast-forward clean+behind
+repos. Diverged or dirty repos are SKIPPED — my-git does not auto-
+rebase or merge-commit (that's a manual decision).
+
+Modes:
+  default (no 'go')   ANALYZE — fetch + print one concise line per repo
+                      (CLEAN, behind=N, ahead=N, DIVERGED, DIRTY).
+                      No ff-merge performed.
+  go                  APPLY — same fetch, PLUS fast-forward merge for
+                      clean+behind repos.
+
+Options:
+  go                   Actually fast-forward; otherwise analyze only.
+  --fetch-only         Stop after fetch, never merge (safe to run always).
+  -i, --interactive    Prompt [Y/s/a] before each ff-merge under -R walks.
+  -R, --recursive      Walk full submodule tree TOP-DOWN (parents fetch
+                       first so submodule refs resolve).
+  --force              Bypass per-repo my-git-submodules.ignore markers
+                       (same semantics as 'sm --force' / 'mc --force').
+  -V, -VV, -D, -DD     Verbosity / debug.
+  --help
+
+Decisions per repo:
+  no remote                           -> skipped (no-remote=N in summary)
+  marker + no --force                 -> skipped (ignored=N)
+  DIRTY worktree                      -> skipped (user must commit/stash)
+  DIVERGED (ahead + behind)           -> skipped (manual merge/rebase)
+  clean + ahead only                  -> noop (nothing to pull)
+  clean + behind                      -> fast-forward (go) / would-ff (analyze)
+  clean + matched                     -> noop
+
+Analyze always fetches (read-only) so the output reflects real upstream
+state. Set '--fetch-only' for a repeatable "update refs, don't touch
+worktree" pass; the 'fetch' subcommand alias does this.
 EOF
 }
 
@@ -2214,6 +2510,7 @@ show_help() {
     ''|top)              show_help_top ;;
     status|st|s)         show_help_status ;;
     masscommits|mc|c|go) show_help_masscommits ;;
+    pull|pl|fetch)       show_help_pull ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     config|--config|--create-config) show_help_config ;;
@@ -4206,6 +4503,8 @@ main() {
     go)
       # Back-compat: 'my-git go' = 'my-git mc go' (action).
       cmd_masscommits go "$@" ;;
+    pull|pl)                    cmd_pull "$@" ;;
+    fetch)                      cmd_pull --fetch-only "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     help)                       show_help "${1:-top}" ;;
