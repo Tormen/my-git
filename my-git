@@ -1951,29 +1951,34 @@ cmd_flatten() {
   fi
 
   log_major "$_fl_top: flatten plan"
+  # Plan details: always visible (not -V-gated) — the user needs to see
+  # WHAT would be touched before deciding whether to run 'go'.
   if [ "$_fl_n_nested" -gt 0 ]; then
     if [ "$_fl_rmgit" = 1 ]; then
-      log_medium "nested .git to REMOVE ($_fl_n_nested, irreversible):"
+      printf '  %s>>%s nested .git to REMOVE (%s, irreversible):\n' \
+        "$C_BLUE" "$C_RESET" "$_fl_n_nested"
     else
-      log_medium "nested .git to briefly move-out-and-restore ($_fl_n_nested; history preserved):"
+      printf '  %s>>%s nested .git to briefly move-out-and-restore (%s; history preserved):\n' \
+        "$C_BLUE" "$C_RESET" "$_fl_n_nested"
     fi
     printf '%s\n' "$_fl_nested" | while IFS= read -r _n; do
-      [ -n "$_n" ] && log_minor "  $_n"
+      [ -n "$_n" ] && printf '       %s\n' "$_n"
     done
   fi
   if [ "$_fl_n_orphan" -gt 0 ]; then
-    log_medium "orphan gitlinks to unstage ($_fl_n_orphan):"
+    printf '  %s>>%s orphan gitlinks to unstage (%s):\n' \
+      "$C_BLUE" "$C_RESET" "$_fl_n_orphan"
     printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
-      [ -n "$_p" ] && log_minor "  $_p"
+      [ -n "$_p" ] && printf '       %s\n' "$_p"
     done
   fi
 
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
     echo
-    log_medium "analyze-only — re-run with 'flatten go' to apply."
-    log_medium "  default (history preserved):  $US flatten go"
-    log_medium "  irreversible delete:          $US flatten go --rm-git"
+    printf '  %s>>%s analyze-only — re-run with '\''go'\'' to apply:\n' "$C_BLUE" "$C_RESET"
+    printf '  %s>>%s   default (history preserved):  %s flatten go\n' "$C_BLUE" "$C_RESET" "$US"
+    printf '  %s>>%s   irreversible delete:          %s flatten go --rm-git\n' "$C_BLUE" "$C_RESET" "$US"
     exit 0
   fi
 
