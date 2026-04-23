@@ -859,7 +859,14 @@ commit_one() {
     }
   fi
 
-  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules 2>/dev/null)
+  # --ignore-submodules=dirty: show gitlink BUMPS (new commits in
+  # submodules) so -R bottom-up walk can catch them in the parent's
+  # cleanup commit, but still suppress noise from uncommitted worktree
+  # changes INSIDE submodules (those are the submodule's business, not
+  # the super's). Using bare '--ignore-submodules' (aka =all) would
+  # hide gitlink bumps too — bug: the super would falsely show CLEAN
+  # after children committed under -R.
+  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
 
   # Push is allowed only when BOTH conditions hold:
   #   (1) repo path matches an entry in GIT_REPOS (explicit allowlist), AND
