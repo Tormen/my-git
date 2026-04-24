@@ -1837,12 +1837,17 @@ cmd_flatten() {
   # Used by the add/commit phase so we pass ONLY flatten's paths to
   # 'git add --' and 'git commit --only --', leaving any unrelated
   # user changes untouched.
+  # _fl_build_paths_argv sets:
+  #   $_fl_paths_raw  — newline-separated list of unique paths (for
+  #                     iteration in error-restore and empty-dir filter)
+  #   $_fl_argv       — shell-escaped argv string for 'eval git ...'
   _fl_build_paths_argv() {
     _fl_paths_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flpaths.XXXXXX") || return 1
     {
       printf '%s\n' "$_fl_nested" | sed 's|/\.git$||'
       printf '%s\n' "$_fl_orphan"
     } | grep -v '^$' | sort -u > "$_fl_paths_tmp"
+    _fl_paths_raw=$(cat "$_fl_paths_tmp")
     _fl_argv=""
     while IFS= read -r _p; do
       [ -n "$_p" ] || continue
@@ -1850,6 +1855,30 @@ cmd_flatten() {
     done < "$_fl_paths_tmp"
     rm -f "$_fl_paths_tmp"
     [ -n "$_fl_argv" ]
+  }
+
+  # After 'git add', some paths may have staged nothing (e.g. a nested
+  # repo dir that contained ONLY .git and no other files — once .git is
+  # moved out, the dir is empty; git tracks no empty dirs). Filter
+  # $_fl_paths_raw / $_fl_argv down to paths that have at least one
+  # staged entry under them. Without this, 'git commit --only -- <dir>'
+  # errors 'pathspec did not match any file(s) known to git' for empty
+  # nested dirs and the whole flatten rolls back.
+  _fl_filter_to_staged() {
+    _fl_keep_raw=""
+    _fl_keep_argv=""
+    while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      if git diff --cached --name-only -- "$_p" 2>/dev/null | grep -q .; then
+        _fl_keep_raw="$_fl_keep_raw$_p
+"
+        _fl_keep_argv="$_fl_keep_argv $(shell_escape "$_p")"
+      fi
+    done <<_EOF
+$_fl_paths_raw
+_EOF
+    _fl_paths_raw=$_fl_keep_raw
+    _fl_argv=$_fl_keep_argv
   }
 
   _fl_mode=analyze
@@ -1946,13 +1975,59 @@ cmd_flatten() {
     case "$_ans" in a|A) echo "Aborted."; exit 77 ;; esac
   fi
 
-  # Unstage orphan gitlinks first (safe regardless of .git handling).
-  printf '%s\n' "$_fl_orphan" | while IFS= read -r _p; do
+  # Compute path list + argv ONCE, up-front — needed both for commit
+  # and for the trap's 'git reset HEAD -- <paths>' rollback if we fail
+  # after touching the index.
+  if ! _fl_build_paths_argv; then
+    log_error "could not compute path list"
+    exit 1
+  fi
+
+  # Set up the save root + manifest + trap BEFORE we touch anything.
+  # _fl_restore handles BOTH index-reset and .git restore, so it's
+  # appropriate for either flatten path; --rm-git just leaves the
+  # manifest empty (nothing to restore in phase 2).
+  _fl_save_root=$(mktemp -d "${TMPDIR:-/tmp}/${US}.flatten.XXXXXX") \
+    || { log_error "mktemp failed"; exit 1; }
+  _fl_manifest="$_fl_save_root/.manifest"
+  : > "$_fl_manifest"
+  _fl_index_touched=0
+  _fl_restore() {
+    # (1) Un-stage any index changes we made so the user's index goes
+    # back to HEAD state for our paths. 'git reset HEAD -- <p>' is the
+    # precise inverse of 'git add -- <p>' / 'git rm --cached -- <p>'
+    # and doesn't touch paths we didn't flatten.
+    if [ "$_fl_index_touched" = 1 ] && [ -n "${_fl_paths_raw:-}" ]; then
+      while IFS= read -r _rp; do
+        [ -n "$_rp" ] || continue
+        git reset -q HEAD -- "$_rp" >/dev/null 2>&1 || true
+      done <<_FL_RESTORE_EOF
+$_fl_paths_raw
+_FL_RESTORE_EOF
+    fi
+    # (2) Restore each nested .git (deepest first for nested-nested safety).
+    [ -s "$_fl_manifest" ] || return 0
+    awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_fl_manifest" \
+      | while IFS="$(printf '\t')" read -r _orig _saved; do
+          [ -e "$_saved" ] || continue
+          [ -e "$_orig" ] && rm -rf -- "$_orig" 2>/dev/null
+          mv -- "$_saved" "$_orig" 2>/dev/null || \
+            log_warn "restore failed: $_saved -> $_orig"
+        done
+  }
+  trap '_fl_restore; rm -rf "$_fl_save_root"; exit 1' INT TERM HUP
+
+  # Unstage orphan gitlinks first. Heredoc (not pipe) keeps the loop in
+  # the parent shell so _fl_index_touched = 1 actually persists.
+  while IFS= read -r _p; do
     [ -n "$_p" ] || continue
     log_medium "remove   $_p"
+    _fl_index_touched=1
     run git rm --cached -rf -- "$_p" >/dev/null 2>&1 || \
       log_warn "git rm --cached failed for $_p"
-  done
+  done <<_FL_ORPHAN_EOF
+$_fl_orphan
+_FL_ORPHAN_EOF
 
   if [ "$_fl_rmgit" = 1 ]; then
     # Destructive path: explicit 'yes' confirmation required.
@@ -1984,42 +2059,44 @@ cmd_flatten() {
 $_fl_nested
 _FL_EOF
     log_major "staging & committing flattened content (only paths flatten touched)..."
-    _fl_build_paths_argv || { log_error "could not compute path list"; exit 1; }
+    _fl_index_touched=1
     # shellcheck disable=SC2086
-    eval "run git add -- $_fl_argv" || { log_error "git add failed"; exit 1; }
+    if ! eval "run git add -- $_fl_argv"; then
+      log_error "git add failed"
+      _fl_restore
+      rm -rf "$_fl_save_root"
+      exit 1
+    fi
+    # Filter out paths that have no staged content (empty nested dirs).
+    _fl_filter_to_staged
+    if [ -z "$_fl_argv" ]; then
+      log_major "nothing to commit (all nested dirs were empty after .git removed)"
+      _fl_restore
+      rm -rf "$_fl_save_root"
+      trap - INT TERM HUP
+      exit 0
+    fi
     _fl_msg="my-git flatten --rm-git: $_fl_n_nested nested .git removed, $_fl_n_orphan orphan gitlink(s) unstaged"
     _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
     # shellcheck disable=SC2086
-    if eval "run git commit --only -q -m \"\$_fl_msg\" -- $_fl_argv" 2>"$_fl_commit_log"; then
+    if run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
       rm -f "$_fl_commit_log"
+      rm -rf "$_fl_save_root"
+      trap - INT TERM HUP
       log_major "$_fl_top: $(c_green 'DONE :))') (flattened; child .git dirs DELETED; unrelated changes left untouched)"
     else
       log_error "flatten commit failed:"
       cat "$_fl_commit_log" >&2
       rm -f "$_fl_commit_log"
+      _fl_restore
+      rm -rf "$_fl_save_root"
       exit 1
     fi
     exit 0
   fi
 
   # Preserve-history path: move each nested .git OUTSIDE the outer
-  # worktree, commit, then restore.
-  _fl_save_root=$(mktemp -d "${TMPDIR:-/tmp}/${US}.flatten.XXXXXX") \
-    || { log_error "mktemp failed"; exit 1; }
-  _fl_manifest="$_fl_save_root/.manifest"
-  : > "$_fl_manifest"
-  _fl_restore() {
-    [ -s "$_fl_manifest" ] || return 0
-    awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_fl_manifest" \
-      | while IFS="$(printf '\t')" read -r _orig _saved; do
-          [ -e "$_saved" ] || continue
-          [ -e "$_orig" ] && rm -rf -- "$_orig" 2>/dev/null
-          mv -- "$_saved" "$_orig" 2>/dev/null || \
-            log_warn "restore failed: $_saved -> $_orig"
-        done
-  }
-  trap '_fl_restore; rm -rf "$_fl_save_root"; exit 1' INT TERM HUP
-
+  # worktree, commit, then restore. Trap already armed above.
   _fl_i=0
   while IFS= read -r _n; do
     [ -n "$_n" ] || continue
@@ -2038,12 +2115,7 @@ $_fl_nested
 _FL_EOF
 
   log_major "staging & committing flattened content (only paths flatten touched)..."
-  if ! _fl_build_paths_argv; then
-    log_error "could not compute path list; restoring .git dirs..."
-    _fl_restore
-    rm -rf "$_fl_save_root"
-    exit 1
-  fi
+  _fl_index_touched=1
   # shellcheck disable=SC2086
   if ! eval "run git add -- $_fl_argv"; then
     log_error "git add failed; restoring .git dirs..."
@@ -2051,10 +2123,19 @@ _FL_EOF
     rm -rf "$_fl_save_root"
     exit 1
   fi
+  # Filter out paths that have no staged content (nested dir was empty).
+  _fl_filter_to_staged
+  if [ -z "$_fl_argv" ]; then
+    log_major "nothing to commit (all nested dirs were empty after .git move-out)"
+    _fl_restore
+    rm -rf "$_fl_save_root"
+    trap - INT TERM HUP
+    exit 0
+  fi
   _fl_msg="my-git flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged"
   _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
   # shellcheck disable=SC2086
-  if ! eval "run git commit --only -q -m \"\$_fl_msg\" -- $_fl_argv" 2>"$_fl_commit_log"; then
+  if ! run git commit -q -m "$_fl_msg" 2>"$_fl_commit_log"; then
     log_error "flatten commit failed:"
     cat "$_fl_commit_log" >&2
     rm -f "$_fl_commit_log"
