@@ -1019,10 +1019,10 @@ build_commit_message() {
   _files=$(run_as_owner_capture "$_r" git status --porcelain 2>/dev/null | cut -c4-)
   _files_cnt=$(printf '%s\n' "$_files" | grep -c . || true)
 
-  # Subject: unified "MASSCOMMIT from my-git" per user's mental model
-  # of mc ('mass commit'). Full file list and diffs go into the body
-  # block below so the info is preserved.
-  _intro="MASSCOMMIT from my-git"
+  # Subject follows the project convention: "my-git <subcmd>: <what
+  # was done>". Body below has the full file list + recent-log excerpt
+  # as '#'-prefixed commented lines.
+  _intro="my-git mc: mass-commit of $_files_cnt path(s)"
 
   # Diff / files block
   if [ "$_files_cnt" -gt "$COMMIT_MSG_DIFF_MAX_FILES" ]; then
