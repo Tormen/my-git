@@ -76,9 +76,13 @@ log_fail()      { printf ' %sFAIL:%s %s\n'    "$C_BOLD$C_RED"   "$C_RESET" "$*" 
 # The 's'/'a'/'g' letters match flatten's default (-i, no forced mode) choice
 # prompt, so every interactive prompt in my-git offers the same vocabulary.
 _prompt_ysa() {
+  # $1 = question body, e.g. '[1 of 6] "path" [zip] restore .git ?'. Rendered
+  # in the SAME bold-cyan ' >>> ' style as log_major's overview lines, then
+  # the colored choices.
   while :; do
-    printf '%s  %s[Y]es%s / %s[s]kip%s / %s[a]bort%s / %s[g]o%s (yes to this + all remaining): ' \
-      "$1" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" "$C_BOLD$C_GREEN" "$C_RESET" >/dev/tty
+    printf ' %s>>> %s%s   %s[Y]es%s / %s[s]kip%s / %s[a]bort%s / %s[g]o%s (this + all rest): ' \
+      "$C_BOLD$C_CYAN" "$1" "$C_RESET" \
+      "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" "$C_BOLD$C_GREEN" "$C_RESET" >/dev/tty
     IFS= read -r _pysa </dev/tty || return 2
     _pysa=$(printf '%s' "$_pysa" | tr -d '[:space:]')
     case "$_pysa" in
@@ -86,7 +90,7 @@ _prompt_ysa() {
       s|S)    return 1 ;;
       a|A)    return 2 ;;
       g|G)    return 3 ;;
-      *) printf '    %s? please answer  Y=yes  s=skip  a=abort  g=go(all rest)%s\n' "$C_YELLOW" "$C_RESET" >/dev/tty ;;
+      *) printf '     %s? please answer  Y=yes  s=skip  a=abort  g=go(all rest)%s\n' "$C_YELLOW" "$C_RESET" >/dev/tty ;;
     esac
   done
 }
@@ -3748,7 +3752,7 @@ _FL_ORP_EOF
     fi
     if [ "$_fl_interactive" = 1 ]; then
       _FBC_I=$((${_FBC_I:-0} + 1))
-      _prompt_ysa "flatten --$3 ($_FBC_I/$_FBC_TOTAL): apply to $1?"
+      _prompt_ysa "[$_FBC_I of $_FBC_TOTAL] \"$1\" [--$3] flatten ?"
       case $? in
         1) _FBC_CHOICE=skip; log_medium "skip  $1" ;;
         2) return 2 ;;
@@ -4178,7 +4182,7 @@ _FL_EMB_REALIZE_EOF
       _fl_zip_i=$((_fl_zip_i + 1))
       # -i: ask per repo (one by one), FULLY annotated.
       if [ "$_fl_interactive" = 1 ]; then
-        _prompt_ysa "flatten --zip ($_fl_zip_i/$_fl_zip_total): archive $_fl_zt?"
+        _prompt_ysa "[$_fl_zip_i of $_fl_zip_total] \"$_fl_zt\" [zip] archive .git ?"
         case $? in
           1) _fl_zip_skip=$((_fl_zip_skip + 1)); log_medium "skip  $_fl_zt"; continue ;;
           2) log_major "aborted (${_fl_zip_ok} already archived)"; return 77 ;;
@@ -4451,11 +4455,6 @@ _FL_IGNCHK_ORPH_EOF
     exit 0
   fi
 
-  # 'go -i' asks repo by repo below, so skip the upfront batch plan (it reads
-  # as "about to do all N"). Analyze mode always shows the full plan.
-  if [ "$_fl_mode" = go ] && [ "$_fl_interactive" = 1 ]; then
-    log_major "$_fl_top: flatten${_fl_forced_mode:+ --$_fl_forced_mode} — asking one at a time (-i: [Y]es/[s]kip/[a]bort/[g]o)"
-  else
   log_major "$_fl_top: flatten plan"
   _fl_n_ign_nested=$(printf '%s' "$_fl_ignored_nested" | grep -c .)
   _fl_n_ign_reg=$(printf '%s' "$_fl_ignored_registered" | grep -c .)
@@ -4512,7 +4511,6 @@ _FL_IGNCHK_ORPH_EOF
   fi
 
   _fl_warn_registered
-  fi
 
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
@@ -4875,7 +4873,7 @@ _FL_SHIELD_SCAN_EOF
     if [ "$_fl_index_touched" = 1 ] && [ -n "${_fl_paths_raw:-}" ]; then
       while IFS= read -r _rp; do
         [ -n "$_rp" ] || continue
-        git restore --staged -- "$_rp" >/dev/null 2>&1 || true
+        run git restore --staged -- "$_rp" >/dev/null 2>&1 || true
       done <<_FL_ROLLBACK_EOF
 $_fl_paths_raw
 _FL_ROLLBACK_EOF
@@ -5388,17 +5386,10 @@ cmd_unflatten() {
     exit 0
   fi
 
-  # With 'go -i' we ask repo by repo, so DON'T dump the whole plan first —
-  # that reads as "about to do all N". Just note the count; the per-item
-  # prompts below (each shown as i/N) are the interaction.
-  if [ "$_ufl_mode" = go ] && [ "$_ufl_interactive" = 1 ]; then
-    log_major "$_ufl_top: unflatten — $_ufl_n item(s), one at a time (-i: [Y]es/[s]kip/[a]bort/[g]o)"
-    _ufl_skip_plan=1
-  else
-    _ufl_skip_plan=0
-  fi
-  [ "$_ufl_skip_plan" = 1 ] || log_major "$_ufl_top: unflatten plan ($_ufl_n item(s))"
-  [ "$_ufl_skip_plan" = 1 ] || while IFS="$(printf '\t')" read -r _p _m; do
+  # Always show the full plan first (a helpful OVERVIEW of every item), then
+  # under 'go -i' ask repo by repo below (each prompt shown as [i of N]).
+  log_major "$_ufl_top: unflatten plan ($_ufl_n item(s))"
+  while IFS="$(printf '\t')" read -r _p _m; do
     [ -n "$_p" ] || continue
     if [ "$_m" = merge ]; then
       printf '  %s>> %s  (RECONSTRUCT via git subtree split — history before the merge is gone)%s\n' "$C_BLUE" "$_p" "$C_RESET"
@@ -5433,7 +5424,7 @@ cmd_unflatten() {
     [ -n "$_p" ] || continue
     _ufl_i=$((_ufl_i + 1))
     if [ "$_ufl_interactive" = 1 ]; then
-      _prompt_ysa "unflatten [$_m] ($_ufl_i/$_ufl_n): restore $_p?"
+      _prompt_ysa "[$_ufl_i of $_ufl_n] \"$_p\" [$_m] restore .git ?"
       case $? in
         1) log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; rm -f "$_ufl_cand"; exit 77 ;;
@@ -5913,7 +5904,7 @@ ensure_claude_setup() {
   _moved=0
   for _f in "$_cl"/* "$_cl"/.[!.]* "$_cl"/..?*; do
     [ -e "$_f" ] || continue
-    mv -- "$_f" "$_dest/" || { log_error "mv failed: $_f"; return 1; }
+    run mv -- "$_f" "$_dest/" || { log_error "mv failed: $_f"; return 1; }
     _moved=$((_moved + 1))
   done
   log_medium "moved $_moved item(s)"
@@ -6026,6 +6017,7 @@ _do_sidecar_audit() {
 
   # (B) sidecar internals wrongly TRACKED as content in the toplevel index.
   if [ -d "$_sa_top/.git" ]; then
+    trace "(cd $_sa_top && git ls-files -- '*/$_sa_grd/*')   # audit: sidecar internals tracked as content?"
     _sa_tracked_dirs=$( cd "$_sa_top" 2>/dev/null && git ls-files -- "*/$_sa_grd/*" 2>/dev/null \
                         | sed "s|/$_sa_grd/.*|/$_sa_grd|" | sort -u )
     if [ -n "$_sa_tracked_dirs" ]; then
@@ -6040,6 +6032,7 @@ _do_sidecar_audit() {
         # that from sweeping in the user's OTHER staged work, we bail out if
         # the index already has staged changes (repair is safely re-runnable
         # once the index is clean).
+        trace "(cd $_sa_top && git diff --cached --name-only)   # repair: any pre-existing staged changes?"
         _sa_pre_staged=$( cd "$_sa_top" 2>/dev/null && git diff --cached --name-only 2>/dev/null | head -1 )
         if [ -n "$_sa_pre_staged" ]; then
           log_major "  SKIP:  $_sa_bd sidecar object-DB dir(s) tracked as content — NOT touched: your index already has staged changes. Commit/reset them, then re-run 'repair --sidecar go'."
@@ -6096,6 +6089,7 @@ _do_sidecar_audit() {
         log_major "  NOTE:  $_sc has no $_sa_grd.status snapshot (unflatten --sidecar still works, but branch/remote metadata was not recorded)."
       # Untracked, non-ignored files under the sidecar, minus the git dir
       # itself (which is meant to be excluded, checked in (A)).
+      trace "(cd $_sa_top && git ls-files --others --exclude-standard -- $_sc)   # audit: sidecar content tracked by parent?"
       _sa_untracked=$( cd "$_sa_top" 2>/dev/null \
         && git ls-files --others --exclude-standard -- "$_sc" 2>/dev/null \
         | grep -v "^$_sc/$_sa_grd/" )
@@ -7486,7 +7480,7 @@ _sm_persist_url_change() {
     return 0
   fi
   if ! git config -f "$_pc_cfg" remote.origin.url "$_pc_new" 2>/dev/null; then
-    git config -f "$_pc_cfg" --add remote.origin.url "$_pc_new" 2>/dev/null || {
+    run git config -f "$_pc_cfg" --add remote.origin.url "$_pc_new" 2>/dev/null || {
       printf 'WARN  could not write remote.origin.url to %s\n' "$_pc_cfg" >&2
       return 1
     }
@@ -7508,7 +7502,7 @@ _sm_remove_gitmodules_entry() {
       /^\[/ { skip = ($0 == want) ? 1 : 0 }
       skip == 0 { print }
   ' .gitmodules > "$_rge_tmp"; then
-    mv -- "$_rge_tmp" .gitmodules
+    run mv -- "$_rge_tmp" .gitmodules
   else
     rm -f "$_rge_tmp"
     return 1
@@ -7681,18 +7675,18 @@ _sm_try_preserve_rebind() {
   # Move gitdir to its canonical super-repo location.
   _pr_newdir=${_pr_new_gd%/*}
   mkdir -p "$_pr_newdir" || return 1
-  mv -- "$_pr_src" "$_pr_new_gd" || return 1
+  run mv -- "$_pr_src" "$_pr_new_gd" || return 1
   # For the stale/pointer cases the remaining <sp>/.git is an old pointer
   # (or a now-stale pointer file to the place we just emptied). For the
   # embedded case, the mv above already took <sp>/.git away.
   [ -e "$_pr_sp/.git" ] && rm -rf -- "$_pr_sp/.git" 2>/dev/null
   printf 'gitdir: %s.git/modules/%s\n' "$_pr_up" "$_pr_sp" > "$_pr_sp/.git" || {
     # Roll back: move gitdir back where it came from.
-    mv -- "$_pr_new_gd" "$_pr_src" 2>/dev/null || true
+    run mv -- "$_pr_new_gd" "$_pr_src" 2>/dev/null || true
     return 1
   }
   # Fix up the moved gitdir's config.
-  git config -f "$_pr_new_gd/config" core.worktree "${_pr_wt_up}${_pr_sp}" || true
+  run git config -f "$_pr_new_gd/config" core.worktree "${_pr_wt_up}${_pr_sp}" || true
   [ -n "$_pr_url" ] && git config -f "$_pr_new_gd/config" remote.origin.url "$_pr_url" || true
   # Update .gitmodules: drop old entry, append new.
   if [ -f "$_sm_toplevel/.gitmodules" ]; then
@@ -7705,10 +7699,10 @@ _sm_try_preserve_rebind() {
   } >> "$_sm_toplevel/.gitmodules"
   # Update the superproject index.
   if git ls-files --error-unmatch -- "$_pr_old" >/dev/null 2>&1; then
-    git update-index --force-remove -- "$_pr_old" 2>/dev/null || true
+    run git update-index --force-remove -- "$_pr_old" 2>/dev/null || true
     _sm_record_change "$_pr_old"
   fi
-  git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
+  run git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
   _sm_record_change ".gitmodules"
   _sm_record_change "$_pr_sp"
   return 0
@@ -7977,9 +7971,9 @@ _sm_run_here() {
         esac
       fi
       printf '    removing .gitmodules entry, .git/config entry, index entry, .git/modules/%s\n' "$_cs_name" >&2
-      git config -f .gitmodules --remove-section "submodule.$_cs_name" 2>/dev/null || true
-      git config --remove-section "submodule.$_cs_name" 2>/dev/null || true
-      git update-index --force-remove -- "$_cs_sp" 2>/dev/null || true
+      run git config -f .gitmodules --remove-section "submodule.$_cs_name" 2>/dev/null || true
+      run git config --remove-section "submodule.$_cs_name" 2>/dev/null || true
+      run git update-index --force-remove -- "$_cs_sp" 2>/dev/null || true
       [ -n "$_cs_name" ] && rm -rf -- ".git/modules/$_cs_name" 2>/dev/null || true
       _cs_removed=$((_cs_removed + 1))
     done <<_CS_EOF
@@ -7990,12 +7984,12 @@ _CS_EOF
         run git update-index --force-remove -- .gitmodules 2>/dev/null || true
         run rm -f -- .gitmodules
       else
-        git add -- .gitmodules 2>/dev/null || true
+        run git add -- .gitmodules 2>/dev/null || true
       fi
       if git diff --cached --quiet 2>/dev/null; then
         printf '    nothing to commit in %s (no net diff vs HEAD)\n' "$(pwd -P)" >&2
       else
-        git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)" || \
+        run git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)" || \
           { log_error "commit failed in $(pwd -P)"; echo 0; return 1; }
         printf '    committed in %s\n' "$(pwd -P)" >&2
       fi
@@ -8110,7 +8104,7 @@ _CS_EOF
     echo
     printf '%s\n' "$_to_unstage" | while IFS= read -r _p; do
       printf 'UNSTAGE  %s\n' "$_p"
-      git update-index --force-remove -- "$_p" >/dev/null 2>&1 || {
+      run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || {
         printf 'WARN  git update-index --force-remove failed for %s\n' "$_p" >&2
       }
     done
@@ -8149,8 +8143,8 @@ _CS_EOF
     _rc=$?
     if [ -n "$INFLIGHT_TMP" ] && [ -e "$INFLIGHT_TMP" ]; then
       printf 'RECOVER  restoring %s <- %s\n' "$INFLIGHT_ORIG" "$INFLIGHT_TMP" >&2
-      rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
-      mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
+      run rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
+      run mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
     fi
     rm -f "$_sm_tmpfile" "$_sm_plan" 2>/dev/null || true
     trap - EXIT
