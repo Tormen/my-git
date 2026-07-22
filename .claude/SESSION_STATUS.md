@@ -429,6 +429,54 @@ flat `src/<path>` from bulk discovery).
     test_sm_converts_published_sidecar_skips_local_only,
     test_sm_operates_on_sidecared_parent. Suite now **60**, all passing.
 
+## DONE — zshrc.mine helper functions (git()/gI()/gz/gu) [root-owned file]
+
+These live in `etc/zshrc.mine` (root-owned, mode 640), applied via
+`sudo python3 <scratch>/apply_*.py` handoff scripts (sudo needs a
+password here; can't write it directly). NOT part of the my-git script.
+
+- **`git()` wrapper — `git init` → `gI`, plus a `git -- …` escape.**
+  The sidecar-aware `git()` (walks up to a parent `.git.real`, runs
+  `git --git-dir=…/.git.real --work-tree=…`) now:
+    * `[ "$1" = "--" ]` FIRST → `command git "$@"` — a plain-git escape:
+      NO walk-up, NO init interception. Repurposes the otherwise-useless
+      bare `git -- <subcmd>` form.
+    * `[ "$1" = init ]` → `gI "$@"` — so `git init` makes a sidecar when
+      nested. The init always runs on the LOCAL git, never a parent's
+      `--git-dir`.
+- **`gI()`** — `git init` that creates a `.git.real` sidecar when inside
+  an existing work tree, else a plain `.git`. Verified: nested → local
+  sidecar (`core.worktree=..`, parent HEAD untouched), standalone →
+  plain. It reaches the real git via the escape (`git -- init …`,
+  `git -- --git-dir=.git.real config core.worktree ..`) so the wrapper
+  can't re-intercept `init` (no recursion) — the earlier `command git
+  init` worked too but the user wanted it routed through `git()`.
+  `git -- init` is also the user-facing way to force a PLAIN local init
+  even when nested.
+- **`gz`/`gu` redesign — after a real incident.** `gz --help` (no
+  `--help` guard; only `-k/--keep` was recognized) ran plain `gz` and
+  archived+deleted the REAL `/learn/.git` (854 MB) — `/learn` → symlink
+  to `/2/learn`, NOT the `/Users/us/learn` playground. Fully recovered
+  from the `.git.zip` (unzip, 360 commits + same 3 dirty files intact).
+  Redesign:
+    * `gz [-k|--keep] <PATH>` — PATH now MANDATORY (bare `gz` errors,
+      refuses to guess cwd). `-h/--help` prints help and does NOTHING.
+      Unknown-flag guard. Only archives sidecar internals — LEAVES
+      tracked worktree dotfiles `.gitignore/.gitattributes/.gitmodules/
+      .gitkeep` (the merged/parent git still needs them; the old
+      `.git*(N.)` glob would have swallowed `.gitignore`).
+    * `gu <ZIP> [PATH]` — ZIP mandatory; PATH optional, defaults to the
+      zip's own directory (so `gu .git.zip` in cwd works, `gu
+      /learn/.git.zip` infers `/learn`). Refuses to overwrite an
+      existing `.git`/`.git.real`.
+    * Both use `command zip`/`command unzip` so the user's `unzip`→
+      `do_unzip` alias can't defeat the integrity check (that alias was
+      the source of the stray `usage: do_unzip` line).
+  gz/gu round-trip re-verified binary-identical on a 46-commit HOUSE
+  sidecar and end-to-end for `.git` + `.git.real` (incl. `.gitignore`
+  preservation). All tested in scratch zsh subshells (not in my-git's
+  --run-tests, since these are zshrc functions).
+
 ## DONE — `audit` + `repair --sidecar` (commits fd10a2f, 352de41)
 - **`my-git audit [--claude] [--sidecar] [-R] [PATH]`** (read-only) and
   **`my-git repair --sidecar [go] [-R] [PATH]`** (analyze by default, `go`
