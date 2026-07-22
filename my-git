@@ -633,6 +633,7 @@ list_direct_submodules() {
 #   flatten. Purely informational for 'st'.
 list_realized_dirs() {
   _lrd_r=$1
+  _lrd_collapse=${2:-}          # 'collapse' => keep only top-most of a nest
   [ -d "$_lrd_r" ] || return 0
   _lrd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
   ( cd "$_lrd_r" 2>/dev/null || exit 0
@@ -648,12 +649,27 @@ list_realized_dirs() {
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '$_lrd_grd' -prune -print 2>/dev/null"
   ) | sed -e 's|^\./||' -e "s|/${_lrd_grd}\$||" -e "s|^${_lrd_grd}\$||" \
-    | grep -v '^$' | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- | awk '
-      function is_under(arr, n, path,   i) {
-        for (i = 1; i <= n; i++) { if (path == arr[i] || index(path, arr[i] "/") == 1) return 1 }
-        return 0
-      }
-      { if (is_under(kept, nk, $0)) next; print; kept[++nk] = $0 }'
+    | grep -v '^$' | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
+    | { if [ "$_lrd_collapse" = collapse ]; then
+          # Collapse-mode: keep only the TOP-MOST sidecar of each nest and
+          # drop any sidecar sitting under an already-kept one. This is for
+          # the 'st' tree renderer ONLY — it unions the top-level entries and
+          # then recurses (walk_tree_lines) to surface deeper sidecars, so
+          # listing the nested ones here too would DOUBLE them (once nested,
+          # once flat at top level).
+          awk '
+            function is_under(arr, n, path,   i) {
+              for (i = 1; i <= n; i++) { if (path == arr[i] || index(path, arr[i] "/") == 1) return 1 }
+              return 0
+            }
+            { if (is_under(kept, nk, $0)) next; print; kept[++nk] = $0 }'
+        else
+          # Default: EVERY sidecar dir, deepest included. Sidecars legitimately
+          # nest (src is a sidecar and so is src/sh/my-git) and consumers like
+          # audit/repair, bulk unflatten and sm's sidecar pre-pass must see
+          # them all — collapsing would silently skip nested sidecars.
+          cat
+        fi; }
 }
 
 # ensure_sidecar_exclude <repo>
@@ -977,7 +993,9 @@ walk_tree_lines() (
   # big foreign tree, so it stays opt-in. Registered submodules are
   # always shown. (sm calls list_unregistered_nested directly and is NOT
   # gated by these flags — discovery IS sm's purpose.)
-  _subs_realized=$(list_realized_dirs "$_root")
+  # 'collapse': the tree renderer unions TOP-LEVEL entries and recurses to
+  # surface deeper sidecars, so ask for top-most-only to avoid doubling.
+  _subs_realized=$(list_realized_dirs "$_root" collapse)
   _subs_merged=$(list_merged_dirs "$_root")
   if [ "${SCOPE_MANAGED:-1}" = 1 ] || [ "${RECURSIVE:-0}" = 1 ]; then
     _subs_unreg=$(list_unregistered_nested "$_root")
@@ -5571,6 +5589,185 @@ cmd_claude_check() {
   done
 }
 
+# ═════════════════════════════════════════════════════════════════════════
+# ═══ AUDIT / REPAIR (sidecar setup) ═══════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════
+#
+# _do_sidecar_audit <toplevel> <apply 0|1>
+#   Inspect (apply=0) or repair (apply=1) the SETUP of every sidecar under
+#   <toplevel>. Legacy sidecars (created before this tooling, or by hand)
+#   commonly have setup problems that are invisible to normal use but
+#   matter for portability and repo hygiene:
+#     (A) '**/GIT_SIDECAR_DIRNAME' missing from the tracked .gitignore, so
+#         sidecars show as '??' untracked clutter (or, worse, their whole
+#         object DB got committed as content — see B).
+#     (B) a sidecar's internal git DB tracked as ordinary content in the
+#         parent index (repo bloat) — should be excluded, not committed.
+#     (C) a NON-portable absolute 'core.worktree' (points at the original
+#         tree; breaks if the repo is moved/cloned). Portable form is '..'.
+#     (D) an EMPTY sidecar (0 commits) — preserves no history; flagged for
+#         the user to decide (never auto-deleted).
+#   Returns the number of issues found (apply=0) or fixed (apply=1) via the
+#   global _SA_ISSUES counter.
+_do_sidecar_audit() {
+  _sa_top=$1; _sa_apply=$2
+  _sa_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  _SA_ISSUES=0
+  _sa_list=$(list_realized_dirs "$_sa_top")
+  if [ -z "$_sa_list" ]; then
+    log_major "$_sa_top: no sidecars found — nothing to audit"
+    return 0
+  fi
+  _sa_n=$(printf '%s\n' "$_sa_list" | grep -c .)
+  log_major "$_sa_top: auditing $_sa_n sidecar(s)$([ "$_sa_apply" = 1 ] && printf ' (repair mode)')"
+
+  # (A) tracked-.gitignore exclude — one entry covers the whole tree.
+  if [ -d "$_sa_top/.git" ] && ! grep -qxF "**/$_sa_grd" "$_sa_top/.gitignore" 2>/dev/null; then
+    _SA_ISSUES=$((_SA_ISSUES + 1))
+    if [ "$_sa_apply" = 1 ]; then
+      ensure_sidecar_exclude "$_sa_top"
+      log_major "  fixed: added '**/$_sa_grd' to tracked .gitignore (committed)"
+    else
+      log_major "  ISSUE: '**/$_sa_grd' not in tracked .gitignore — sidecars show as untracked clutter (repair adds+commits it)"
+    fi
+  fi
+
+  # (B) sidecar internals wrongly TRACKED as content in the toplevel index.
+  if [ -d "$_sa_top/.git" ]; then
+    _sa_tracked_dirs=$( cd "$_sa_top" 2>/dev/null && git ls-files -- "*/$_sa_grd/*" 2>/dev/null \
+                        | sed "s|/$_sa_grd/.*|/$_sa_grd|" | sort -u )
+    if [ -n "$_sa_tracked_dirs" ]; then
+      _sa_bd=$(printf '%s\n' "$_sa_tracked_dirs" | grep -c .)
+      _SA_ISSUES=$((_SA_ISSUES + 1))
+      if [ "$_sa_apply" = 1 ]; then
+        # NOTE: this is an INDEX-ONLY removal ('git rm --cached' keeps the
+        # files on disk). A pathspec commit ('git commit -- <dir>') would
+        # take the WORKTREE version of <dir> — where the files still exist —
+        # and so commit NOTHING. The removal only lives in the index, so it
+        # must be committed by a plain 'git commit' (index-as-is). To keep
+        # that from sweeping in the user's OTHER staged work, we bail out if
+        # the index already has staged changes (repair is safely re-runnable
+        # once the index is clean).
+        _sa_pre_staged=$( cd "$_sa_top" 2>/dev/null && git diff --cached --name-only 2>/dev/null | head -1 )
+        if [ -n "$_sa_pre_staged" ]; then
+          log_major "  SKIP:  $_sa_bd sidecar object-DB dir(s) tracked as content — NOT touched: your index already has staged changes. Commit/reset them, then re-run 'repair --sidecar go'."
+        else
+          ( cd "$_sa_top" 2>/dev/null || exit 0
+            _sa_oifs=$IFS; IFS='
+'
+            # shellcheck disable=SC2086
+            set -- $_sa_tracked_dirs
+            IFS=$_sa_oifs
+            for _bd in "$@"; do
+              [ -n "$_bd" ] || continue
+              run git rm -r --cached -q -- "$_bd" >/dev/null 2>&1 || true
+            done
+            # plain commit: index holds ONLY our staged removals (verified
+            # clean above), so nothing unrelated can ride along.
+            run git commit -q -m "my-git repair: stop tracking sidecar internals as content" >/dev/null 2>&1 || true )
+          log_major "  fixed: untracked $_sa_bd sidecar object-DB dir(s) from the parent index (committed; files kept on disk)"
+        fi
+      else
+        log_major "  ISSUE: $_sa_bd sidecar object-DB dir(s) TRACKED as content in the parent (bloat) — repair 'git rm --cached'es them"
+      fi
+    fi
+  fi
+
+  # (C)+(D) per-sidecar: absolute core.worktree, empty history.
+  printf '%s\n' "$_sa_list" | while IFS= read -r _sc; do
+    [ -n "$_sc" ] || continue
+    _sa_gd="$_sa_top/$_sc/$_sa_grd"
+    _sa_cw=$(git config --file "$_sa_gd/config" --get core.worktree 2>/dev/null)
+    case "$_sa_cw" in
+      /*)
+        if [ "$_sa_apply" = 1 ]; then
+          run git config --file "$_sa_gd/config" core.worktree ".." 2>/dev/null \
+            && log_major "  fixed: $_sc core.worktree '$_sa_cw' -> '..' (portable)"
+        else
+          log_major "  ISSUE: $_sc core.worktree is absolute ('$_sa_cw') — not portable; repair sets it to '..'"
+        fi
+        ;;
+    esac
+    _sa_commits=$(git --git-dir="$_sa_gd" rev-list --all --count 2>/dev/null || echo 0)
+    if [ "${_sa_commits:-0}" -eq 0 ]; then
+      log_major "  NOTE:  $_sc is an EMPTY sidecar (0 commits — preserves no history). Not auto-fixed: 'unflatten --sidecar $_sc' to restore an empty live repo, or remove its $_sa_grd."
+    fi
+  done
+  return 0
+}
+
+# my-git audit [--claude] [--sidecar] [-R] [paths...]   (read-only)
+cmd_audit() {
+  _au_claude=0; _au_sidecar=0; _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help audit; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -R|--recursive) RECURSIVE=1 ;;
+      --claude)     _au_claude=1 ;;
+      --sidecar)    _au_sidecar=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "audit: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+  # Default: audit everything we know how to.
+  [ "$_au_claude" = 0 ] && [ "$_au_sidecar" = 0 ] && { _au_claude=1; _au_sidecar=1; }
+  if [ "$_au_claude" = 1 ]; then
+    # shellcheck disable=SC2086
+    ( cmd_claude_check "$@" )
+  fi
+  if [ "$_au_sidecar" = 1 ]; then
+    _roots=$(resolve_scope "$@") || exit 1
+    printf '%s\n' "$_roots" | while IFS= read -r _r; do
+      [ -n "$_r" ] || continue
+      _do_sidecar_audit "$_r" 0
+    done
+  fi
+}
+
+# my-git repair --sidecar [go] [-R] [paths...]   (analyze by default)
+cmd_repair() {
+  _rp_sidecar=0; _rp_mode=analyze; _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help repair; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -R|--recursive) RECURSIVE=1 ;;
+      go)           _rp_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _rp_mode=analyze ;;
+      --sidecar)    _rp_sidecar=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "repair: unknown option: $1" 64 ;;
+      *)            _args="$_args $(shell_escape "$1")" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+  [ "$_rp_sidecar" = 1 ] || fatal "repair: nothing to do — pass --sidecar (the only repair target so far)" 64
+  _roots=$(resolve_scope "$@") || exit 1
+  _rp_apply=0; [ "$_rp_mode" = go ] && _rp_apply=1
+  printf '%s\n' "$_roots" | while IFS= read -r _r; do
+    [ -n "$_r" ] || continue
+    _do_sidecar_audit "$_r" "$_rp_apply"
+  done
+  if [ "$_rp_apply" = 0 ]; then
+    echo
+    log_major "This was analyze-only — re-run with 'go' to apply the fixes:"
+    printf '  %s>>   %s repair --sidecar go%s\n' "$C_BLUE" "$US" "$C_RESET"
+  fi
+}
+
 # ─── Help pages ─────────────────────────────────────────────────────────
 show_help_top() {
   cat <<EOF
@@ -5595,6 +5792,8 @@ Subcommands:
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
   claude-check             Audit .claude/ setup (read-only by default)
+  audit                    Read-only health checks (--claude and/or --sidecar)
+  repair                   Fix sidecar setup problems (--sidecar; analyze, 'go' to apply)
   help                     Show this help
 
 Global options:
@@ -6163,6 +6362,61 @@ Config:
 EOF
 }
 
+show_help_audit() {
+  _grd_disp=${GIT_SIDECAR_DIRNAME:-.git.real}
+  cat <<EOF
+$US audit [--claude] [--sidecar] [-R] [PATH...]      (read-only)
+
+Read-only health checks over the tree. With no flag, runs BOTH audits.
+
+  --claude     Run the .claude-setup check (same as '$US claude-check').
+  --sidecar    Audit the SETUP of every sidecar (.git.real) under scope.
+
+Sidecar audit reports (never changes anything):
+  ISSUE  '**/$_grd_disp' missing from the tracked .gitignore — sidecars
+         then show up as '??' untracked clutter.
+  ISSUE  a sidecar's object-DB directory TRACKED as content in the parent
+         index (repo bloat — should be excluded, not committed).
+  ISSUE  a NON-portable absolute 'core.worktree' (breaks if moved/cloned;
+         portable form is '..').
+  NOTE   an EMPTY sidecar (0 commits) — preserves no history.
+
+Fix the ISSUEs with:   $US repair --sidecar go   (see: --help repair)
+
+PATH...      Limit to the given super-repo(s)/subtree(s); default: all
+             configured GIT_REPOS.
+
+See also:      $US --help repair
+               $US --help claude-check
+EOF
+}
+
+show_help_repair() {
+  _grd_disp=${GIT_SIDECAR_DIRNAME:-.git.real}
+  cat <<EOF
+$US repair --sidecar [go] [-R] [PATH...]     (analyze by default)
+
+Fix the SETUP problems that '$US audit --sidecar' reports. Analyze-only
+unless you add 'go' (like flatten / sm). Fixes, per sidecar under scope:
+
+  (A) add '**/$_grd_disp' to the tracked .gitignore and commit it, so
+      sidecars stop showing as untracked clutter.
+  (B) 'git rm -r --cached' any sidecar object-DB directory that was
+      wrongly committed as content, and commit (files stay on disk).
+  (C) rewrite an absolute 'core.worktree' to the portable '..'.
+
+NOT auto-fixed (flagged only): EMPTY sidecars (0 commits). Restore an
+empty live repo with 'unflatten --sidecar <path>', or remove its
+$_grd_disp yourself — never done automatically (it can't be undone).
+
+  go           Apply the fixes (default is analyze/dry-run).
+  -R           (accepted; sidecar discovery already recurses the subtree.)
+  PATH...      Limit to the given super-repo(s)/subtree(s).
+
+See also:      $US --help audit
+EOF
+}
+
 show_help_submodules() {
   _sm_usage 2>/dev/null || cat <<EOF
 my-git submodules  (aliases: sub, sm)
@@ -6468,6 +6722,8 @@ show_help() {
     unflatten|unfl)      show_help_unflatten ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
+    audit)               show_help_audit ;;
+    repair)              show_help_repair ;;
     config|--config|--create-config) show_help_config ;;
     verbose|-V|--verbose|-VV)        show_help_verbose ;;
     debug|-D|--debug|-DD|--deepdbg)  show_help_debug ;;
@@ -10478,7 +10734,121 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
+  test_audit_and_repair_sidecar_setup() {
+    # 'audit --sidecar' must DETECT the three fixable setup faults a legacy
+    # sidecar can carry, and 'repair --sidecar go' must FIX all three while
+    # leaving files on disk. Then a re-audit must come back clean.
+    _rt_repo_file kid_o k.txt
+    _rt_repo repo
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd repo && git clone -q ../kid_o sc >/dev/null 2>&1 )
+    cd repo || return 1
+    _rt_ok "sidecar sc" _rt_my_git flatten go sc --sidecar || return 1
+    # ── deliberately BREAK the setup that flatten got right ───────────────
+    #  (A) drop the tracked exclude
+    rm -f .gitignore
+    #  (C) make core.worktree absolute (non-portable)
+    git config --file sc/.git.real/config core.worktree "$PWD/sc"
+    #  (B) commit the sidecar object-DB as content
+    git add -f sc/.git.real >/dev/null 2>&1
+    git commit -q -m "break: track internals + drop exclude" >/dev/null 2>&1
+    # ── analyze: all three must be reported, nothing changed ──────────────
+    _rt_ok "audit --sidecar analyze" _rt_my_git audit --sidecar "$PWD" || return 1
+    _rt_contains "audit flags missing exclude" "$_rt_out" "not in tracked .gitignore" || return 1
+    _rt_contains "audit flags tracked object-DB" "$_rt_out" "TRACKED as content" || return 1
+    _rt_contains "audit flags absolute worktree"  "$_rt_out" "core.worktree is absolute" || return 1
+    # analyze must NOT have touched anything
+    _rt_absent "analyze did not add .gitignore" .gitignore || return 1
+    [ -n "$(git ls-files -- 'sc/.git.real/*' 2>/dev/null)" ] || { _rt_fail "analyze wrongly untracked internals"; return 1; }
+    # ── go: apply the fixes ───────────────────────────────────────────────
+    _rt_ok "repair --sidecar go" _rt_my_git repair --sidecar go "$PWD" || return 1
+    _rt_exists "repair added .gitignore" .gitignore || return 1
+    _rt_contains "exclude entry present" .gitignore "**/.git.real" || return 1
+    [ -z "$(git ls-files -- 'sc/.git.real/*' 2>/dev/null)" ] || { _rt_fail "repair did not untrack internals"; return 1; }
+    # The removal must be COMMITTED, not merely staged. (An earlier bug used
+    # 'git commit -- <dir>', which takes the WORKTREE view where the files
+    # still exist and so commits nothing — leaving the rm --cached staged.
+    # 'git ls-files' reads the index and would look "clean" either way, so
+    # assert on BOTH the index being empty AND HEAD no longer holding them.)
+    [ -z "$(git diff --cached --name-only 2>/dev/null)" ] || { _rt_fail "repair left the untracking staged, not committed"; return 1; }
+    [ -z "$(git ls-tree -r HEAD -- sc/.git.real 2>/dev/null)" ] || { _rt_fail "sidecar internals still present in HEAD after repair"; return 1; }
+    _rt_isdir "internals still on disk after repair" sc/.git.real || return 1
+    _cw=$(git config --file sc/.git.real/config core.worktree)
+    [ "$_cw" = ".." ] || { _rt_fail "core.worktree not made portable, got '$_cw'"; return 1; }
+    # ── re-audit: clean, no ISSUE lines ──────────────────────────────────
+    _rt_ok "audit after repair" _rt_my_git audit --sidecar "$PWD" || return 1
+    _rt_not_contains "no residual ISSUE after repair" "$_rt_out" "ISSUE" || return 1
+    return 0
+  }
+
+  test_repair_sidecar_does_not_sweep_pre_staged_work() {
+    # The (B) untrack step must commit ONLY its own index-only removal. If
+    # the user already has UNRELATED staged changes, a plain 'git commit'
+    # would sweep them in — so repair must SKIP (B) and warn, leaving both
+    # the tracked internals AND the user's staged work exactly as they were.
+    _rt_repo_file kid_o k.txt
+    _rt_repo repo
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd repo && git clone -q ../kid_o sc >/dev/null 2>&1 )
+    cd repo || return 1
+    _rt_ok "sidecar sc" _rt_my_git flatten go sc --sidecar || return 1
+    rm -f .gitignore
+    git add -f sc/.git.real >/dev/null 2>&1
+    git commit -q -m "break: track internals" >/dev/null 2>&1
+    # user stages an unrelated change, then runs repair
+    echo "user work" > mine.txt
+    git add mine.txt
+    _rt_ok "repair with a dirty index" _rt_my_git repair --sidecar go "$PWD" || return 1
+    _rt_contains "repair warns it skipped (B)" "$_rt_out" "your index already has staged changes" || return 1
+    # user's staged file is still staged and uncommitted, internals still tracked
+    git diff --cached --name-only | grep -qx mine.txt || { _rt_fail "repair disturbed the user's staged change"; return 1; }
+    [ -n "$(git ls-files -- 'sc/.git.real/*' 2>/dev/null)" ] || { _rt_fail "repair untracked internals despite dirty index"; return 1; }
+    return 0
+  }
+
+  test_st_nested_sidecar_not_doubled() {
+    # A sidecar living inside another sidecar's worktree (src is a sidecar,
+    # src/sh/my-git is a sidecar) must appear EXACTLY ONCE in 'st' — nested
+    # under its parent, NOT also as a flat top-level entry. The tree renderer
+    # asks list_realized_dirs for top-most-only ('collapse') and recurses for
+    # the rest; the DEFAULT full list (used by audit/repair/unflatten/sm) must
+    # still enumerate BOTH. Regression for that collapse-vs-full split.
+    _rt_repo_file kid1 a.txt
+    _rt_repo_file kid2 b.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid1 mid >/dev/null 2>&1 \
+        && git -C mid clone -q ../../kid2 deep >/dev/null 2>&1 )
+    # deepest-first: sidecar 'deep' from within 'mid', then 'mid' from 'top'
+    cd top/mid || return 1
+    _rt_ok "sidecar deep" _rt_my_git flatten go deep --sidecar || return 1
+    cd .. || return 1        # back to top
+    _rt_ok "sidecar mid" _rt_my_git flatten go mid --sidecar || return 1
+    _rt_ok "st top" _rt_my_git st "$PWD" || return 1
+    _n=$(grep -c '\[sidecar\]' "$_rt_out" 2>/dev/null)
+    [ "$_n" = 2 ] || { _rt_fail "expected exactly 2 sidecar lines in st, got $_n (nested sidecar doubled?)"; return 1; }
+    _rt_contains "nested 'deep' shown" "$_rt_out" "deep" || return 1
+    # default (non-collapsed) discovery, via audit, must see BOTH
+    _rt_ok "audit sees both" _rt_my_git audit --sidecar "$PWD" || return 1
+    _rt_contains "audit enumerates both sidecars" "$_rt_out" "auditing 2 sidecar" || return 1
+    return 0
+  }
+
+  test_audit_sidecar_flags_empty_sidecar() {
+    # An EMPTY sidecar (0 commits) preserves no history — audit must NOTE it
+    # (never auto-fix). Build one by sidecaring a truly commit-less clone.
+    mkdir -p src0 && ( cd src0 && git init -q )
+    _rt_repo repo
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd repo && cp -R ../src0 sc && ( cd sc && git config user.email t@t.com && git config user.name t ) )
+    cd repo || return 1
+    _rt_ok "sidecar empty sc" _rt_my_git flatten go sc --sidecar || return 1
+    _rt_ok "audit --sidecar sees empty" _rt_my_git audit --sidecar "$PWD" || return 1
+    _rt_contains "empty sidecar NOTEd" "$_rt_out" "EMPTY sidecar" || return 1
+    return 0
+  }
+
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -10633,6 +11003,8 @@ main() {
     unflatten|unfl)             cmd_unflatten "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
+    audit)                      cmd_audit "$@" ;;
+    repair)                     cmd_repair "$@" ;;
     help)                       show_help "${1:-top}" ;;
     -h|--help)                  show_help top ;;
     *)
