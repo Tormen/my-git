@@ -443,3 +443,31 @@ flat `src/<path>` from bulk discovery).
   its 6 `.git.real` sidecars. Decide whether sidecar/merged markers
   should show even in shallow foreign scope (cheap, informative) vs
   keeping the current perf-motivated shallow default.
+
+## sm bugs found via real-playground testing (global > src > kid)
+
+Tested on the writable production copy /Users/us/global (reset between
+each run with `rsync -axSH --delete /Users/us/global.BKP/ /Users/us/global/`):
+
+27. **sm stale-detection was sidecar-blind.** `list_stale_submodules` +
+    the go-mode stale pre-pass checked only `[ -e <path>/.git ]`, so a
+    registered submodule that had been SIDECARED (`.git.real`, no `.git`)
+    was flagged "missing on disk" and its registration removed. On the
+    real sidecared `src` this cascaded into removing ~14 valid
+    registrations and then a fatal commit ("does not have a commit
+    checked out"). Fixed: both checks now also accept
+    `GIT_SIDECAR_DIRNAME`. Test: test_sm_sidecared_submodule_not_flagged_stale.
+28. **Path-scoped sm still ran the tree-wide stale sweep.** `sm go <path>`
+    is supposed to touch ONLY `<path>`, but the stale-registration
+    pre-pass ran regardless — cleaning unrelated entries and (on the real
+    tree) failing the commit on a genuinely-broken sibling. Fixed: the
+    stale pre-pass is gated on `_sm_scope_rel` being empty (use bare
+    `sm --clean-stale` for tree-wide cleanup). Test:
+    test_sm_path_scope_suppresses_stale_sweep.
+
+Both scenarios the user asked for now work on the real tree:
+  - src = SIDECAR:  `cd src && sm go sh/my-power`  → registers into src's
+    own .git.real (src stays a sidecar), path-scoped (no stale sweep).
+  - src = MERGED:   `sm go src/sh/my-power` from global → registers as a
+    submodule OF GLOBAL at src/sh/my-power (src stays merged).
+Test: test_sm_kid_of_merged_src_registers_into_global. Suite: 63 tests.

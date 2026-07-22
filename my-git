@@ -778,7 +778,12 @@ list_stale_submodules() {
     | awk '{$1=""; sub(/^ /,""); print}' \
     | while IFS= read -r _p; do
         [ -n "$_p" ] || continue
+        # Present on disk as a live repo (.git) OR a sidecar
+        # (GIT_SIDECAR_DIRNAME) → NOT stale. A registered submodule that
+        # was later sidecared still EXISTS (as a sidecar); treating it as
+        # "no directory on disk" wrongly deregistered it.
         [ -e "$_lsr_r/$_p/.git" ] && continue
+        [ -e "$_lsr_r/$_p/${GIT_SIDECAR_DIRNAME:-.git.real}" ] && continue
         printf '%s\n' "$_p"
       done
 }
@@ -7386,13 +7391,18 @@ _CS_EOF
   # status' to list phantom entries. Typical cause: a submodule was moved
   # on disk without updating the registration (or the old entry wasn't
   # removed after a rename).
-  if [ -f .gitmodules ]; then
+  # SKIPPED when PATH-scoped: 'sm <path> go' must touch ONLY <path> — a
+  # tree-wide stale sweep is exactly the kind of unrelated maintenance
+  # scoping is meant to suppress (use bare 'sm --clean-stale' for that).
+  if [ -f .gitmodules ] && [ -z "$_sm_scope_rel" ]; then
     git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
     | while IFS= read -r _stline; do
         _stkey=${_stline%% *}; _stpath=${_stline#* }
         [ -n "$_stpath" ] || continue
-        # Does the path exist AND contain a .git file or dir? If yes → not stale.
-        if [ -e "$_stpath/.git" ]; then
+        # Present as a live repo (.git) OR a sidecar (GIT_SIDECAR_DIRNAME)
+        # → NOT stale. A sidecared-but-still-registered submodule EXISTS;
+        # flagging it "missing on disk" wrongly deregistered it.
+        if [ -e "$_stpath/.git" ] || [ -e "$_stpath/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
           continue
         fi
         # Extract the submodule name from the config key (submodule.<NAME>.path).
@@ -9044,6 +9054,69 @@ _RT_CONF_EOF
     return 0
   }
 
+  test_sm_sidecared_submodule_not_flagged_stale() {
+    # REGRESSION (found testing sm on a real sidecared tree): a submodule
+    # registered in .gitmodules but present on disk as a SIDECAR
+    # (.git.real, no .git) must NOT be treated as a stale registration
+    # (missing on disk) and deregistered. sm's stale check looked only
+    # for '.git'; a sidecar has '.git.real'. Here we build the legacy
+    # "registered AND sidecared" state (sidecar the repo, then register
+    # it in .gitmodules by hand) and confirm sm doesn't flag it stale.
+    _rt_repo_file sub_o s.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../sub_o mysub >/dev/null 2>&1 )
+    cd global || return 1
+    _rt_ok "sidecar mysub" _rt_my_git flatten go mysub --sidecar || return 1
+    _rt_isdir "mysub is a sidecar" mysub/.git.real || return 1
+    git config -f .gitmodules submodule.mysub.path mysub
+    git config -f .gitmodules submodule.mysub.url ../sub_o
+    git add .gitmodules && git commit -q -m "manually register the sidecar (legacy state)"
+    _rt_ok "sm analyze" _rt_my_git sm || return 1
+    _rt_not_contains "sidecared submodule must NOT be flagged STALE" "$_rt_out" "STALE" || return 1
+    return 0
+  }
+
+  test_sm_path_scope_suppresses_stale_sweep() {
+    # REGRESSION: a PATH-scoped 'sm go <path>' must act ONLY on <path> —
+    # NOT run the tree-wide stale-registration sweep (which could also
+    # fatally fail the commit on an unrelated broken entry). Here a
+    # genuinely-stale 'ghost' entry is injected; a scoped 'sm go kidA'
+    # must register kidA and leave 'ghost' untouched.
+    _rt_repo_file a_o a.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../a_o kidA >/dev/null 2>&1
+      git config -f .gitmodules submodule.ghost.path ghost
+      git config -f .gitmodules submodule.ghost.url ../ghost_o
+      git add .gitmodules && git commit -q -m "inject a stale ghost registration" )
+    cd global || return 1
+    _rt_ok "sm go kidA (path-scoped)" _rt_my_git sm go kidA || return 1
+    grep -q '"kidA"' .gitmodules 2>/dev/null || { _rt_fail "kidA should be registered"; return 1; }
+    grep -q 'ghost' .gitmodules 2>/dev/null || { _rt_fail "the stale 'ghost' entry must be LEFT UNTOUCHED by a path-scoped run"; return 1; }
+    return 0
+  }
+
+  test_sm_kid_of_merged_src_registers_into_global() {
+    # global > src(merged) > kid. After src is MERGED, src is plain
+    # content in global (no git dir of its own), so 'sm go src/kid' from
+    # global registers kid as a submodule of GLOBAL at path src/kid.
+    _rt_repo_file kid_o k.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git init -q src && ( cd src && echo s > s.txt && git add s.txt && git commit -q -m s
+        git clone -q ../../kid_o kid >/dev/null 2>&1 ) )
+    cd global || return 1
+    _rt_ok "merge src" _rt_my_git flatten go src --merge || return 1
+    _rt_exists "src merged (.git.merged)" src/.git.merged || return 1
+    _rt_absent "src has no live .git" src/.git || return 1
+    _rt_ok "sm go src/kid (kid registers into global)" _rt_my_git sm go src/kid || return 1
+    grep -q 'src/kid' .gitmodules 2>/dev/null || { _rt_fail "src/kid should be a submodule of global"; return 1; }
+    _rt_km=$(git ls-files -s -- src/kid 2>/dev/null | awk '{print $1}')
+    [ "$_rt_km" = 160000 ] || { _rt_fail "src/kid should be a gitlink in global's index, got '$_rt_km'"; return 1; }
+    return 0
+  }
+
   test_flatten_subdir_invocation() {
     _rt_repo_file sub-o x.txt
     _rt_repo parent
@@ -10159,7 +10232,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
