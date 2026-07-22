@@ -61,6 +61,10 @@ log_dbg_med()   { [ "$DBG"      = 1 ] && printf '  %s~~ %s%s\n'  "$C_DIM" "$*" "
 log_dbg_minor() { [ "$DEEPDBG"  = 1 ] && printf '   %s~ %s%s\n'   "$C_DIM" "$*" "$C_RESET" >&2; return 0; }
 log_warn()      { printf '%sWARN:  %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 log_error()     { printf '%sERROR: %s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
+# Outcome lines — green SUCCESS / red FAIL always come as a PAIR, so a
+# result is unambiguous ("did it happen?") in both directions.
+log_ok()        { printf ' %sSUCCESS:%s %s\n' "$C_BOLD$C_GREEN" "$C_RESET" "$*"; }
+log_fail()      { printf ' %sFAIL:%s %s\n'    "$C_BOLD$C_RED"   "$C_RESET" "$*" >&2; }
 
 # ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
 # run: echo command in grey at -V, then execute. Preserves exit code.
@@ -773,6 +777,79 @@ list_zipped_dirs() {
         [ -d "$_lzd_r/$_lzd_d/$_lzd_grd" ] && continue
         printf '%s\n' "$_lzd_d"
       done
+}
+
+# _zip_gitdir <path> <keep 0|1>
+#   POSIX port of the 'gz' shell helper (my-git must not depend on any zsh
+#   function/alias). Archive <path>'s git dir into a .zip beside it, then —
+#   unless keep=1 — remove the live dir. Handles a plain '.git' -> '.git.zip'
+#   and a sidecar '$GIT_SIDECAR_DIRNAME' -> '$GIT_SIDECAR_DIRNAME.zip' (folding
+#   in a sibling '.status' snapshot). TRACKED worktree dotfiles (.gitignore,
+#   .gitmodules, …) are always left in place. Verifies the archive
+#   ('unzip -t') before deleting anything; on failure the partial zip is
+#   removed and nothing is lost. Uses the real 'zip'/'unzip' binaries.
+_zip_gitdir() {
+  _zg_p=$1; _zg_keep=${2:-0}
+  _zg_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  if [ -d "$_zg_p/.git" ]; then
+    _zg_src=.git; _zg_zip=.git.zip; _zg_extra=""
+  elif [ -d "$_zg_p/$_zg_grd" ]; then
+    _zg_src=$_zg_grd; _zg_zip="$_zg_grd.zip"; _zg_extra=""
+    [ -e "$_zg_p/$_zg_grd.status" ] && _zg_extra="$_zg_grd.status"
+  else
+    log_error "zip: $_zg_p: no .git or $_zg_grd directory to archive"
+    return 1
+  fi
+  if [ -e "$_zg_p/$_zg_zip" ]; then
+    log_error "zip: $_zg_p/$_zg_zip already exists — not overwriting"
+    return 1
+  fi
+  log_dbg_med "zip: $_zg_p: archiving $_zg_src${_zg_extra:+ + $_zg_extra} -> $_zg_zip (keep=$_zg_keep)"
+  ( cd "$_zg_p" || exit 1
+    # shellcheck disable=SC2086
+    if run zip -qr "$_zg_zip" "$_zg_src" $_zg_extra && run unzip -tqq "$_zg_zip"; then
+      if [ "$_zg_keep" != 1 ]; then
+        # shellcheck disable=SC2086
+        run rm -rf "$_zg_src" $_zg_extra
+      fi
+    else
+      log_error "zip: $_zg_p: zip failed (archive left untouched, originals kept)"
+      rm -f "$_zg_zip"
+      exit 1
+    fi
+  ) || return 1
+  return 0
+}
+
+# _unzip_gitdir <path> <keep 0|1>
+#   POSIX port of the 'gu' shell helper. Restore <path>'s archived git dir
+#   from '.git.zip' or '$GIT_SIDECAR_DIRNAME.zip', then — unless keep=1 —
+#   remove the .zip. Refuses to overwrite an existing live '.git'/sidecar.
+_unzip_gitdir() {
+  _ug_p=$1; _ug_keep=${2:-0}
+  _ug_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  if [ -f "$_ug_p/$_ug_grd.zip" ]; then
+    _ug_zip="$_ug_grd.zip"; _ug_restored=$_ug_grd
+  elif [ -f "$_ug_p/.git.zip" ]; then
+    _ug_zip=.git.zip; _ug_restored=.git
+  else
+    log_error "unzip: $_ug_p: no .git.zip or $_ug_grd.zip to restore"
+    return 1
+  fi
+  if [ -e "$_ug_p/$_ug_restored" ]; then
+    log_error "unzip: $_ug_p/$_ug_restored already exists — refusing to overwrite"
+    return 1
+  fi
+  log_dbg_med "unzip: $_ug_p: restoring $_ug_restored from $_ug_zip (keep=$_ug_keep)"
+  ( cd "$_ug_p" || exit 1
+    if run unzip -q "$_ug_zip"; then
+      [ "$_ug_keep" = 1 ] || run rm -f "$_ug_zip"
+    else
+      log_error "unzip: $_ug_p: unzip failed"
+      exit 1
+    fi
+  ) || return 1
+  return 0
 }
 
 # list_unregistered_nested <repo>
@@ -1510,7 +1587,7 @@ cmd_status() {
           merged)   _sum="(plain content — .git deleted; see ./.git.merged, or 'my-git unflatten --merge')"
                     repo_is_local_only "$_abs" && _flag='⌂' ;;
           zipped)   if [ -f "$_abs/.git.real.zip" ]; then _zname=.git.real.zip; else _zname=.git.zip; fi
-                    _sum="(git dir archived in ./$_zname — restore with: gu ./$_zname)" ;;
+                    _sum="(git dir archived in ./$_zname — restore: '$US unflatten --zip')" ;;
           *)        _sum=$(status_summary "$_abs")
                     repo_is_local_only "$_abs" && _flag='⌂' ;;
         esac
@@ -3869,6 +3946,7 @@ _FL_EMB_REALIZE_EOF
   _fl_force=0
   _fl_forced_mode=""
   _fl_scope_path_raw=""
+  _fl_keep=0
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3891,12 +3969,21 @@ _FL_EMB_REALIZE_EOF
       # argument: scopes to just that one nested repo (see below).
       --sidecar)
         [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != sidecar ] && \
-          fatal "flatten: --sidecar and --merge are mutually exclusive" 64
+          fatal "flatten: --sidecar / --merge / --zip are mutually exclusive" 64
         _fl_forced_mode=sidecar ;;
       --merge)
         [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != merge ] && \
-          fatal "flatten: --sidecar and --merge are mutually exclusive" 64
+          fatal "flatten: --sidecar / --merge / --zip are mutually exclusive" 64
         _fl_forced_mode=merge ;;
+      # --zip: a THIRD flatten mode — archive the git dir into a compact
+      # .git.zip / GIT_SIDECAR_DIRNAME.zip that the parent tracks as content
+      # ('st' shows the dir as [zipped]). Reverse with 'unflatten --zip'.
+      # Ported into my-git (no dependency on the gz/gu shell helpers).
+      --zip)
+        [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != zip ] && \
+          fatal "flatten: --zip is mutually exclusive with --sidecar/--merge" 64
+        _fl_forced_mode=zip ;;
+      -k|--keep)    _fl_keep=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "flatten: unknown option: $1" 64 ;;
       # A single positional PATH restricts the whole run (analyze, go,
@@ -3955,7 +4042,66 @@ _FL_EMB_REALIZE_EOF
 
   cd "$_fl_top" || fatal "flatten: cannot cd to $_fl_top" 1
 
-  log_dbg_med "flatten: top=$_fl_top scope='${_fl_scope_path:-<whole repo>}' forced_mode='${_fl_forced_mode:-<none>}' mode=$_fl_mode interactive=$_fl_interactive rmgit=$_fl_rmgit force=$_fl_force sidecar_dirname=$GIT_SIDECAR_DIRNAME"
+  log_dbg_med "flatten: top=$_fl_top scope='${_fl_scope_path:-<whole repo>}' forced_mode='${_fl_forced_mode:-<none>}' mode=$_fl_mode interactive=$_fl_interactive rmgit=$_fl_rmgit force=$_fl_force keep=$_fl_keep sidecar_dirname=$GIT_SIDECAR_DIRNAME"
+
+  # ── --zip mode ────────────────────────────────────────────────────────
+  # Archive git dirs into a .zip (the 'gz' operation, ported here so my-git
+  # never depends on a shell function). With a PATH: that one repo/sidecar.
+  # Bulk (no PATH): every SIDECAR under the toplevel — compress them all;
+  # live nested repos are deliberately left alone in bulk (zip one on
+  # purpose by naming its path). Analyze by default; 'go' to apply.
+  if [ "$_fl_forced_mode" = zip ]; then
+    if [ -n "$_fl_scope_path" ]; then
+      is_git_repo_or_flattened "$_fl_scope_path" || \
+        fatal "flatten --zip: '$_fl_scope_path' is not a git repo or sidecar" 1
+      if [ -f "$_fl_scope_path/.git.zip" ] || [ -f "$_fl_scope_path/$GIT_SIDECAR_DIRNAME.zip" ]; then
+        log_major "flatten --zip: $_fl_scope_path is already zipped — nothing to do"
+        return 0
+      fi
+      _fl_zip_targets=$_fl_scope_path
+    else
+      _fl_zip_targets=$(list_realized_dirs "$_fl_top")
+      if [ -z "$_fl_zip_targets" ]; then
+        log_major "flatten --zip: no sidecars under $_fl_top to archive"
+        log_medium "(pass a PATH to zip a specific live repo or sidecar)"
+        return 0
+      fi
+    fi
+
+    if [ "$_fl_mode" != go ]; then
+      log_major "$_fl_top: flatten --zip plan"
+      printf '%s\n' "$_fl_zip_targets" | while IFS= read -r _fl_zt; do
+        [ -n "$_fl_zt" ] || continue
+        if [ -d "$_fl_zt/.git" ]; then _fl_zwhat=".git -> .git.zip"; else _fl_zwhat="$GIT_SIDECAR_DIRNAME -> $GIT_SIDECAR_DIRNAME.zip"; fi
+        printf '  %s>> %s   (%s%s)%s\n' "$C_BLUE" "$_fl_zt" "$_fl_zwhat" "$([ "$_fl_keep" = 1 ] && printf ', keep original')" "$C_RESET"
+      done
+      echo
+      log_major "This was analyze-only — re-run with 'go' to apply:"
+      printf '  %s>>   %s flatten go --zip%s %s%s\n' "$C_BLUE" "$US" "$([ "$_fl_keep" = 1 ] && printf ' -k')" "${_fl_scope_path:-}" "$C_RESET"
+      return 0
+    fi
+
+    # go: apply. Split targets on newlines into positional args.
+    _fl_oifs=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $_fl_zip_targets
+    IFS=$_fl_oifs
+    _fl_zip_ok=0; _fl_zip_fail=0
+    for _fl_zt in "$@"; do
+      [ -n "$_fl_zt" ] || continue
+      if _zip_gitdir "$_fl_zt" "$_fl_keep"; then
+        _fl_zip_ok=$((_fl_zip_ok + 1))
+        log_ok "flatten --zip: archived $_fl_zt$([ "$_fl_keep" = 1 ] && printf ' (original kept)')"
+      else
+        _fl_zip_fail=$((_fl_zip_fail + 1))
+      fi
+    done
+    [ "$_fl_zip_fail" = 0 ] || log_fail "flatten --zip: $_fl_zip_fail target(s) failed"
+    log_major "flatten --zip: $_fl_zip_ok archived, $_fl_zip_fail failed"
+    [ "$_fl_zip_fail" = 0 ]
+    return
+  fi
 
   # Direct sidecar -> merge conversion: if the PATH argument already IS
   # a sidecar (GIT_SIDECAR_DIRNAME present, no live .git) and --merge
@@ -4984,6 +5130,7 @@ cmd_unflatten() {
   _ufl_interactive=0
   _ufl_forced_mode=""
   _ufl_scope_path_raw=""
+  _ufl_keep=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) show_help unflatten; exit 0 ;;
@@ -4996,12 +5143,19 @@ cmd_unflatten() {
       -i|--interactive) _ufl_interactive=1; require_tty unflatten ;;
       --sidecar)
         [ -n "$_ufl_forced_mode" ] && [ "$_ufl_forced_mode" != sidecar ] && \
-          fatal "unflatten: --sidecar and --merge are mutually exclusive" 64
+          fatal "unflatten: --sidecar / --merge / --zip are mutually exclusive" 64
         _ufl_forced_mode=sidecar ;;
       --merge)
         [ -n "$_ufl_forced_mode" ] && [ "$_ufl_forced_mode" != merge ] && \
-          fatal "unflatten: --sidecar and --merge are mutually exclusive" 64
+          fatal "unflatten: --sidecar / --merge / --zip are mutually exclusive" 64
         _ufl_forced_mode=merge ;;
+      # --zip: restore a git dir archived by 'flatten --zip' (the 'gu'
+      # operation, ported here). Reverses '.git.zip' / SIDECAR.zip -> live dir.
+      --zip)
+        [ -n "$_ufl_forced_mode" ] && [ "$_ufl_forced_mode" != zip ] && \
+          fatal "unflatten: --sidecar / --merge / --zip are mutually exclusive" 64
+        _ufl_forced_mode=zip ;;
+      -k|--keep)    _ufl_keep=1 ;;
       -*) fatal "unflatten: unknown option: $1" 64 ;;
       *)
         [ -n "$_ufl_scope_path_raw" ] && \
@@ -5041,7 +5195,10 @@ cmd_unflatten() {
   if [ -n "$_ufl_scope_path" ]; then
     _ufl_p_mode=$_ufl_forced_mode
     if [ -z "$_ufl_p_mode" ]; then
-      if [ -d "$_ufl_scope_path/$GIT_SIDECAR_DIRNAME" ]; then
+      if [ -f "$_ufl_scope_path/.git.zip" ] || [ -f "$_ufl_scope_path/$GIT_SIDECAR_DIRNAME.zip" ]; then
+        _ufl_p_mode=zip
+        log_dbg_med "unflatten: auto-detected mode=zip for '$_ufl_scope_path' (.git.zip/$GIT_SIDECAR_DIRNAME.zip present)"
+      elif [ -d "$_ufl_scope_path/$GIT_SIDECAR_DIRNAME" ]; then
         _ufl_p_mode=sidecar
         log_dbg_med "unflatten: auto-detected mode=sidecar for '$_ufl_scope_path' ($_ufl_scope_path/$GIT_SIDECAR_DIRNAME present)"
       elif [ -e "$_ufl_scope_path/.git" ]; then
@@ -5072,7 +5229,15 @@ cmd_unflatten() {
         printf '%s\tmerge\n' "$_p"
       done >> "$_ufl_cand"
     fi
-    log_dbg_med "unflatten bulk discovery: $(grep -c 'sidecar$' "$_ufl_cand" 2>/dev/null) sidecar(s), $(grep -c 'merge$' "$_ufl_cand" 2>/dev/null) merged path(s) found under $_ufl_top (forced_mode='${_ufl_forced_mode:-<both>}')"
+    # Zipped dirs (flatten --zip) are discoverable via their .git*.zip marker.
+    # Only skipped when the run is explicitly restricted to sidecar OR merge.
+    if [ "$_ufl_forced_mode" != sidecar ] && [ "$_ufl_forced_mode" != merge ]; then
+      list_zipped_dirs "$_ufl_top" | while IFS= read -r _p; do
+        [ -n "$_p" ] || continue
+        printf '%s\tzip\n' "$_p"
+      done >> "$_ufl_cand"
+    fi
+    log_dbg_med "unflatten bulk discovery: $(grep -c 'sidecar$' "$_ufl_cand" 2>/dev/null) sidecar(s), $(grep -c 'merge$' "$_ufl_cand" 2>/dev/null) merged path(s), $(grep -c 'zip$' "$_ufl_cand" 2>/dev/null) zipped path(s) found under $_ufl_top (forced_mode='${_ufl_forced_mode:-<all>}')"
   fi
 
   _ufl_n=$(grep -c . "$_ufl_cand" 2>/dev/null)
@@ -5087,6 +5252,8 @@ cmd_unflatten() {
     [ -n "$_p" ] || continue
     if [ "$_m" = merge ]; then
       printf '  %s>> %s  (RECONSTRUCT via git subtree split — history before the merge is gone)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+    elif [ "$_m" = zip ]; then
+      printf '  %s>> %s  (restore git dir from .zip%s)%s\n' "$C_BLUE" "$_p" "$([ "$_ufl_keep" = 1 ] && printf ', keep .zip')" "$C_RESET"
     else
       printf '  %s>> %s  (restore exactly from %s)%s\n' "$C_BLUE" "$_p" "$GIT_SIDECAR_DIRNAME" "$C_RESET"
     fi
@@ -5127,6 +5294,17 @@ cmd_unflatten() {
         _ufl_n_ok=$((_ufl_n_ok + 1)); _ufl_commit_paths="$_ufl_commit_paths $(shell_escape "$_p")"
       else
         _ufl_n_fail=$((_ufl_n_fail + 1)); log_dbg_med "unflatten apply: $_p FAILED (merge reconstruct)"
+      fi
+    elif [ "$_m" = zip ]; then
+      # Pure filesystem restore (like the reverse of flatten --zip): no
+      # parent index bookkeeping to commit here — the removed .git*.zip is
+      # a plain worktree change, settled by the next 'mc' (same as gz/gu,
+      # which never touch the parent). So NOT added to _ufl_commit_paths.
+      if _unzip_gitdir "$_p" "$_ufl_keep"; then
+        _ufl_n_ok=$((_ufl_n_ok + 1))
+        log_ok "unflatten --zip: restored $_p$([ "$_ufl_keep" = 1 ] && printf ' (.zip kept)')"
+      else
+        _ufl_n_fail=$((_ufl_n_fail + 1)); log_dbg_med "unflatten apply: $_p FAILED (zip restore)"
       fi
     else
       if _unfl_restore_sidecar "$_p"; then
@@ -5844,9 +6022,9 @@ Subcommands:
   pull | pl                Fetch + fast-forward merge (analyze / 'go'; -R top-down)
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
-  flatten | fl             Merge nested repos into outer as content — either merge (.git kept
-                           live or deleted) or sidecar (.git.real, history kept, --sidecar/--merge/PATH)
-  unflatten | unfl         Reverse of flatten — rebuild a live .git (--sidecar exact, --merge best-effort)
+  flatten | fl             Merge nested repos into outer as content — merge (.git kept/deleted),
+                           sidecar (.git.real, history kept), or --zip (archive git dir to .zip)
+  unflatten | unfl         Reverse of flatten — rebuild a live .git (--sidecar/--merge/--zip; auto-detects)
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
   audit                    Read-only health checks (--claude and/or --sidecar)
@@ -6156,7 +6334,7 @@ show_help_flatten() {
   cat <<EOF
 my-git flatten  (alias: fl)
 
-usage: $US [-V|-D] flatten [go] [-i] [--rm-git] [--force] [--sidecar|--merge] [path]
+usage: $US [-V|-D] flatten [go] [-i] [--rm-git] [--force] [--sidecar|--merge|--zip [-k]] [path]
 
 Merge every nested git repo under the CURRENT super-repo into the
 super's history as regular tracked content. Callable from anywhere
@@ -6188,6 +6366,21 @@ would otherwise decide per-type/per-item:
   <path> --sidecar/--merge    restricts to just that ONE nested repo
                               (embedded, registered, or orphan gitlink)
                               instead of the whole tree — see 'Scope'.
+
+--zip: a THIRD way to flatten — instead of relocating (sidecar) or
+deleting (merge) the git dir, ARCHIVE it into a compact '.git.zip' (plain
+repo) or 'GIT_SIDECAR_DIRNAME.zip' (sidecar) beside the worktree, then
+remove the live dir. The parent then tracks that .zip as plain content
+('$US st' shows the dir as [zipped]). This is the same operation as the
+'gz' shell helper, ported into my-git so it needs no shell function.
+  go --zip          bulk: archive EVERY sidecar under the toplevel (live
+                    nested repos are left alone — name one by path to zip it).
+  <path> --zip      archive just that one repo/sidecar (.git or the sidecar).
+  -k, --keep        keep the original git dir too (just create the .zip).
+Reverse with '$US unflatten --zip' (or bare 'unflatten', which auto-detects
+a zipped path). Restore is lossless — the archive is integrity-checked
+('unzip -t') before the original is ever removed. TRACKED worktree dotfiles
+(.gitignore, .gitmodules, …) are always left in place.
 
 When --sidecar sidecars a repo, it also writes <path>/GIT_SIDECAR_DIRNAME.status
 next to it: an ordinary, parent-tracked text file recording branch,
@@ -6310,10 +6503,10 @@ show_help_unflatten() {
   cat <<EOF
 my-git unflatten  (alias: unfl)
 
-usage: $US [-V|-D] unflatten [go] [-i] [--sidecar|--merge] [path]
+usage: $US [-V|-D] unflatten [go] [-i] [--sidecar|--merge|--zip [-k]] [path]
 
-Reverse of 'flatten' — rebuilds a live '.git' at a nested path. Two
-modes, matching flatten's two:
+Reverse of 'flatten' — rebuilds a live '.git' at a nested path. Three
+modes, matching flatten's three:
 
   --sidecar   EXACT, lossless. <path>/GIT_SIDECAR_DIRNAME moves back to
               <path>/.git, and core.worktree/core.bare (realize's own
@@ -6339,9 +6532,17 @@ modes, matching flatten's two:
               'flatten'/'--merge' just before deletion — removed again
               once unflatten successfully reconstructs a live .git.
 
-Auto-detection: with a PATH and neither flag, the mode is inferred from
-what's actually on disk — a GIT_SIDECAR_DIRNAME present means --sidecar;
-otherwise --merge is attempted.
+  --zip       EXACT, lossless. Un-archives a git dir that 'flatten --zip'
+              packed away: '.git.zip' -> '.git', or
+              'GIT_SIDECAR_DIRNAME.zip' -> the sidecar dir. The .zip is
+              removed on success (keep it with -k). Refuses to overwrite an
+              existing live dir. Bulk-discoverable via its .git*.zip marker.
+              Same operation as the 'gu' shell helper, ported into my-git.
+
+Auto-detection: with a PATH and no mode flag, the mode is inferred from
+what's actually on disk — a '.git*.zip' means --zip; a GIT_SIDECAR_DIRNAME
+present means --sidecar; otherwise --merge is attempted. Bulk (no path)
+processes all three marker kinds unless restricted to one with a flag.
 
 Modes:
   default (no 'go')   ANALYZE — print the plan (which paths, which
@@ -10924,7 +11125,7 @@ _RT_STALE_CONF_EOF
     cd top || return 1
     _rt_ok "st -R on tree with zipped dirs" _rt_my_git -R st "$PWD" || return 1
     _rt_contains "a zipped dir is shown as [zipped]" "$_rt_out" "[zipped]" || return 1
-    _rt_contains "zipped note mentions restore with gu" "$_rt_out" "restore with: gu" || return 1
+    _rt_contains "zipped note mentions how to restore" "$_rt_out" "unflatten --zip" || return 1
     # exactly TWO [zipped] (plainkid + sc/inner), not three — no doubling, and
     # keptkid (live + backup zip) must not be counted
     _z=$(grep -c '\[zipped\]' "$_rt_out" 2>/dev/null)
@@ -10938,6 +11139,62 @@ _RT_STALE_CONF_EOF
     # st on a zipped PATH directly must work (not 'not a git repo')
     _rt_ok "st on a zipped PATH" _rt_my_git st "$PWD/plainkid" || return 1
     _rt_contains "zipped path tagged [zipped]" "$_rt_out" "[zipped]" || return 1
+    return 0
+  }
+
+  test_flatten_zip_unflatten_zip_round_trip() {
+    # 'flatten --zip' archives a sidecar's git dir to .git.real.zip (st shows
+    # [zipped]); 'unflatten' auto-detects the zip and restores it LOSSLESSLY
+    # (same HEAD, worktree intact). POSIX port of gz/gu inside my-git.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o sc >/dev/null 2>&1 )
+    cd top || return 1
+    _rt_ok "make a sidecar" _rt_my_git flatten go sc --sidecar || return 1
+    _sha_before=$(git --git-dir=sc/.git.real rev-parse HEAD 2>/dev/null)
+    # analyze must not touch anything
+    _rt_ok "flatten --zip analyze" _rt_my_git flatten --zip sc || return 1
+    [ -d sc/.git.real ] || { _rt_fail "analyze removed the sidecar dir"; return 1; }
+    _rt_absent "analyze made no zip" sc/.git.real.zip || return 1
+    # go
+    _rt_ok "flatten --zip go" _rt_my_git flatten go --zip sc || return 1
+    _rt_exists "zip created" sc/.git.real.zip || return 1
+    _rt_absent "live sidecar dir removed" sc/.git.real || return 1
+    _rt_ok "st shows the zipped dir" _rt_my_git st "$PWD" || return 1
+    _rt_contains "tagged [zipped]" "$_rt_out" "[zipped]" || return 1
+    # unflatten (auto-detect zip)
+    _rt_ok "unflatten go (auto zip)" _rt_my_git unflatten go sc || return 1
+    _rt_isdir "sidecar dir restored" sc/.git.real || return 1
+    _rt_absent "zip removed after restore" sc/.git.real.zip || return 1
+    _rt_exists "worktree file intact" sc/k.txt || return 1
+    _sha_after=$(git --git-dir=sc/.git.real rev-parse HEAD 2>/dev/null)
+    [ "$_sha_before" = "$_sha_after" ] || { _rt_fail "HEAD changed across zip round-trip: $_sha_before != $_sha_after"; return 1; }
+    return 0
+  }
+
+  test_flatten_zip_keep_and_plain_git() {
+    # -k keeps the original; a plain (non-sidecar) .git zips to .git.zip;
+    # 'unflatten --zip -k' restores while keeping the .zip.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o plainkid >/dev/null 2>&1 )
+    cd top || return 1
+    # -k: plain .git zipped but ORIGINAL kept
+    _rt_ok "flatten --zip -k go (plain .git)" _rt_my_git flatten go --zip -k plainkid || return 1
+    _rt_exists ".git.zip made" plainkid/.git.zip || return 1
+    _rt_isdir ".git kept (-k)" plainkid/.git || return 1
+    # a live .git beside a backup zip must NOT read as [zipped]
+    _rt_ok "st with backup zip" _rt_my_git -R st "$PWD" || return 1
+    if grep -F 'plainkid' "$_rt_out" | grep -qF '[zipped]'; then
+      _rt_fail "a live repo with a backup .git.zip (-k) was wrongly tagged [zipped]"; return 1
+    fi
+    # removing the live .git leaves a genuine zipped dir; unflatten --zip -k keeps the zip
+    rm -rf plainkid/.git
+    _rt_ok "unflatten --zip -k go" _rt_my_git unflatten go --zip -k plainkid || return 1
+    _rt_isdir ".git restored" plainkid/.git || return 1
+    _rt_exists ".git.zip kept (-k)" plainkid/.git.zip || return 1
     return 0
   }
 
@@ -10955,7 +11212,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_audit_sidecar_flags_empty_sidecar"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
