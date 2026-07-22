@@ -537,17 +537,24 @@ is_git_repo_or_flattened() {
   [ -e "$1/.git" ] && return 0
   [ -d "$1/${GIT_SIDECAR_DIRNAME:-.git.real}" ] && return 0
   [ -f "$1/.git.merged" ] && return 0
+  [ -f "$1/.git.real.zip" ] && return 0
+  [ -f "$1/.git.zip" ] && return 0
   return 1
 }
 
 # flatten_marker_tag <path>
-#   Echo the st tree tag for a path based on its flatten marker:
-#   'realized' (sidecar), 'merged', or '' (a live repo / anything else).
+#   Echo the st tree tag for a path based on its flatten/archive marker:
+#   'realized' (sidecar), 'merged', 'zipped' (git dir archived by 'gz'),
+#   or '' (a live repo / anything else). A live '.git' always wins (so a
+#   'gz -k' backup zip beside a live repo is NOT tagged zipped).
 flatten_marker_tag() {
-  if [ ! -e "$1/.git" ] && [ -d "$1/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
+  [ -e "$1/.git" ] && return 0
+  if [ -d "$1/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
     echo realized
-  elif [ ! -e "$1/.git" ] && [ -f "$1/.git.merged" ]; then
+  elif [ -f "$1/.git.merged" ]; then
     echo merged
+  elif [ -f "$1/.git.real.zip" ] || [ -f "$1/.git.zip" ]; then
+    echo zipped
   fi
 }
 
@@ -734,6 +741,38 @@ list_merged_dirs() {
     eval "find . \\( $_pex \\) -prune -o -name '.git.merged' -prune -print 2>/dev/null"
   ) | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' \
     | grep -v '^$'
+}
+
+# list_zipped_dirs <repo>
+#   Print paths (relative to $repo) of directories whose git dir has been
+#   ARCHIVED by the 'gz' shell helper — i.e. they carry a '.git.zip' (a
+#   zipped plain '.git') or '.git.real.zip' (a zipped sidecar) FILE, and
+#   no live '.git'/'.git.real' alongside. The worktree files are still on
+#   disk; only the history is currently zipped up (restore with 'gu').
+#   Same shape as list_merged_dirs. A dir that ALSO still has a live
+#   '.git'/'.git.real' (e.g. 'gz -k' kept the original) is NOT reported —
+#   it is still a normal live/sidecar repo, the zip is just a backup.
+list_zipped_dirs() {
+  _lzd_r=$1
+  [ -d "$_lzd_r" ] || return 0
+  _lzd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  ( cd "$_lzd_r" 2>/dev/null || exit 0
+    # PERF: prune git-internal dir contents (see list_realized_dirs).
+    _pex="-path ./.git -o -name .git -o -name $_lzd_grd -o -name .git.merged"
+    for _ed in ${ST_EXCLUDE_DIRS:-}; do
+      _pex="$_pex -o -name $_ed"
+    done
+    # shellcheck disable=SC2086
+    eval "find . \\( $_pex \\) -prune -o \\( -name .git.zip -o -name .git.real.zip \\) -print 2>/dev/null"
+  ) | sed -e 's|^\./||' -e 's|/\.git\.real\.zip$||' -e 's|/\.git\.zip$||' \
+        -e 's|^\.git\.real\.zip$||' -e 's|^\.git\.zip$||' \
+    | grep -v '^$' | sort -u | while IFS= read -r _lzd_d; do
+        # Skip a dir that still has a LIVE git dir next to the zip (gz -k):
+        # it is a working repo, not an archived one.
+        [ -e "$_lzd_r/$_lzd_d/.git" ] && continue
+        [ -d "$_lzd_r/$_lzd_d/$_lzd_grd" ] && continue
+        printf '%s\n' "$_lzd_d"
+      done
 }
 
 # list_unregistered_nested <repo>
@@ -993,17 +1032,28 @@ walk_tree_lines() (
   # big foreign tree, so it stays opt-in. Registered submodules are
   # always shown. (sm calls list_unregistered_nested directly and is NOT
   # gated by these flags — discovery IS sm's purpose.)
-  # 'collapse': the tree renderer unions TOP-LEVEL entries and recurses to
-  # surface deeper sidecars, so ask for top-most-only to avoid doubling.
-  _subs_realized=$(list_realized_dirs "$_root" collapse)
+  _subs_realized=$(list_realized_dirs "$_root")
   _subs_merged=$(list_merged_dirs "$_root")
+  _subs_zipped=$(list_zipped_dirs "$_root")
+  # realized / merged / zipped are all found by recursive find and CAN nest
+  # inside one another (a sidecar's worktree can hold a merged or zipped repo,
+  # you can 'gz' a sidecar that lives inside another sidecar, etc.). The
+  # renderer unions TOP-LEVEL entries and RECURSES to surface deeper markers,
+  # so keep only the top-most of each nest here — otherwise a deeper marker
+  # shows up twice (once nested, once flat at the top). One collapse over all
+  # three types also covers cross-type nesting (e.g. a zipped repo under a
+  # sidecar), which a per-type collapse would miss.
+  _markers=$(printf '%s\n%s\n%s\n' "$_subs_realized" "$_subs_merged" "$_subs_zipped" \
+    | grep -v '^$' | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
+    | awk 'function is_under(a, n, p,   i) { for (i=1;i<=n;i++) if (p==a[i] || index(p, a[i] "/")==1) return 1; return 0 }
+           { if (is_under(kept, nk, $0)) next; print; kept[++nk]=$0 }')
   if [ "${SCOPE_MANAGED:-1}" = 1 ] || [ "${RECURSIVE:-0}" = 1 ]; then
     _subs_unreg=$(list_unregistered_nested "$_root")
   else
     _subs_unreg=""
   fi
   _subs_stale=$(list_stale_submodules "$_root")
-  _all=$(printf '%s\n%s\n%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" "$_subs_stale" "$_subs_realized" "$_subs_merged" | grep -v '^$' | sort -u)
+  _all=$(printf '%s\n%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" "$_subs_stale" "$_markers" | grep -v '^$' | sort -u)
   [ -z "$_all" ] && return 0
   _total=$(printf '%s\n' "$_all" | grep -c .)
   _i=0
@@ -1030,10 +1080,12 @@ walk_tree_lines() (
       _ntag=realized
     elif printf '%s\n' "$_subs_merged" | grep -qxF "$_sub"; then
       _ntag=merged
+    elif printf '%s\n' "$_subs_zipped" | grep -qxF "$_sub"; then
+      _ntag=zipped
     else
       _ntag=unreg
     fi
-    if [ "$_ntag" != stale ] && [ "$_ntag" != realized ] && [ "$_ntag" != merged ] && is_nested_ignored "$_root" "$_sub"; then
+    if [ "$_ntag" != stale ] && [ "$_ntag" != realized ] && [ "$_ntag" != merged ] && [ "$_ntag" != zipped ] && is_nested_ignored "$_root" "$_sub"; then
       _ntag="${_ntag}-ign"
     fi
     walk_tree_lines "$_root/$_sub" "$_sub" "$_my_pfx" "$_my_cpfx" "$_ntag"
@@ -1400,6 +1452,7 @@ cmd_status() {
               stale)     _mark="[STALE REGISTRATION]" ;;
               realized)  _mark="[sidecar]" ;;
               merged)    _mark="[merged]" ;;
+              zipped)    _mark="[zipped]" ;;
             esac
             # Columns for awk: <left> TAB <mark> TAB <tag> TAB <abs>
             printf '%s\t%s\t%s\t%s\n' "$_left" "$_mark" "$_tag" "$_abs" >> "$_rawtmp"
@@ -1456,6 +1509,8 @@ cmd_status() {
                     repo_is_local_only "$_abs" && _flag='⌂' ;;
           merged)   _sum="(plain content — .git deleted; see ./.git.merged, or 'my-git unflatten --merge')"
                     repo_is_local_only "$_abs" && _flag='⌂' ;;
+          zipped)   if [ -f "$_abs/.git.real.zip" ]; then _zname=.git.real.zip; else _zname=.git.zip; fi
+                    _sum="(git dir archived in ./$_zname — restore with: gu ./$_zname)" ;;
           *)        _sum=$(status_summary "$_abs")
                     repo_is_local_only "$_abs" && _flag='⌂' ;;
         esac
@@ -1463,6 +1518,7 @@ cmd_status() {
         case "$_tag" in
           realized) echo R >> "$_stcounts_tmp"; continue ;;
           merged)   echo G >> "$_stcounts_tmp"; continue ;;
+          zipped)   echo Z >> "$_stcounts_tmp"; continue ;;
         esac
         case "$_sum" in
           "CLEAN :))"*)         echo C ;;
@@ -1489,7 +1545,7 @@ cmd_status() {
     printf '  %s>> state:   %sCLEAN :))%s  CLEAN, ahead/behind N  DIVERGED (ahead X, behind Y)  DIRTY (N) [...]  CLEAN (no upstream for BRANCH)%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
     printf '  %s>> dirty:   M=modified  A=added  D=deleted  R=renamed  ??=untracked  ?=other  (counts inside [ ])%s\n' "$C_BLUE" "$C_RESET"
-    printf '  %s>> tags:    [registered]=in .gitmodules  [unregistered]=nested repo not registered  [sidecar]=self-contained history relocated to ./%s  [merged]=.git deleted, see ./.git.merged  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
+    printf '  %s>> tags:    [registered]=in .gitmodules  [unregistered]=nested repo not registered  [sidecar]=self-contained history relocated to ./%s  [merged]=.git deleted, see ./.git.merged  [zipped]=git dir archived by gz (./.git.zip / ./.git.real.zip), restore with gu  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
       "$C_BLUE" "${GIT_SIDECAR_DIRNAME:-.git.real}" "$C_RESET"
     printf '  %s>> flags (column after the tag): %s⌂%s = local-only (no remote configured — nothing to publish to);  blank = has a remote (publishable)%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
@@ -1506,6 +1562,7 @@ cmd_status() {
     _n_err=$(grep -c '^E$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_realized=$(grep -c '^R$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_merged=$(grep -c '^G$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_zipped=$(grep -c '^Z$' "$_stcounts_tmp" 2>/dev/null | head -1)
     echo
     log_major "Summary"
     _parts=""
@@ -1516,6 +1573,7 @@ cmd_status() {
     [ "$_n_dirty" -gt 0 ]    && _parts="$_parts $(c_yellow "DIRTY=$_n_dirty")"
     [ "$_n_realized" -gt 0 ] && _parts="$_parts sidecar=$_n_realized"
     [ "$_n_merged" -gt 0 ]   && _parts="$_parts merged=$_n_merged"
+    [ "$_n_zipped" -gt 0 ]   && _parts="$_parts zipped=$_n_zipped"
     [ "$_n_err" -gt 0 ]      && _parts="$_parts $(c_red "err/skip=$_n_err")"
     printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$_st_total" "$_parts" "$C_RESET"
   fi
@@ -5892,6 +5950,14 @@ repos found on disk. Marks shown after the display name:
                               edits now (as plain content), so check the
                               outer repo's status for anything current
                               (see '$US --help flatten').
+  [zipped]                  — directory whose git dir has been ARCHIVED by
+                              the 'gz' shell helper: it carries a '.git.zip'
+                              (zipped plain '.git') or '.git.real.zip'
+                              (zipped sidecar) and no live git dir. The
+                              worktree files are still here; only the history
+                              is currently zipped. Restore with 'gu'. (A live
+                              repo that merely keeps a backup zip via 'gz -k'
+                              is NOT shown as [zipped].)
 
 The top-level scope path carries no tag (it IS the super-repo, not a nested
 entry). DIRTY/CLEAN is orthogonal to registration — DIRTY just means
@@ -10833,6 +10899,48 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_st_shows_zipped_git_dirs() {
+    # 'gz' archives a repo's git dir to .git.zip / .git.real.zip and removes
+    # the live dir. st must show such a dir as [zipped] (not let it vanish),
+    # tag a zipped PATH directly, NOT double a zipped-under-sidecar, and NOT
+    # tag a live repo that merely keeps a backup zip (the 'gz -k' case).
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    # plain nested repo, git dir zipped away
+    ( cd top && mkdir plainkid && cd plainkid && git init -q && git config user.email t@t.com \
+        && git config user.name t && git commit -qm x --allow-empty \
+        && zip -qr .git.zip .git >/dev/null 2>&1 && rm -rf .git )
+    # sidecar containing a nested sidecar; zip the INNER one (zipped-under-sidecar)
+    ( cd top && mkdir -p sc/inner )
+    ( cd top/sc && git init --separate-git-dir=.git.real -q && rm -f .git \
+        && git --git-dir=.git.real config core.worktree .. )
+    ( cd top/sc/inner && git init --separate-git-dir=.git.real -q && rm -f .git \
+        && git --git-dir=.git.real config core.worktree .. \
+        && zip -qr .git.real.zip .git.real >/dev/null 2>&1 && rm -rf .git.real )
+    # gz -k style: LIVE repo that also keeps a backup .git.zip (must stay live)
+    ( cd top && mkdir keptkid && cd keptkid && git init -q && git config user.email t@t.com \
+        && git config user.name t && git commit -qm x --allow-empty \
+        && zip -qr .git.zip .git >/dev/null 2>&1 )
+    cd top || return 1
+    _rt_ok "st -R on tree with zipped dirs" _rt_my_git -R st "$PWD" || return 1
+    _rt_contains "a zipped dir is shown as [zipped]" "$_rt_out" "[zipped]" || return 1
+    _rt_contains "zipped note mentions restore with gu" "$_rt_out" "restore with: gu" || return 1
+    # exactly TWO [zipped] (plainkid + sc/inner), not three — no doubling, and
+    # keptkid (live + backup zip) must not be counted
+    _z=$(grep -c '\[zipped\]' "$_rt_out" 2>/dev/null)
+    [ "$_z" = 2 ] || { _rt_fail "expected 2 [zipped] lines, got $_z (doubling, or gz -k repo wrongly zipped?)"; return 1; }
+    # keptkid stays a live repo, never [zipped]
+    if grep -F 'keptkid' "$_rt_out" | grep -qF '[zipped]'; then
+      _rt_fail "a live repo with only a backup .git.zip (gz -k) was wrongly tagged [zipped]"; return 1
+    fi
+    # summary counts them
+    _rt_contains "summary reports zipped=2" "$_rt_out" "zipped=2" || return 1
+    # st on a zipped PATH directly must work (not 'not a git repo')
+    _rt_ok "st on a zipped PATH" _rt_my_git st "$PWD/plainkid" || return 1
+    _rt_contains "zipped path tagged [zipped]" "$_rt_out" "[zipped]" || return 1
+    return 0
+  }
+
   test_audit_sidecar_flags_empty_sidecar() {
     # An EMPTY sidecar (0 commits) preserves no history — audit must NOTE it
     # (never auto-fix). Build one by sidecaring a truly commit-less clone.
@@ -10847,7 +10955,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_audit_sidecar_flags_empty_sidecar"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
