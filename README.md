@@ -412,16 +412,22 @@ recording the transfer in `.git.merged`, before anything is deleted.
 `--sidecar` / `--merge` / `--zip` force ONE mode across every item flatten
 would otherwise decide per-item:
 
-- `go --sidecar|--merge|--zip` — bulk-apply that one mode, no prompting.
+- `go --sidecar|--merge|--zip` — **bulk**-apply that one mode, no prompting.
   `--sidecar`/`--merge` cover every nested LIVE repo (including registered
   submodules, which bare `go` alone leaves untouched); `--zip` archives
   every existing SIDECAR under the toplevel (a live nested repo is zipped
   only when named explicitly by path).
-- `-i --sidecar|--merge|--zip` — same bulk behavior; `-i` is a no-op once
-  a mode is forced (nothing left to ask per item).
+- `go -i --sidecar|--merge|--zip` — instead of bulk, ask **[Y]es / [s]kip /
+  [a]bort per repo, one by one** (works with every mode, including `--zip`).
 - `<path> --sidecar|--merge|--zip` — restricts to just that one
   repo/sidecar (embedded, registered submodule, orphan gitlink, or an
   existing sidecar for `--zip`) instead of the whole tree.
+
+`--local-only` (alias `--house`) restricts any mode to repos with **no
+remote** — the ones `st` marks with the house icon (⌂). The typical use is
+`my-git flatten go --zip --local-only` to archive only the unpublished
+sidecars. Same flag works for `--sidecar`/`--merge` too. (`unflatten`'s
+`-i` behaves identically, one repo at a time.)
 
 A nested repo carrying `.git/my-git-submodules.ignore` (the same marker
 `sm`/`mc` already honor) is left entirely untouched by default — not

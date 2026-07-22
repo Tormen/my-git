@@ -66,6 +66,22 @@ log_error()     { printf '%sERROR: %s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
 log_ok()        { printf ' %sSUCCESS:%s %s\n' "$C_BOLD$C_GREEN" "$C_RESET" "$*"; }
 log_fail()      { printf ' %sFAIL:%s %s\n'    "$C_BOLD$C_RED"   "$C_RESET" "$*" >&2; }
 
+# _prompt_ysa <question> — one per-item interactive gate, FULLY annotated so
+# the choices are never cryptic. Prints '<question>  [Y]es / [s]kip / [a]bort:'
+# to the tty and reads one answer. Returns 0=yes (Enter/y), 1=skip (s),
+# 2=abort (a, anything else, or EOF — the caller does its own cleanup).
+_prompt_ysa() {
+  printf '%s  %s[Y]es%s / %s[s]kip%s / %s[a]bort%s: ' \
+    "$1" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" >/dev/tty
+  IFS= read -r _pysa </dev/tty || _pysa=a
+  _pysa=$(printf '%s' "$_pysa" | tr -d '[:space:]')
+  case "$_pysa" in
+    ''|y|Y) return 0 ;;
+    s|S)    return 1 ;;
+    *)      return 2 ;;
+  esac
+}
+
 # ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
 # run: echo command in grey at -V, then execute. Preserves exit code.
 # show: print a "would run" command in grey (always shown at callsite —
@@ -3678,7 +3694,8 @@ _FL_ORP_EOF
       fi
       echo
     fi
-    printf '  Proceed with these choices? [Y/a]: ' >/dev/tty
+    printf '  Proceed with these choices?  %s[Y]es%s / %s[a]bort%s: ' \
+      "$C_GREEN" "$C_RESET" "$C_RED" "$C_RESET" >/dev/tty
     IFS= read -r _ans </dev/tty || _ans=a
     case "$_ans" in
       a|A) echo "Aborted." >&2; return 77 ;;
@@ -3695,6 +3712,25 @@ _FL_ORP_EOF
   # PATH argument was given). Fed straight into the existing, unchanged
   # _fl_interactive_apply — forcing a mode doesn't need its own apply
   # logic, only its own way of deciding the choice per item.
+  # _fbc_gate <path> <intended-choice> <mode> — apply the --local-only filter
+  # and the -i per-item prompt to a forced-mode item. Sets _FBC_CHOICE to the
+  # choice to actually record: the intended one, or 'skip' when the item has a
+  # remote (under --local-only) or is declined (-i skip). Returns 2 to signal
+  # ABORT (-i abort). ('skip' leaves the item untouched — see the apply's
+  # per-type 'skip' cases.)
+  _fbc_gate() {
+    _FBC_CHOICE=$2
+    if [ "$_fl_local_only" = 1 ] && ! repo_is_local_only "$1"; then
+      _FBC_CHOICE=skip
+      log_dbg_med "flatten --$3: $1 has a remote (or no local repo) — skipped by --local-only"
+      return 0
+    fi
+    if [ "$_fl_interactive" = 1 ]; then
+      _prompt_ysa "flatten --$3: apply to $1?"
+      case $? in 1) _FBC_CHOICE=skip; log_medium "skip  $1" ;; 2) return 2 ;; esac
+    fi
+    return 0
+  }
   _fl_build_forced_choices() {
     _fbc_file=$1
     _fbc_mode=$2
@@ -3708,7 +3744,8 @@ _FL_ORP_EOF
         continue
       fi
       if [ "$_fbc_mode" = sidecar ]; then _ch=sidecar; else _ch=delete; fi
-      printf 'registered\t%s\t%s\n' "$_p" "$_ch" >> "$_fbc_file"
+      _fbc_gate "$_p" "$_ch" "$_fbc_mode" || return 2
+      printf 'registered\t%s\t%s\n' "$_p" "$_FBC_CHOICE" >> "$_fbc_file"
     done <<_FBC_REG_EOF
 $_fl_registered
 _FBC_REG_EOF
@@ -3730,13 +3767,15 @@ _FBC_REG_EOF
         # no flag needed.
         _ch=delete
       fi
-      printf 'embedded\t%s\t%s\n' "$_p" "$_ch" >> "$_fbc_file"
+      _fbc_gate "$_p" "$_ch" "$_fbc_mode" || return 2
+      printf 'embedded\t%s\t%s\n' "$_p" "$_FBC_CHOICE" >> "$_fbc_file"
     done <<_FBC_EMB_EOF
 $_fl_nested
 _FBC_EMB_EOF
     while IFS= read -r _p; do
       [ -n "$_p" ] || continue
-      printf 'orphan\t%s\tunstage\n' "$_p" >> "$_fbc_file"
+      _fbc_gate "$_p" unstage "$_fbc_mode" || return 2
+      printf 'orphan\t%s\t%s\n' "$_p" "$_FBC_CHOICE" >> "$_fbc_file"
     done <<_FBC_ORP_EOF
 $_fl_orphan
 _FBC_ORP_EOF
@@ -3947,6 +3986,7 @@ _FL_EMB_REALIZE_EOF
   _fl_forced_mode=""
   _fl_scope_path_raw=""
   _fl_keep=0
+  _fl_local_only=0
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3982,6 +4022,11 @@ _FL_EMB_REALIZE_EOF
           fatal "flatten: --zip is mutually exclusive with --sidecar/--merge" 64
         _fl_forced_mode=zip ;;
       -k|--keep)    _fl_keep=1 ;;
+      # --local-only: restrict to repos with NO remote configured — the ones
+      # 'st' marks with the house icon (⌂). Works with any mode; the common
+      # use is 'flatten --zip --local-only' to archive only the unpublished
+      # sidecars. (--house is an alias, for the icon.)
+      --local-only|--house|--houses) _fl_local_only=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "flatten: unknown option: $1" 64 ;;
       # A single positional PATH restricts the whole run (analyze, go,
@@ -4066,8 +4111,20 @@ _FL_EMB_REALIZE_EOF
       fi
     fi
 
+    # --local-only: keep only the repos with NO remote (⌂ in 'st').
+    if [ "$_fl_local_only" = 1 ]; then
+      _fl_zip_targets=$(printf '%s\n' "$_fl_zip_targets" | while IFS= read -r _fl_zt; do
+        [ -n "$_fl_zt" ] || continue
+        repo_is_local_only "$_fl_zt" && printf '%s\n' "$_fl_zt"
+      done)
+      if [ -z "$_fl_zip_targets" ]; then
+        log_major "flatten --zip --local-only: no local-only (⌂) repo/sidecar under $_fl_top to archive"
+        return 0
+      fi
+    fi
+
     if [ "$_fl_mode" != go ]; then
-      log_major "$_fl_top: flatten --zip plan"
+      log_major "$_fl_top: flatten --zip plan$([ "$_fl_local_only" = 1 ] && printf ' (--local-only: ⌂ only)')"
       printf '%s\n' "$_fl_zip_targets" | while IFS= read -r _fl_zt; do
         [ -n "$_fl_zt" ] || continue
         if [ -d "$_fl_zt/.git" ]; then _fl_zwhat=".git -> .git.zip"; else _fl_zwhat="$GIT_SIDECAR_DIRNAME -> $GIT_SIDECAR_DIRNAME.zip"; fi
@@ -4075,7 +4132,8 @@ _FL_EMB_REALIZE_EOF
       done
       echo
       log_major "This was analyze-only — re-run with 'go' to apply:"
-      printf '  %s>>   %s flatten go --zip%s %s%s\n' "$C_BLUE" "$US" "$([ "$_fl_keep" = 1 ] && printf ' -k')" "${_fl_scope_path:-}" "$C_RESET"
+      printf '  %s>>   %s flatten go --zip%s%s %s%s\n' "$C_BLUE" "$US" "$([ "$_fl_keep" = 1 ] && printf ' -k')" "$([ "$_fl_local_only" = 1 ] && printf ' --local-only')" "${_fl_scope_path:-}" "$C_RESET"
+      [ "$_fl_interactive" = 1 ] && log_medium "(-i: 'go -i' will ask [Y]es/[s]kip/[a]bort per repo)"
       return 0
     fi
 
@@ -4085,9 +4143,17 @@ _FL_EMB_REALIZE_EOF
     # shellcheck disable=SC2086
     set -- $_fl_zip_targets
     IFS=$_fl_oifs
-    _fl_zip_ok=0; _fl_zip_fail=0
+    _fl_zip_ok=0; _fl_zip_fail=0; _fl_zip_skip=0
     for _fl_zt in "$@"; do
       [ -n "$_fl_zt" ] || continue
+      # -i: ask per repo (one by one), FULLY annotated.
+      if [ "$_fl_interactive" = 1 ]; then
+        _prompt_ysa "flatten --zip: archive $_fl_zt?"
+        case $? in
+          1) _fl_zip_skip=$((_fl_zip_skip + 1)); log_medium "skip  $_fl_zt"; continue ;;
+          2) log_major "aborted (${_fl_zip_ok} already archived)"; return 77 ;;
+        esac
+      fi
       if _zip_gitdir "$_fl_zt" "$_fl_keep"; then
         _fl_zip_ok=$((_fl_zip_ok + 1))
         log_ok "flatten --zip: archived $_fl_zt$([ "$_fl_keep" = 1 ] && printf ' (original kept)')"
@@ -4096,7 +4162,7 @@ _FL_EMB_REALIZE_EOF
       fi
     done
     [ "$_fl_zip_fail" = 0 ] || log_fail "flatten --zip: $_fl_zip_fail target(s) failed"
-    log_major "flatten --zip: $_fl_zip_ok archived, $_fl_zip_fail failed"
+    log_major "flatten --zip: $_fl_zip_ok archived, $_fl_zip_fail failed$([ "$_fl_zip_skip" -gt 0 ] && printf ', %s skipped' "$_fl_zip_skip")"
     [ "$_fl_zip_fail" = 0 ]
     return
   fi
@@ -4447,14 +4513,18 @@ _FL_IGNCHK_ORPH_EOF
       exit 0
     fi
   elif [ -n "$_fl_forced_mode" ]; then
-    # --sidecar / --merge: bulk-apply that one choice to every item in
-    # scope (already narrowed to $_fl_scope_path above if given). Same
-    # -i also passed is a no-op here on purpose — forcing one mode
-    # everywhere leaves nothing left to prompt about per item.
-    log_major "$_fl_top: forcing --$_fl_forced_mode on $((_fl_n_registered + _fl_n_nested + _fl_n_orphan)) item(s)"
+    # --sidecar / --merge: apply that one mode across every item in scope
+    # (already narrowed to $_fl_scope_path above if given). -i asks
+    # [Y]es/[s]kip/[a]bort per item; --local-only skips items that have a
+    # remote (⌂ only) — both handled inside _fl_build_forced_choices.
+    log_major "$_fl_top: --$_fl_forced_mode on up to $((_fl_n_registered + _fl_n_nested + _fl_n_orphan)) item(s)$([ "$_fl_interactive" = 1 ] && printf ' (-i: per item)')$([ "$_fl_local_only" = 1 ] && printf ' (--local-only: ⌂ only)')"
     _fl_choices=$(mktemp "${TMPDIR:-/tmp}/${US}.flchoices.XXXXXX") || \
       fatal "flatten --$_fl_forced_mode: mktemp failed" 1
-    _fl_build_forced_choices "$_fl_choices" "$_fl_forced_mode"
+    if ! _fl_build_forced_choices "$_fl_choices" "$_fl_forced_mode"; then
+      rm -f "$_fl_choices"
+      log_major "aborted"
+      exit 77
+    fi
     _fl_index_touched=0
     _fl_interactive_apply "$_fl_choices"
     rm -f "$_fl_choices"
@@ -5314,11 +5384,10 @@ cmd_unflatten() {
   while IFS="$(printf '\t')" read -r _p _m; do
     [ -n "$_p" ] || continue
     if [ "$_ufl_interactive" = 1 ]; then
-      printf '%s[%s] %s%s -- proceed? [Y/s/a]: ' "$C_BOLD" "$_m" "$_p" "$C_RESET" >/dev/tty
-      IFS= read -r _ans </dev/tty || _ans=a
-      case "$_ans" in
-        s|S) log_medium "skip  $_p"; continue ;;
-        a|A) log_major "aborted"; rm -f "$_ufl_cand"; exit 77 ;;
+      _prompt_ysa "unflatten [$_m]: restore $_p?"
+      case $? in
+        1) log_medium "skip  $_p"; continue ;;
+        2) log_major "aborted"; rm -f "$_ufl_cand"; exit 77 ;;
       esac
     fi
     log_dbg_med "unflatten apply: $_p (mode=$_m)"
@@ -5783,7 +5852,8 @@ ensure_claude_setup() {
   fi
 
   if [ "$INTERACTIVE" = 1 ]; then
-    printf '    proceed with migration? [y/N]: ' >&2
+    printf '    proceed with migration?  %s[y]es%s / %s[N]o%s (default: No): ' \
+      "$C_GREEN" "$C_RESET" "$C_RED" "$C_RESET" >&2
     read -r _ans </dev/tty || _ans=n
     case "$_ans" in y|Y|yes) : ;; *) log_medium "skipped by user"; return 1 ;; esac
   fi
@@ -6345,7 +6415,7 @@ Modes:
 Options:
   go                   Actually fast-forward; otherwise analyze only.
   --fetch-only         Stop after fetch, never merge (safe to run always).
-  -i, --interactive    Prompt [Y/s/a] before each ff-merge under -R walks.
+  -i, --interactive    Prompt [Y]es / [s]kip / [a]bort before each ff-merge under -R walks.
   -R, --recursive      Walk full submodule tree TOP-DOWN (parents fetch
                        first so submodule refs resolve).
   --force              Bypass per-repo my-git-submodules.ignore markers
@@ -6401,7 +6471,7 @@ show_help_flatten() {
   cat <<EOF
 my-git flatten  (alias: fl)
 
-usage: $US [-V|-D] flatten [go] [-i] [--rm-git] [--force] [--sidecar|--merge|--zip [-k]] [path]
+usage: $US [-V|-D] flatten [go] [-i] [--local-only] [--rm-git] [--force] [--sidecar|--merge|--zip [-k]] [path]
 
 Merge every nested git repo under the CURRENT super-repo into the
 super's history as regular tracked content. Callable from anywhere
@@ -6434,19 +6504,27 @@ happens to the git dir itself. Every item is handled by exactly ONE mode:
               the 'gz' shell helper, ported in so no shell function is needed.)
 
 Choosing a mode (all three behave the same way here):
-  go --sidecar|--merge|--zip   bulk-apply that ONE mode across scope, no
+  go --sidecar|--merge|--zip   BULK-apply that ONE mode across scope, no
                                prompting. --sidecar/--merge convert every
                                nested LIVE repo (incl. registered submodules,
                                which bare 'go' leaves untouched); --zip
                                archives every existing SIDECAR under the
                                toplevel (a live nested repo is zipped only
                                when named explicitly by path).
-  -i --sidecar|--merge|--zip   same bulk behavior; -i is a no-op once a mode
-                               is forced (nothing left to ask per item).
+  go -i --sidecar|--merge|--zip
+                               instead of bulk, ask [Y]es / [s]kip / [a]bort
+                               per repo, one by one (works with EVERY mode).
   <path> --sidecar|--merge|--zip
                                restrict to just that ONE repo/sidecar
                                (embedded, registered, orphan gitlink, or an
                                existing sidecar for --zip) — see 'Scope'.
+
+Filter:
+  --local-only  (alias --house)  restrict to repos with NO remote — the ones
+                                 'st' marks with the house icon (⌂). Works
+                                 with any mode; the typical use is
+                                 'flatten go --zip --local-only' to archive
+                                 only the unpublished sidecars.
 
 With NO mode flag, bare 'flatten' decides --sidecar vs --merge per item for
 the nested live repos it finds (never --zip — that stays opt-in). Each mode
@@ -6611,8 +6689,9 @@ processes all three marker kinds unless restricted to one with a flag.
 Modes:
   default (no 'go')   ANALYZE — print the plan (which paths, which
                       mechanism). No writes of any kind.
-  go                  APPLY.
-  go -i               confirm [Y]es/[S]kip/[A]bort per item.
+  go                  APPLY (bulk — all discovered items, no prompting).
+  go -i               instead of bulk, ask [Y]es / [s]kip / [a]bort per
+                      repo, one by one (works with EVERY mode).
 
 Bulk (no PATH): both modes are discoverable via their own on-disk
 marker — sidecars via GIT_SIDECAR_DIRNAME (same listing 'my-git st' uses
@@ -11269,6 +11348,41 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_flatten_zip_local_only() {
+    # --local-only restricts --zip to repos with NO remote (⌂ in st): a
+    # sidecar WITH a remote is left alone, only the local-only one archived.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && mkdir loc && cd loc && git init -q && git config user.email t@t.com \
+        && git config user.name t && echo a > f && git add f && git commit -qm x )   # no remote
+    ( cd top && git clone -q ../kid_o pub >/dev/null 2>&1 )                            # has origin
+    cd top || return 1
+    _rt_ok "sidecar loc" _rt_my_git flatten go loc --sidecar || return 1
+    _rt_ok "sidecar pub" _rt_my_git flatten go pub --sidecar || return 1
+    _rt_ok "flatten --zip --local-only go" _rt_my_git flatten go --zip --local-only || return 1
+    _rt_exists "local-only sidecar archived" loc/.git.real.zip || return 1
+    _rt_absent "published sidecar NOT archived" pub/.git.real.zip || return 1
+    _rt_isdir "published sidecar still live" pub/.git.real || return 1
+    return 0
+  }
+
+  test_flatten_sidecar_local_only() {
+    # --local-only also restricts a FORCED --sidecar to no-remote nested repos.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && mkdir locp && cd locp && git init -q && git config user.email t@t.com \
+        && git config user.name t && echo a > f && git add f && git commit -qm x )   # embedded, no remote
+    ( cd top && git clone -q ../kid_o pubp >/dev/null 2>&1 )                           # embedded, has origin
+    cd top || return 1
+    _rt_ok "flatten --sidecar --local-only go" _rt_my_git flatten go --sidecar --local-only || return 1
+    _rt_isdir "local-only repo sidecared" locp/.git.real || return 1
+    _rt_exists "published repo left live" pubp/.git || return 1
+    _rt_absent "published repo NOT sidecared" pubp/.git.real || return 1
+    return 0
+  }
+
   test_flatten_hints_zip_when_nothing_to_flatten() {
     # bare 'flatten' with nothing to sidecar/merge must still SURFACE the
     # --zip archive option (existing sidecars) and, once something is zipped,
@@ -11337,7 +11451,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
