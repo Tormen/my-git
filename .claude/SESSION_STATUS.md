@@ -429,14 +429,34 @@ flat `src/<path>` from bulk discovery).
     test_sm_converts_published_sidecar_skips_local_only,
     test_sm_operates_on_sidecared_parent. Suite now **60**, all passing.
 
+## DONE — `audit` + `repair --sidecar` (commits fd10a2f, 352de41)
+- **`my-git audit [--claude] [--sidecar] [-R] [PATH]`** (read-only) and
+  **`my-git repair --sidecar [go] [-R] [PATH]`** (analyze by default, `go`
+  applies). Shared engine `_do_sidecar_audit <top> <apply>`. `audit
+  --claude` delegates to `claude-check`; no-flag audit runs both.
+  Detects/repairs four legacy sidecar faults:
+    (A) `**/.git.real` missing from tracked `.gitignore` → add + commit.
+    (B) sidecar object-DB tracked as content in the parent → `git rm
+        --cached` + plain commit (index-only; guarded by a pre-staged
+        check so it SKIPs rather than sweep the user's staged work).
+    (C) absolute, non-portable `core.worktree` → rewrite to `..`.
+    (D) empty sidecar (0 commits) → flag only, never auto-fixed.
+  Two correctness fixes en route (each with a regression test):
+    * `list_realized_dirs` gained a `collapse` arg — its old
+      unconditional is_under() collapse silently DROPPED nested sidecars
+      (src is a sidecar AND src/sh/my-git is one), so audit/repair/bulk-
+      unflatten/sm only saw the outermost. Default is now the FULL list;
+      only `st`'s tree renderer asks for `collapse` (else nested sidecars
+      double as flat top-level rows). Test: test_st_nested_sidecar_not_doubled.
+    * fix (B) index-only commit: `git commit -- <dir>` takes the WORKTREE
+      view (files still on disk) and commits nothing → plain index commit
+      instead. Test: test_repair_sidecar_does_not_sweep_pre_staged_work.
+  Verified on real /Users/us/global (32 sidecars): all four faults found;
+  repair fixes A/B/C, leaves 1080 unrelated dirty paths untouched, keeps
+  internals on disk; re-audit clean. Tests: test_audit_and_repair_sidecar_setup,
+  test_audit_sidecar_flags_empty_sidecar. Suite now **73**, all passing.
+
 ## Still PENDING (approved, not yet built)
-- **`my-git repair --sidecar -R`**: repair legacy sidecar setup issues
-  found by the audit (see below) — add the `**/.git.real` tracked
-  exclude; `git rm --cached` any sidecar whose `.git.real` internals got
-  committed as content (1 found: `src/sh/my-git`); fix a non-portable
-  absolute `core.worktree` (found on `src/.git.real`); flag empty
-  sidecars (0 commits — found: `src/sh/lc`). 31/32 sidecars on the real
-  tree are just missing the exclude (show as `??` clutter).
 - **`/learn` shallow-discovery**: bare `my-git` from inside a FOREIGN
   (non-$GIT_REPOS) repo stays shallow (no nested/sidecar discovery)
   unless `-R`. User noticed `my-git` from `/Users/us/learn` doesn't list
