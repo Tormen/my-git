@@ -5791,7 +5791,6 @@ Subcommands:
   unflatten | unfl         Reverse of flatten — rebuild a live .git (--sidecar exact, --merge best-effort)
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
-  claude-check             Audit .claude/ setup (read-only by default)
   audit                    Read-only health checks (--claude and/or --sidecar)
   repair                   Fix sidecar setup problems (--sidecar; analyze, 'go' to apply)
   help                     Show this help
