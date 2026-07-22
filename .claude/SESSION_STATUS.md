@@ -398,3 +398,48 @@ repos confirmed working (empty remote captured, `[merged]` tag shown).
 Known cosmetic `st` issue (NOT yet fixed): a `[merged]` repo nested
 under a `[sidecar]` can appear twice in the tree (once nested, once as a
 flat `src/<path>` from bulk discovery).
+
+## sm: PATH-scoping + sidecar-awareness + sidecar->submodule conversion
+
+26. **sm is now sidecar-aware, path-scopable, and converts sidecars.**
+    - **Sidecar-aware parent**: at the top of `_sm_run_here`, if the
+      scope's repo is a sidecar (GIT_SIDECAR_DIRNAME, no live `.git`),
+      set GIT_DIR/GIT_WORK_TREE to it (unset first so an outer sidecar's
+      value can't leak into a child with its own `.git`). Every git call
+      in that scope then transparently operates on `.git.real` — same
+      idea as the zshrc `git()` wrapper. Verified: `git submodule add`
+      registers correctly into a sidecared parent's index + worktree
+      `.gitmodules`. This is what lets `sm` register a nested repo into a
+      sidecared `src`.
+    - **PATH-scoping**: `sm <path> go` / `sm go <path>` (path before or
+      after `go`) scopes to just that nested repo, like `flatten <path>`
+      — captured as a positional arg, resolved to toplevel-relative,
+      filters the candidate list.
+    - **Sidecar → submodule**: a pre-pass before candidate discovery
+      restores publishable sidecars live (implicit `unflatten --sidecar`)
+      so the normal register flow picks them up; bulk `sm go` converts
+      ALL publishable sidecars (user's explicit choice: "more consistent
+      and intuitive"). A LOCAL-ONLY sidecar (no remote, ⌂) can't be a
+      submodule (git needs a URL) → left as a sidecar with a clear note.
+      Analyze/dry mode reports WOULD-convert without touching anything.
+      Real-world verified on the copy's sidecared `src`: correctly reads
+      each sidecar's actual origin URL, flags `icfp` local-only, lists
+      the GitHub-published ones as convertible.
+    Tests: test_sm_path_scoped_registers_only_target,
+    test_sm_converts_published_sidecar_skips_local_only,
+    test_sm_operates_on_sidecared_parent. Suite now **60**, all passing.
+
+## Still PENDING (approved, not yet built)
+- **`my-git repair --sidecar -R`**: repair legacy sidecar setup issues
+  found by the audit (see below) — add the `**/.git.real` tracked
+  exclude; `git rm --cached` any sidecar whose `.git.real` internals got
+  committed as content (1 found: `src/sh/my-git`); fix a non-portable
+  absolute `core.worktree` (found on `src/.git.real`); flag empty
+  sidecars (0 commits — found: `src/sh/lc`). 31/32 sidecars on the real
+  tree are just missing the exclude (show as `??` clutter).
+- **`/learn` shallow-discovery**: bare `my-git` from inside a FOREIGN
+  (non-$GIT_REPOS) repo stays shallow (no nested/sidecar discovery)
+  unless `-R`. User noticed `my-git` from `/Users/us/learn` doesn't list
+  its 6 `.git.real` sidecars. Decide whether sidecar/merged markers
+  should show even in shallow foreign scope (cheap, informative) vs
+  keeping the current perf-motivated shallow default.

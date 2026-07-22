@@ -6049,9 +6049,9 @@ show_help_submodules() {
   _sm_usage 2>/dev/null || cat <<EOF
 my-git submodules  (aliases: sub, sm)
 
-usage: $US sm [opts]                     (analyze; compact one-line output)
-       $US sm [-T|--dry|--try]           (preview)
-       $US sm go [--force]               (apply)
+usage: $US sm [opts] [PATH]              (analyze; compact one-line output)
+       $US sm [-T|--dry|--try] [PATH]    (preview)
+       $US sm go [--force] [PATH]        (apply)
        $US sm --list-ignored             (audit ignored nested repos)
        $US sm --clean-leftovers          (resolve .preexisting.* leftovers)
        $US sm --clean-stale              (remove ONLY stale registrations)
@@ -6061,6 +6061,17 @@ usage: $US sm [opts]                     (analyze; compact one-line output)
 
 Merged from the standalone my-git-submodules.sh tool. Run from the top of a
 super-repo to register nested .git trees as proper submodules.
+
+A single positional PATH scopes the run to just that one nested repo
+(like 'flatten <path>'), before OR after 'go':
+   $US sm go sh/my-git      ==   $US sm sh/my-git go
+
+Sidecar → submodule: 'sm go' also CONVERTS sidecars (GIT_SIDECAR_DIRNAME)
+into submodules — it restores the sidecar live (implicit
+'unflatten --sidecar') and registers it. A LOCAL-ONLY sidecar (no remote,
+shown as ⌂ in 'st') can't be a submodule (git needs a URL), so it's left
+as a sidecar. sm is also SIDECAR-AWARE of the enclosing repo: it works
+even when the super-repo itself is a sidecar (operates via its .git.real).
 
 Options:
   -D, --debug        set -x plus extra diagnostics
@@ -6956,6 +6967,7 @@ _sm_run_here() {
   _sm_sync_gitignore=0
   _sm_emit_gitignore=0
   _sm_unstage_embedded=0
+  _sm_scope_path_raw=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -6977,10 +6989,36 @@ _sm_run_here() {
       -h|--help)             show_help submodules; exit 0 ;;
       --)                    shift; break ;;
       -*)                    printf 'Unknown option: %s\n\n' "$1" >&2; show_help submodules >&2; exit 2 ;;
-      *)                     printf 'Unexpected argument: %s\n\n' "$1" >&2; show_help submodules >&2; exit 2 ;;
+      # A single positional PATH scopes the whole run to just that one
+      # nested repo (mirrors 'flatten <path>'). Works before OR after
+      # 'go' ('sm sh/my-git go' == 'sm go sh/my-git'). Resolved to a
+      # toplevel-relative path once the toplevel is known, below.
+      *)                     [ -n "$_sm_scope_path_raw" ] && {
+                               printf 'sm: only one path argument is supported (got %s and %s)\n\n' "$_sm_scope_path_raw" "$1" >&2
+                               show_help submodules >&2; exit 2
+                             }
+                             _sm_scope_path_raw=$1 ;;
     esac
     shift
   done
+
+  # ─── Sidecar-awareness ───
+  # If THIS scope's repo is a sidecar (GIT_SIDECAR_DIRNAME present, no
+  # live .git), point git at it for the whole run — same idea as the
+  # zshrc git() wrapper, but via GIT_DIR/GIT_WORK_TREE so every git call
+  # here (bare or via _sm_safe_git) transparently operates on the
+  # sidecar. UNSET first so a value leaked in from an OUTER sidecar
+  # scope can't bleed into a child that has its own live .git (each
+  # recursion re-enters _sm_run_here and re-detects). Verified: with
+  # these set, 'git submodule add' registers correctly into a sidecared
+  # parent's .git.real index + worktree .gitmodules.
+  unset GIT_DIR GIT_WORK_TREE
+  _sm_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  if [ -d "$_sm_grd" ] && [ ! -e ".git" ]; then
+    GIT_DIR="$(pwd -P)/$_sm_grd"; GIT_WORK_TREE="$(pwd -P)"
+    export GIT_DIR GIT_WORK_TREE
+    log_dbg_med "sm: this scope is a SIDECAR — operating via GIT_DIR=$GIT_DIR GIT_WORK_TREE=$GIT_WORK_TREE"
+  fi
 
   # ─── Super-repo sanity ───
   _sm_safe_git "$(pwd -P)" rev-parse --show-toplevel >/dev/null 2>&1 || {
@@ -6991,6 +7029,25 @@ _sm_run_here() {
   if [ "$_sm_toplevel" != "$(pwd -P)" ]; then
     printf 'error: run this from the super-repo root (%s)\n' "$_sm_toplevel" >&2
     exit 1
+  fi
+
+  # Resolve a PATH argument (if given) to a CWD-relative, normalized
+  # form for filtering the candidate list below. Accepts an absolute
+  # path under the toplevel or a plain relative path; strips any leading
+  # './' and trailing '/'. '_sm_scope_rel' empty means "whole repo".
+  _sm_scope_rel=""
+  if [ -n "$_sm_scope_path_raw" ]; then
+    _sm_scope_abs=$(cd "$_sm_scope_path_raw" 2>/dev/null && pwd -P) || \
+      fatal "sm: '$_sm_scope_path_raw': no such directory" 1
+    case "$_sm_scope_abs" in
+      "$_sm_toplevel")
+        fatal "sm: '$_sm_scope_path_raw' is the super-repo root itself, not a nested repo" 64 ;;
+      "$_sm_toplevel"/*)
+        _sm_scope_rel=${_sm_scope_abs#"$_sm_toplevel"/} ;;
+      *)
+        fatal "sm: '$_sm_scope_path_raw' is not inside $_sm_toplevel" 64 ;;
+    esac
+    log_dbg_med "sm: scoped to path '$_sm_scope_rel'"
   fi
 
   # ─── leftovers / clean-leftovers ───
@@ -7238,8 +7295,44 @@ _CS_EOF
   }
   trap _sm_cleanup EXIT INT TERM HUP
 
+  # ─── Sidecar → submodule pre-conversion ───
+  # A sidecar (GIT_SIDECAR_DIRNAME) is normally "plain content, nothing
+  # to register". But 'sm' can convert it INTO a submodule: restore it
+  # live first ('unflatten --sidecar'), after which the normal
+  # find/register flow below picks it up like any nested repo. A
+  # LOCAL-ONLY sidecar (no remote) CANNOT be a submodule — git needs a
+  # URL to record — so it's left as a sidecar with a clear note. In
+  # analyze/dry mode nothing is restored; we just report what 'go' would
+  # convert. Respects PATH-scoping (only the scoped sidecar, if any).
+  _sm_sidecars=$(list_realized_dirs .)
+  if [ -n "$_sm_scope_rel" ]; then
+    _sm_sidecars=$(printf '%s\n' "$_sm_sidecars" | grep -Fx "$_sm_scope_rel" 2>/dev/null || true)
+  fi
+  if [ -n "$_sm_sidecars" ]; then
+    printf '%s\n' "$_sm_sidecars" | while IFS= read -r _scp; do
+      [ -n "$_scp" ] || continue
+      _scp_url=$(git --git-dir="$_scp/$_sm_grd" config --get remote.origin.url 2>/dev/null)
+      if [ -z "$_scp_url" ]; then
+        log_major "sm: $_scp is a LOCAL-ONLY sidecar (no remote URL) — cannot become a submodule; left as a sidecar (⌂)"
+        continue
+      fi
+      if [ "$_sm_mode" = go ]; then
+        log_major "sm: converting sidecar $_scp → live .git (unflatten --sidecar) so it can be registered as a submodule (remote: $_scp_url)"
+        _unfl_restore_sidecar "$_scp" || log_error "sm: could not restore sidecar $_scp — leaving it as-is"
+      else
+        log_major "sm: WOULD convert sidecar $_scp → submodule (has remote $_scp_url) — re-run with 'go'"
+      fi
+    done
+  fi
+
   find . -mindepth 2 -name .git \( -type d -o -type f \) \
        -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_sm_tmpfile"
+  # PATH-scoping: keep only the candidate AT the scoped path (its own
+  # './<path>/.git') — descendants of it are that repo's own concern.
+  if [ -n "$_sm_scope_rel" ]; then
+    grep -Fx "./$_sm_scope_rel/.git" "$_sm_tmpfile" > "$_sm_tmpfile.scoped" 2>/dev/null || : > "$_sm_tmpfile.scoped"
+    mv "$_sm_tmpfile.scoped" "$_sm_tmpfile"
+  fi
   _sm_total=$(wc -l < "$_sm_tmpfile" | tr -d ' ')
 
   _sm_c_registered=0; _sm_c_ready=0; _sm_c_need_untrack=0; _sm_c_no_url=0; _sm_c_dirty=0
@@ -8884,6 +8977,73 @@ _RT_CONF_EOF
     return 0
   }
 
+  test_sm_path_scoped_registers_only_target() {
+    # 'sm go <path>' (or 'sm <path> go') registers ONLY that nested repo,
+    # like 'flatten <path>' — not every nested repo in the tree.
+    _rt_repo_file a_o a.txt
+    _rt_repo_file b_o b.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../a_o kidA >/dev/null 2>&1 && git clone -q ../b_o kidB >/dev/null 2>&1 )
+    cd global || return 1
+    _rt_ok "sm go kidA (path-scoped)" _rt_my_git sm go kidA || return 1
+    grep -q 'kidA' .gitmodules 2>/dev/null || { _rt_fail "kidA should be registered"; return 1; }
+    if grep -q 'kidB' .gitmodules 2>/dev/null; then
+      _rt_fail "kidB must NOT be registered — the run was scoped to kidA"; return 1
+    fi
+    # path BEFORE 'go' works too
+    _rt_ok "sm kidB go (path before go)" _rt_my_git sm kidB go || return 1
+    grep -q 'kidB' .gitmodules 2>/dev/null || { _rt_fail "kidB should now be registered"; return 1; }
+    return 0
+  }
+
+  test_sm_converts_published_sidecar_skips_local_only() {
+    # 'sm go' converts a PUBLISHED sidecar (has a remote) into a submodule
+    # by implicitly restoring it live (unflatten --sidecar) then
+    # registering it. A LOCAL-ONLY sidecar (no remote) cannot be a
+    # submodule (git needs a URL), so it's left as a sidecar, untouched.
+    _rt_repo_file pub_o p.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../pub_o published >/dev/null 2>&1
+      git init -q localonly && ( cd localonly && echo l > l.txt && git add l.txt && git commit -q -m l ) )
+    cd global || return 1
+    _rt_ok "sidecar published" _rt_my_git flatten go published --sidecar || return 1
+    _rt_ok "sidecar localonly" _rt_my_git flatten go localonly --sidecar || return 1
+    _rt_isdir "published is a sidecar" published/.git.real || return 1
+    _rt_isdir "localonly is a sidecar" localonly/.git.real || return 1
+    _rt_ok "sm go converts publishable sidecars" _rt_my_git sm go || return 1
+    # published: sidecar -> live .git -> registered submodule
+    _rt_absent "published .git.real removed (converted)" published/.git.real || return 1
+    _rt_isdir "published now has a live .git" published/.git || return 1
+    grep -q 'published' .gitmodules 2>/dev/null || { _rt_fail "published should be a registered submodule now"; return 1; }
+    # localonly: left as a sidecar, NOT registered
+    _rt_isdir "localonly still a sidecar (left alone)" localonly/.git.real || return 1
+    if grep -q 'localonly' .gitmodules 2>/dev/null; then
+      _rt_fail "localonly (no remote) must NOT be registered as a submodule"; return 1
+    fi
+    return 0
+  }
+
+  test_sm_operates_on_sidecared_parent() {
+    # sm must work when the ENCLOSING repo is ITSELF a sidecar (its git
+    # dir is .git.real, no live .git). sm points git at the sidecar via
+    # GIT_DIR/GIT_WORK_TREE (like the zshrc git() wrapper) and registers
+    # a nested repo into the sidecar's own .gitmodules + index.
+    _rt_repo_file kid_o k.txt
+    _rt_repo parent
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd parent && git clone -q ../kid_o kid >/dev/null 2>&1
+      mv .git .git.real && git --git-dir=.git.real config core.worktree .. )
+    cd parent || return 1
+    _rt_absent "parent has no live .git (it's a sidecar)" .git || return 1
+    _rt_ok "sm go on a sidecared parent" _rt_my_git sm go || return 1
+    grep -q 'kid' .gitmodules 2>/dev/null || { _rt_fail "kid should be registered into the sidecared parent"; return 1; }
+    _rt_m=$(git --git-dir=.git.real ls-files -s -- kid 2>/dev/null | awk '{print $1}')
+    [ "$_rt_m" = 160000 ] || { _rt_fail "kid should be a gitlink (160000) in the sidecar's index, got '$_rt_m'"; return 1; }
+    return 0
+  }
+
   test_flatten_subdir_invocation() {
     _rt_repo_file sub-o x.txt
     _rt_repo parent
@@ -9999,7 +10159,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
