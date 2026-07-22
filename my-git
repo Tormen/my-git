@@ -3960,13 +3960,15 @@ _FL_EMB_REALIZE_EOF
       -i|--interactive) _fl_interactive=1; require_tty flatten ;;
       --rm-git)     _fl_rmgit=1 ;;
       --force)      _fl_force=1 ;;
-      # --sidecar / --merge: force ONE of flatten's two modes (see the
-      # README's "flatten: two modes" section) instead of the normal
-      # per-type/per-item defaults. With 'go' alone: bulk-applies to
-      # EVERY nested repo in scope, no prompting. With '-i' too: forced
-      # mode replaces per-item prompting entirely (there's nothing left
-      # to ask once one mode is forced everywhere). With a PATH
-      # argument: scopes to just that one nested repo (see below).
+      # --sidecar / --merge / --zip: force ONE of flatten's THREE EQUAL modes
+      # (see 'my-git --help flatten' / README) instead of the normal per-item
+      # defaults. With 'go' alone: bulk-applies
+      # that ONE mode across scope, no prompting. With '-i' too: the forced
+      # mode replaces per-item prompting entirely (nothing left to ask once a
+      # mode is forced everywhere). With a PATH: scopes to just that one repo.
+      # All three keep the nested files as parent content and differ only in
+      # what happens to the git dir: --merge leaves/deletes it, --sidecar
+      # relocates it to GIT_SIDECAR_DIRNAME, --zip archives it to a .zip.
       --sidecar)
         [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != sidecar ] && \
           fatal "flatten: --sidecar / --merge / --zip are mutually exclusive" 64
@@ -3975,10 +3977,6 @@ _FL_EMB_REALIZE_EOF
         [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != merge ] && \
           fatal "flatten: --sidecar / --merge / --zip are mutually exclusive" 64
         _fl_forced_mode=merge ;;
-      # --zip: a THIRD flatten mode — archive the git dir into a compact
-      # .git.zip / GIT_SIDECAR_DIRNAME.zip that the parent tracks as content
-      # ('st' shows the dir as [zipped]). Reverse with 'unflatten --zip'.
-      # Ported into my-git (no dependency on the gz/gu shell helpers).
       --zip)
         [ -n "$_fl_forced_mode" ] && [ "$_fl_forced_mode" != zip ] && \
           fatal "flatten: --zip is mutually exclusive with --sidecar/--merge" 64
@@ -4314,30 +4312,44 @@ _FL_IGNCHK_ORPH_EOF
      && { [ "$_fl_n_registered" -eq 0 ] || { [ "$_fl_interactive" != 1 ] && [ -z "$_fl_forced_mode" ] && [ "${AUTO_SIDECAR_SUBMODULES:-0}" != 1 ]; }; }; then
     _fl_n_ign_nested=$(printf '%s' "$_fl_ignored_nested" | grep -c .)
     _fl_n_ign_reg=$(printf '%s' "$_fl_ignored_registered" | grep -c .)
-    if [ "$((_fl_n_ign_nested + _fl_n_ign_reg))" -gt 0 ]; then
-      log_major "$_fl_top: nothing to flatten ($((_fl_n_ign_nested + _fl_n_ign_reg)) marked my-git-submodules.ignore, left untouched — --force to include)"
-    else
-      log_major "$_fl_top: nothing to flatten (no embedded nested .git, no orphan gitlinks)"
-    fi
-    if [ "$_fl_n_registered" -gt 0 ]; then
-      _fl_warn_registered
-    fi
-    # Nothing to sidecar/merge — but the tree may still hold SIDECARS that can
-    # be archived ('flatten --zip') or ZIPPED dirs that can be restored
-    # ('unflatten --zip'). Surface those so "nothing to flatten" doesn't hide
-    # the other flatten/unflatten actions actually available here.
+    # flatten has THREE equal modes. --sidecar and --merge convert a nested
+    # LIVE repo (none found — that's why we're here); --zip additionally
+    # archives an existing SIDECAR. So present all three on equal footing,
+    # with counts, rather than "nothing to flatten" (which is only true for
+    # --sidecar/--merge) plus --zip as an afterthought.
     _fl_hint_sc=$(list_realized_dirs "$_fl_top" | grep -c .)
     _fl_hint_zip=$(list_zipped_dirs "$_fl_top" | grep -c .)
-    if [ "${_fl_hint_sc:-0}" -gt 0 ] || [ "${_fl_hint_zip:-0}" -gt 0 ]; then
-      echo
-      log_major "Other actions available in this tree:"
-      [ "${_fl_hint_sc:-0}" -gt 0 ] && \
-        printf '  %s>> %s sidecar(s) can be ARCHIVED to .zip:  %s flatten --zip go   (or: flatten --zip <path>)%s\n' \
-          "$C_BLUE" "$_fl_hint_sc" "$US" "$C_RESET"
-      [ "${_fl_hint_zip:-0}" -gt 0 ] && \
-        printf '  %s>> %s zipped dir(s) can be RESTORED:       %s unflatten --zip go   (or: unflatten --zip <path>)%s\n' \
-          "$C_BLUE" "$_fl_hint_zip" "$US" "$C_RESET"
+    _fl_ign_total=$((_fl_n_ign_nested + _fl_n_ign_reg))
+    if [ "${_fl_hint_sc:-0}" -eq 0 ] && [ "${_fl_hint_zip:-0}" -eq 0 ]; then
+      # Truly nothing — no candidates for ANY mode.
+      if [ "$_fl_ign_total" -gt 0 ]; then
+        log_major "$_fl_top: nothing to flatten ($_fl_ign_total marked my-git-submodules.ignore, left untouched — --force to include)"
+      else
+        log_major "$_fl_top: nothing to flatten (no nested live repos, no sidecars)"
+      fi
+      [ "$_fl_n_registered" -gt 0 ] && _fl_warn_registered
+      exit 0
     fi
+    log_major "$_fl_top: flatten — by mode"
+    printf '  %s>> --merge   :  0   convert a nested live repo   (none found here)%s\n' "$C_BLUE" "$C_RESET"
+    printf '  %s>> --sidecar :  0   convert a nested live repo   (none found here)%s\n' "$C_BLUE" "$C_RESET"
+    if [ "${_fl_hint_sc:-0}" -gt 0 ]; then
+      printf '  %s>> --zip     : %2s   archive existing sidecar(s)  ->  %s flatten --zip go   (or: flatten --zip <path>)%s\n' \
+        "$C_BLUE" "$_fl_hint_sc" "$US" "$C_RESET"
+    else
+      printf '  %s>> --zip     :  0   archive a repo/sidecar       (none found here)%s\n' "$C_BLUE" "$C_RESET"
+    fi
+    if [ "$_fl_ign_total" -gt 0 ]; then
+      printf '  %s>> (%s nested repo(s) marked my-git-submodules.ignore, left untouched — --force to include)%s\n' \
+        "$C_BLUE" "$_fl_ign_total" "$C_RESET"
+    fi
+    if [ "${_fl_hint_zip:-0}" -gt 0 ]; then
+      echo
+      log_major "$_fl_top: unflatten — by mode"
+      printf '  %s>> --zip     : %2s   restore zipped dir(s)        ->  %s unflatten --zip go   (or: unflatten --zip <path>)%s\n' \
+        "$C_BLUE" "$_fl_hint_zip" "$US" "$C_RESET"
+    fi
+    [ "$_fl_n_registered" -gt 0 ] && _fl_warn_registered
     exit 0
   fi
 
@@ -4988,9 +5000,9 @@ _FL_EOF
 # ═══ UNFLATTEN (reverse of flatten: rebuild a live .git) ═══════════════════
 # ═════════════════════════════════════════════════════════════════════════
 #
-# my-git unflatten [go|-T] [-i] [--sidecar|--merge] [path]
+# my-git unflatten [go|-T] [-i] [--sidecar|--merge|--zip [-k]] [path]
 #
-# Inverse of flatten's two modes:
+# Inverse of flatten's THREE EQUAL modes:
 #   --sidecar   exact, lossless restore: $GIT_SIDECAR_DIRNAME -> .git, plus
 #               core.worktree/core.bare unset (realize's own overrides —
 #               correct only for its relocated position, not needed once
@@ -5006,8 +5018,13 @@ _FL_EOF
 #               gone for good. Bulk-discoverable via its .git.merged
 #               marker (list_merged_dirs), same as sidecars via
 #               list_realized_dirs.
-# With no --sidecar/--merge and a PATH given, the mode is auto-detected
-# from what's actually on disk at that path.
+#   --zip       exact, lossless restore: .git.zip -> .git (or
+#               $GIT_SIDECAR_DIRNAME.zip -> the sidecar), then the .zip is
+#               removed (-k keeps it). Bulk-discoverable via its .git*.zip
+#               marker (list_zipped_dirs).
+# With no mode flag and a PATH given, the mode is auto-detected from what's
+# actually on disk at that path (.git*.zip -> zip, sidecar dir -> sidecar,
+# else merge). Bulk (no path) processes all three unless a flag restricts it.
 _unfl_restore_sidecar() {
   _urs_path=$1
   _urs_src="$_urs_path/$GIT_SIDECAR_DIRNAME"
@@ -6072,9 +6089,9 @@ Subcommands:
   pull | pl                Fetch + fast-forward merge (analyze / 'go'; -R top-down)
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
-  flatten | fl             Merge nested repos into outer as content — merge (.git kept/deleted),
-                           sidecar (.git.real, history kept), or --zip (archive git dir to .zip)
-  unflatten | unfl         Reverse of flatten — rebuild a live .git (--sidecar/--merge/--zip; auto-detects)
+  flatten | fl             Nested repo -> parent content; 3 equal modes for its git dir:
+                           --merge (kept/deleted) / --sidecar (.git.real, history kept) / --zip (archived)
+  unflatten | unfl         Reverse of flatten — rebuild a live .git (--merge/--sidecar/--zip; auto-detects)
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
   audit                    Read-only health checks (--claude and/or --sidecar)
@@ -6390,53 +6407,50 @@ Merge every nested git repo under the CURRENT super-repo into the
 super's history as regular tracked content. Callable from anywhere
 inside the repo (auto-scopes to the toplevel).
 
-Two modes, one shared first step (merge the nested repo's files into
-the parent as tracked content) — every choice below is one or the
-other, never both:
-  merge     the nested .git stays live in place, or is deleted. This is
-            the default treatment for embedded repos and the 'flatten'/
-            'delete' choices for registered submodules.
-  sidecar   the nested .git is RELOCATED (not deleted) into a self-
-            contained GIT_SIDECAR_DIRNAME capsule alongside the merged
-            files — full history preserved, fully usable via
-            'git --git-dir=<path>/.git.real', just no longer auto-
-            discovered by IDE/editor git integration. This is the
-            'sidecar' choice below (letter 'r', for "realize" —
-            the underlying mechanism's name, kept internally).
+THREE EQUAL modes. They share one first step — the nested repo's files
+become regular tracked content in the parent — and differ only in what
+happens to the git dir itself. Every item is handled by exactly ONE mode:
 
---sidecar / --merge force ONE of these two across every item flatten
-would otherwise decide per-type/per-item:
-  go --sidecar / go --merge   bulk-apply that ONE mode to every nested
-                              repo in scope, no prompting — including
-                              registered submodules, which bare 'go'
-                              alone leaves untouched.
-  -i --sidecar / -i --merge   same bulk behavior; -i is a no-op here on
-                              purpose (forcing one mode everywhere
-                              leaves nothing left to ask per item).
-  <path> --sidecar/--merge    restricts to just that ONE nested repo
-                              (embedded, registered, or orphan gitlink)
-                              instead of the whole tree — see 'Scope'.
+  --merge     the git dir stays LIVE in place, or is DELETED. my-git does
+              NOT preserve the pre-merge history (only what the parent's
+              own commits captured survives; 'unflatten --merge' can
+              reconstruct that much, best-effort). The historical default
+              for embedded repos and the 'flatten'/'delete' choices for
+              registered submodules.
+  --sidecar   the git dir is RELOCATED (not deleted) into a self-contained
+              GIT_SIDECAR_DIRNAME capsule beside the files — FULL history
+              preserved, usable via 'git --git-dir=<path>/.git.real', just
+              no longer IDE/editor auto-discovered. Also writes a parent-
+              tracked <path>/GIT_SIDECAR_DIRNAME.status snapshot (branch,
+              commit, remote, core.worktree/bare) so 'unflatten --sidecar'
+              restores the EXACT prior state (lossless).
+  --zip       the git dir is ARCHIVED into a compact '.git.zip' (plain repo)
+              or 'GIT_SIDECAR_DIRNAME.zip' (an existing sidecar) beside the
+              files, then removed; the parent tracks the .zip as content
+              ('$US st' shows the dir [zipped]). Lossless — integrity-checked
+              ('unzip -t') before anything is removed; tracked worktree
+              dotfiles (.gitignore, .gitmodules, …) are left in place.
+              -k/--keep also keeps the original git dir. (Same operation as
+              the 'gz' shell helper, ported in so no shell function is needed.)
 
---zip: a THIRD way to flatten — instead of relocating (sidecar) or
-deleting (merge) the git dir, ARCHIVE it into a compact '.git.zip' (plain
-repo) or 'GIT_SIDECAR_DIRNAME.zip' (sidecar) beside the worktree, then
-remove the live dir. The parent then tracks that .zip as plain content
-('$US st' shows the dir as [zipped]). This is the same operation as the
-'gz' shell helper, ported into my-git so it needs no shell function.
-  go --zip          bulk: archive EVERY sidecar under the toplevel (live
-                    nested repos are left alone — name one by path to zip it).
-  <path> --zip      archive just that one repo/sidecar (.git or the sidecar).
-  -k, --keep        keep the original git dir too (just create the .zip).
-Reverse with '$US unflatten --zip' (or bare 'unflatten', which auto-detects
-a zipped path). Restore is lossless — the archive is integrity-checked
-('unzip -t') before the original is ever removed. TRACKED worktree dotfiles
-(.gitignore, .gitmodules, …) are always left in place.
+Choosing a mode (all three behave the same way here):
+  go --sidecar|--merge|--zip   bulk-apply that ONE mode across scope, no
+                               prompting. --sidecar/--merge convert every
+                               nested LIVE repo (incl. registered submodules,
+                               which bare 'go' leaves untouched); --zip
+                               archives every existing SIDECAR under the
+                               toplevel (a live nested repo is zipped only
+                               when named explicitly by path).
+  -i --sidecar|--merge|--zip   same bulk behavior; -i is a no-op once a mode
+                               is forced (nothing left to ask per item).
+  <path> --sidecar|--merge|--zip
+                               restrict to just that ONE repo/sidecar
+                               (embedded, registered, orphan gitlink, or an
+                               existing sidecar for --zip) — see 'Scope'.
 
-When --sidecar sidecars a repo, it also writes <path>/GIT_SIDECAR_DIRNAME.status
-next to it: an ordinary, parent-tracked text file recording branch,
-commit, remote, and enough of the original git config (core.worktree/
-core.bare) for 'my-git unflatten --sidecar <path>' to restore it later
-to the EXACT same state. See 'my-git --help unflatten'.
+With NO mode flag, bare 'flatten' decides --sidecar vs --merge per item for
+the nested live repos it finds (never --zip — that stays opt-in). Each mode
+reverses with its 'unflatten' counterpart. See 'my-git --help unflatten'.
 
 Modes:
   default (no 'go')   ANALYZE — print plan (list of nested .git dirs
@@ -11266,7 +11280,11 @@ _RT_STALE_CONF_EOF
     cd top || return 1
     _rt_ok "make a sidecar" _rt_my_git flatten go sc --sidecar || return 1
     _rt_ok "bare flatten (sidecar present)" _rt_my_git flatten || return 1
-    _rt_contains "still says nothing to flatten" "$_rt_out" "nothing to flatten" || return 1
+    # harmonized: the 3 modes are presented equally (not "nothing to flatten"
+    # + --zip as an afterthought), so --sidecar/--merge/--zip all appear.
+    _rt_contains "presents modes equally" "$_rt_out" "flatten — by mode" || return 1
+    _rt_contains "lists --sidecar mode" "$_rt_out" "--sidecar" || return 1
+    _rt_contains "lists --merge mode" "$_rt_out" "--merge" || return 1
     _rt_contains "surfaces the --zip archive option" "$_rt_out" "flatten --zip go" || return 1
     # zip it, then bare flatten should surface the RESTORE option
     _rt_ok "archive it" _rt_my_git flatten go --zip sc || return 1

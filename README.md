@@ -20,18 +20,19 @@ by multiple users and nested several levels deep.
 - **`sm`** — register / rebind / clean up nested repos as proper
   submodules. **Single level by default**; pass `-R` to walk top-down
   through every registered submodule.
-- **`flatten`** — merge nested git repos into the outer repo's history
-  as plain tracked content. Two modes, one or the other per nested repo,
-  not both: **merge** (nested `.git` stays live in place, or is deleted)
-  or **sidecar** (nested `.git` is relocated into a self-contained
-  `.git.real` capsule — portable, full history preserved, but no longer
-  live/IDE-usable). `--sidecar`/`--merge` force one mode in bulk or on a
-  single path; see [`flatten`](#flatten--merge-nested-repos-into-the-outer-repo-as-content) below.
+- **`flatten`** — fold nested git repos into the outer repo's history as
+  plain tracked content. **Three equal modes**, one per nested repo,
+  differing only in what happens to its git dir: **`--merge`** (stays live
+  in place, or is deleted), **`--sidecar`** (relocated into a
+  self-contained `.git.real` capsule — portable, full history preserved,
+  but no longer live/IDE-usable), or **`--zip`** (archived into a compact
+  `.git.zip`/`.git.real.zip` and removed). Any mode can be forced in bulk
+  or on a single path; see [`flatten`](#flatten--merge-nested-repos-into-the-outer-repo-as-content) below.
 - **`unflatten`** — the reverse: rebuild a live `.git` at a nested path.
-  `--sidecar` is an exact, lossless restore; `--merge` is a best-effort
-  reconstruction from this repo's own commit history (via `git subtree
-  split`) for a path whose original `.git` was deleted. See
-  [`unflatten`](#unflatten--rebuild-a-live-git) below.
+  `--sidecar` and `--zip` are exact, lossless restores; `--merge` is a
+  best-effort reconstruction from this repo's own commit history (via `git
+  subtree split`) for a path whose original `.git` was deleted. Auto-detects
+  the mode per path. See [`unflatten`](#unflatten--rebuild-a-live-git) below.
 
 The split between "always recursive" (`st`) and "opt-in recursive"
 (`mc` / `sm`) mirrors git itself: a super-repo's index only records its
@@ -46,7 +47,7 @@ cases, and each has exactly one right answer:
 
 | # | Case | Meaning | Handling |
 |---|------|---------|----------|
-| 1 | **Archived** | Kept only for its history; never developed or pushed to again. | `.git` (or a `.git.real` sidecar, `+.status`) → a single `.zip` via the `gz` / `gu` shell aliases (`etc/zshrc.mine`). `-k`/`--keep` zips alongside instead of replacing. No `my-git` support needed. |
+| 1 | **Archived** | Kept only for its history; never developed or pushed to again. | `my-git flatten go <path> --zip` — archive its `.git` (or a `.git.real` sidecar, `+.status`) into a single `.zip` the parent tracks as content (`st` shows it `[zipped]`); `unflatten --zip` restores it, `-k`/`--keep` archives alongside instead of replacing. The `gz`/`gu` shell aliases (`etc/zshrc.mine`) do the same thing interactively without my-git. |
 | 2 | **Private** | Developed here, but never published outside this machine (no real origin). | `my-git flatten go` merges it into the parent as plain content and drops its `.git`. No separate history is kept — a repo that's never published shouldn't have had its own identity to begin with. |
 | 3 | **Published** | Developed here AND pushed to its own origin (e.g. GitHub). | Toggle between `flatten --sidecar` (relocate its `.git` into a self-contained `.git.real` alongside the parent-tracked files) and `unflatten --sidecar` (bring it back to its normal live `.git` to resume developing/pushing) as needed — the parent still fully captures its files either way, not just its origin URL, so a fresh clone of the parent needs no extra `submodule update` step. |
 
@@ -151,8 +152,8 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos; `-R` = top-down walk                      |
 | `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`. Settles the whole tree in one command.         |
 | `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
-| `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Merge nested repos into outer as content; per nested repo, either merge (`.git` kept live or deleted) or sidecar (`.git.real`, history preserved); `-i`/`--sidecar`/`--merge`/PATH for per-item or forced-mode control |
-| `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar` exact, `--merge` best-effort (`git subtree split`) |
+| `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir: `--merge` (kept live/deleted), `--sidecar` (`.git.real`, history preserved), `--zip` (archived to `.git.zip`/`.git.real.zip`); `-i`/PATH for per-item or forced-mode control |
+| `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip` exact, `--merge` best-effort (`git subtree split`); auto-detects the mode per path |
 | `claude-check`  |                | always    | Audit `.claude/` symlink convention (read-only by default)                        |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
@@ -366,25 +367,40 @@ my-git flatten go                    # apply
 my-git flatten go -i                 # per-item: choose what happens to each nested repo
 my-git flatten go --sidecar          # bulk: force sidecar mode on EVERY nested repo in scope
 my-git flatten go --merge            # bulk: force merge mode on EVERY nested repo in scope
-my-git flatten go <path> --sidecar   # scope to just ONE nested repo (embedded, registered, or orphan)
+my-git flatten go --zip              # bulk: archive EVERY existing sidecar to a .zip
+my-git flatten go <path> --sidecar   # scope to just ONE repo/sidecar (also --merge / --zip)
 ```
 
-`flatten` is really two modes sharing one first step (merging the nested
-repo's files into the parent as tracked content): **merge** — the nested
-`.git` is DELETED (a `.git.merged` snapshot is written first — branch,
-commit, remote, full config, and any `.git*` convention files like
-`.gitignore`/`.gitattributes`/`.gitmodules`, captured then removed, since
-they'd otherwise silently govern a git identity that no longer exists
-here) — and **sidecar** — the `.git` is relocated (not deleted) into a
-self-contained `.git.real` capsule that keeps its full history, plus a
-`.git.real.status` snapshot for quick reference. Bare `go` (no forced
-mode) still defaults to keeping an embedded repo's `.git` live in place;
-`--merge` always deletes. The choice tables below say which letter maps
-to which.
+`flatten` has **three equal modes**. They share one first step — the
+nested repo's files become tracked content in the parent — and differ
+only in what happens to its git dir:
 
-A path that's **already a sidecar** can be merged directly —
-`flatten <path> --merge` on a `.git.real` path converts it straight
-through, no `unflatten --sidecar` round trip needed first.
+- **`--merge`** — the `.git` is DELETED (a `.git.merged` snapshot is
+  written first — branch, commit, remote, full config, and any `.git*`
+  convention files like `.gitignore`/`.gitattributes`/`.gitmodules`,
+  captured then removed, since they'd otherwise silently govern a git
+  identity that no longer exists here) — or, under bare `go` for an
+  embedded repo, left live in place. my-git does **not** preserve the
+  pre-merge history (only what the parent's own commits captured survives).
+- **`--sidecar`** — the `.git` is RELOCATED (not deleted) into a
+  self-contained `.git.real` capsule that keeps its FULL history, plus a
+  `.git.real.status` snapshot so `unflatten --sidecar` restores the exact
+  prior state.
+- **`--zip`** — the git dir is ARCHIVED into a compact `.git.zip` (plain
+  repo) or `.git.real.zip` (an existing sidecar) and removed; the parent
+  tracks the `.zip` as content and `st` shows the dir `[zipped]`. Lossless
+  (integrity-checked with `unzip -t` before anything is removed; tracked
+  worktree dotfiles left in place); `-k`/`--keep` keeps the original git
+  dir too. Same operation as the `gz` shell helper, ported into my-git so
+  it needs no shell function.
+
+Each reverses with its `unflatten` counterpart. Bare `go` (no forced mode)
+decides `--sidecar` vs `--merge` per item for the nested live repos it
+finds — never `--zip`, which stays opt-in.
+
+A path that's **already a sidecar** can be converted directly —
+`flatten <path> --merge` merges it, `flatten <path> --zip` archives it —
+no `unflatten --sidecar` round trip needed first.
 
 **Safety net for nested submodules:** if the path being merged has its
 own registered (not-yet-sidecared) sub-submodule, its real git directory
@@ -393,18 +409,19 @@ used to silently destroy that sub-submodule's entire history. `flatten`
 now detects this automatically and sidecars the sub-submodule first,
 recording the transfer in `.git.merged`, before anything is deleted.
 
-`--sidecar` / `--merge` force ONE of these two across every item flatten
-would otherwise decide per-type/per-item — including registered
-submodules, which bare `go` alone leaves untouched:
+`--sidecar` / `--merge` / `--zip` force ONE mode across every item flatten
+would otherwise decide per-item:
 
-- `go --sidecar` / `go --merge` — bulk-apply that one mode to every
-  nested repo in scope, no prompting.
-- `-i --sidecar` / `-i --merge` — same bulk behavior; `-i` is a no-op
-  here on purpose (forcing one mode everywhere leaves nothing left to
-  ask per item).
-- `<path> --sidecar` / `<path> --merge` — restricts to just that one
-  nested repo (embedded, registered submodule, or orphan gitlink)
-  instead of the whole tree.
+- `go --sidecar|--merge|--zip` — bulk-apply that one mode, no prompting.
+  `--sidecar`/`--merge` cover every nested LIVE repo (including registered
+  submodules, which bare `go` alone leaves untouched); `--zip` archives
+  every existing SIDECAR under the toplevel (a live nested repo is zipped
+  only when named explicitly by path).
+- `-i --sidecar|--merge|--zip` — same bulk behavior; `-i` is a no-op once
+  a mode is forced (nothing left to ask per item).
+- `<path> --sidecar|--merge|--zip` — restricts to just that one
+  repo/sidecar (embedded, registered submodule, orphan gitlink, or an
+  existing sidecar for `--zip`) instead of the whole tree.
 
 A nested repo carrying `.git/my-git-submodules.ignore` (the same marker
 `sm`/`mc` already honor) is left entirely untouched by default — not
@@ -541,15 +558,16 @@ someone re-added the rule by hand.
 
 ## `unflatten` — rebuild a live `.git`
 
-The reverse of `flatten`. Same two modes, same shapes (analyze/`go`/`-i`/
-PATH), but the mechanism differs sharply between them:
+The reverse of `flatten`. Same **three equal modes**, same shapes
+(analyze/`go`/`-i`/PATH), but the mechanism differs between them:
 
 ```sh
-my-git unflatten                      # analyze: every .git.real sidecar found (bulk discovery)
-my-git unflatten go                   # apply: restore every discovered sidecar
+my-git unflatten                      # analyze: every sidecar / merged / zipped path found (bulk)
+my-git unflatten go                   # apply: restore every discovered one
 my-git unflatten go -i                # confirm [Y]es/[S]kip/[A]bort per item
 my-git unflatten go <path> --sidecar  # restore just ONE sidecar
 my-git unflatten go <path> --merge    # reconstruct just ONE merged (git-deleted) path
+my-git unflatten go <path> --zip      # un-archive just ONE zipped path (or bare: auto-detected)
 ```
 
 - **`--sidecar`** — EXACT, lossless. `<path>/GIT_SIDECAR_DIRNAME` moves
@@ -573,13 +591,21 @@ my-git unflatten go <path> --merge    # reconstruct just ONE merged (git-deleted
   other means. Bulk-discoverable via its `.git.merged` marker (written
   by `flatten --merge` just before deletion, removed again once
   `unflatten` successfully reconstructs a live `.git`).
-- **Auto-detection**: with a PATH and neither flag, the mode is inferred
-  from what's on disk — a `GIT_SIDECAR_DIRNAME` present means
-  `--sidecar`; otherwise `--merge` is attempted.
+- **`--zip`** — EXACT, lossless. Un-archives a git dir that `flatten
+  --zip` packed away: `.git.zip` → `.git`, or `GIT_SIDECAR_DIRNAME.zip` →
+  the sidecar dir. The `.zip` is removed on success (`-k`/`--keep` keeps
+  it). Refuses to overwrite an existing live dir. Bulk-discoverable via
+  its `.git*.zip` marker (`st` marks the dir `[zipped]`). Same operation
+  as the `gu` shell helper, ported into my-git.
+- **Auto-detection**: with a PATH and no mode flag, the mode is inferred
+  from what's on disk — a `.git*.zip` means `--zip`; a
+  `GIT_SIDECAR_DIRNAME` present means `--sidecar`; otherwise `--merge` is
+  attempted.
 
-Bulk (no PATH) discovers **both** kinds via their own on-disk marker:
-sidecars via `GIT_SIDECAR_DIRNAME` (same listing `st` uses to mark
-`[sidecar]`), merged paths via `.git.merged` (marks `[merged]`).
+Bulk (no PATH) discovers **all three** kinds via their own on-disk
+marker: sidecars via `GIT_SIDECAR_DIRNAME` (`st` marks `[sidecar]`),
+merged paths via `.git.merged` (`[merged]`), zipped paths via `.git*.zip`
+(`[zipped]`) — unless restricted to one with a mode flag.
 
 ## Not yet implemented
 
@@ -652,6 +678,11 @@ state explicit:
   permanently deleted). Also purely informational; `my-git unflatten
   <path> --merge` can attempt a best-effort reconstruction from this
   repo's own commit history — see [`unflatten`](#unflatten--rebuild-a-live-git).
+- `[zipped]` — directory whose git dir was archived via `flatten --zip`
+  (a `.git.zip` / `.git.real.zip` beside the worktree, the live dir
+  removed). Purely informational; restore it with `my-git unflatten
+  <path> --zip`. (A live repo that merely keeps a `-k` backup zip is *not*
+  marked `[zipped]`.)
 
 The top-level scope path itself (root of each tree) carries no tag — it is
 the super-repo, not a nested entry. DIRTY/CLEAN is orthogonal to
