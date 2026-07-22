@@ -73,18 +73,22 @@ run() {
   # to capture git's own error text into a temp file). Using plain
   # stderr here would get silently swallowed into that same redirect.
   # Keeps stdout clean either way, for $(...) callers.
-  # Only visible at -V (and therefore -D, -DD).
-  [ "$VRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
+  # Only visible at -VV (VERYVRB) and therefore -D, -DD — NOT at plain
+  # -V. -V is the human "medium detail" axis (per-node status, remotes,
+  # etc.) and is deliberately behaviour-changing; keeping the raw command
+  # trace off it means -V output stays clean and -D (which implies -VV
+  # but NOT -V) shows commands without triggering -V's behaviour changes.
+  [ "$VERYVRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
   "$@"
 }
-# runq — like run(), but the trace is gated on -D (DBG), not -V (VRB).
+# runq — like run(), but the trace is gated on -D (DBG), not -VV.
 # For INTERNAL "noise" commands (temp-file mktemp/rm, other bookkeeping
-# that never touches the user's repo): kept OUT of the -V trace (which
-# should read as the meaningful, repo-affecting command stream), but
-# surfaced at -D and above so a debug run really does show EVERY external
-# command my-git executes — including the noise — when you're hunting a
-# problem. (-DD additionally turns on 'set -x' for full line-by-line
-# shell tracing.) Same fd-3 channel and stdout-clean behavior as run().
+# that never touches the user's repo): kept OUT of the -VV command trace
+# (which should read as the meaningful, repo-affecting command stream),
+# but surfaced at -D and above so a debug run really does show EVERY
+# external command my-git executes — including the noise — when you're
+# hunting a problem. (-DD additionally turns on 'set -x' for full
+# line-by-line shell tracing.) Same fd-3 channel + stdout-clean as run().
 runq() {
   [ "$DBG" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
   "$@"
@@ -1018,6 +1022,23 @@ repo_is_local_only() {
   fi
 }
 
+# _repo_origin_url <repo>
+#   Print the origin remote URL of a repo — live '.git', sidecar
+#   (from GIT_SIDECAR_DIRNAME's config), or merged (from the .git.merged
+#   snapshot). Empty if none. ('rem' has the full multi-remote/audit
+#   view; this is the compact origin-only lookup for st's -V output.)
+_repo_origin_url() {
+  _rou_r=$1
+  _rou_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  if [ -e "$_rou_r/.git" ]; then
+    run_as_owner_capture "$_rou_r" git config --get remote.origin.url 2>/dev/null
+  elif [ -d "$_rou_r/$_rou_grd" ]; then
+    run_as_owner_capture "$_rou_r" git --git-dir="$_rou_grd" config --get remote.origin.url 2>/dev/null
+  elif [ -f "$_rou_r/.git.merged" ]; then
+    sed -n 's/^remote\.origin\.url: //p' "$_rou_r/.git.merged" 2>/dev/null | head -1
+  fi
+}
+
 # status_summary <repo>
 #   Print ONE compact line describing the repo's state. Handles cross-user
 #   policy, errors, dirty counts, ahead/behind/diverged. Never multiline.
@@ -1203,18 +1224,25 @@ status_one() {
       else
         printf '%s > %s: CLEAN (no upstream for %s)\n' "$_ind" "$_r" "$_branch"
       fi
-      return 0
-    fi
-    _div=$(run_as_owner_capture "$_r" git log "${_rem_ref}...${_branch}" 2>/dev/null)
-    if [ -z "$_div" ]; then
-      printf '%s > %s: CLEAN :))\n' "$_ind" "$_r"
     else
-      printf '%s > %s: Local <-> Remote out of sync!\n' "$_ind" "$_r"
-      printf '%s\n' "$_div" | sed -e "s|^|${_ind}        |"
+      _div=$(run_as_owner_capture "$_r" git log "${_rem_ref}...${_branch}" 2>/dev/null)
+      if [ -z "$_div" ]; then
+        printf '%s > %s: CLEAN :))\n' "$_ind" "$_r"
+      else
+        printf '%s > %s: Local <-> Remote out of sync!\n' "$_ind" "$_r"
+        printf '%s\n' "$_div" | sed -e "s|^|${_ind}        |"
+      fi
     fi
   else
     printf '%s > %s:%s\n' "$_ind" "$_r" "$_localmark"
     printf '%s\n' "$_porc" | sed -e "s|^|${_ind}        |"
+  fi
+  # -V also surfaces the git SETUP — the origin remote URL (the most
+  # useful missing bit), sidecar/merged-aware. Full multi-remote/audit
+  # view is 'my-git rem'.
+  _su_url=$(_repo_origin_url "$_r")
+  if [ -n "$_su_url" ]; then
+    printf '%s   remote: origin -> %s\n' "$_ind" "$_su_url"
   fi
 }
 
@@ -1225,9 +1253,9 @@ cmd_status() {
     case "$1" in
       -h|--help) show_help status; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive) RECURSIVE=1 ;;  # -R forces discovery in foreign scopes too
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "status: unknown option: $1" 64 ;;
@@ -1859,9 +1887,9 @@ cmd_masscommits() {
     case "$1" in
       -h|--help) show_help masscommits; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _mc_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _mc_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1; require_tty masscommits ;;
@@ -2156,9 +2184,9 @@ cmd_pull() {
     case "$1" in
       -h|--help) show_help pull; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _pl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _pl_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1; require_tty pull ;;
@@ -3740,9 +3768,9 @@ _FL_EMB_REALIZE_EOF
     case "$1" in
       -h|--help) show_help flatten; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _fl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _fl_mode=analyze ;;
       -i|--interactive) _fl_interactive=1; require_tty flatten ;;
@@ -4854,9 +4882,9 @@ cmd_unflatten() {
     case "$1" in
       -h|--help) show_help unflatten; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _ufl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _ufl_mode=analyze ;;
       -i|--interactive) _ufl_interactive=1; require_tty unflatten ;;
@@ -5123,9 +5151,9 @@ cmd_remote() {
     case "$1" in
       -h|--help) show_help remote; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       --check)      RM_CHECK=1 ;;
       -R|--recursive) RECURSIVE=1 ;;
       --force)      RM_FORCE=1 ;;
@@ -5217,9 +5245,9 @@ cmd_sync() {
       -i|--interactive) _sy_int=1; require_tty sync ;;
       --force)          _sy_force=1 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "sync: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -5475,9 +5503,9 @@ cmd_claude_check() {
     case "$1" in
       -h|--help) show_help claude-check; exit 0 ;;
       -V|--verbose) VRB=1 ;;
-      -VV)          VRB=1; VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
       -i|--interactive) INTERACTIVE=1; require_tty claude-check ;;
       -R|--recursive) RECURSIVE=1 ;;
@@ -6336,35 +6364,51 @@ EOF
 
 show_help_verbose() {
   cat <<EOF
-my-git verbosity: -V / -VV
+my-git verbosity: -V / -VV / -D / -DD
 
--V / --verbose    Verbosity level 1. Enables '>>' medium info lines and
-                  per-repo narration. Also enables the GREY command trace:
-                  every subprocess my-git spawns is echoed as '\$ <cmd>'
-                  in dim/grey to stderr, just before it runs. Mirrors
-                  my-appleRAID's run() helper.
--VV               Verbosity level 2. Adds '>' minor detail lines.
+Three distinct axes — deliberately separated so a debug run doesn't drag
+in -V's (behaviour-changing) medium output:
+
+-V / --verbose        HUMAN medium detail. '>>' info lines + per-repo
+                      narration; in 'st' it switches to the per-node
+                      format and surfaces the origin remote URL. Does
+                      NOT show the raw command trace. This axis can
+                      change WHAT a command does/shows, so it's kept off
+                      the debug path.
+-VV / --very-verbose  The COMMAND TRACE, and ONLY that: every subprocess
+                      my-git spawns is echoed as '\$ <cmd>' in dim/grey
+                      (on a dedicated fd, so it never contaminates \$(...)
+                      captures), just before it runs. Also '>' minor
+                      lines. Does NOT enable -V's medium output.
+-D / --debug          Implies -VV (command trace) PLUS the '~~' debug
+                      lines PLUS the internal "noise" trace (temp-file
+                      ops). Does NOT imply -V — so you get commands +
+                      diagnostics with -V's behaviour changes staying off.
+-DD / --deepdbg       Everything at -D, plus 'set -x' line-by-line shell
+                      tracing (and the ' ~ ' deep lines).
 
 Output prefix legend + color conventions (TTY only — colors are
 suppressed on non-TTY stdout so logs/captures stay clean):
    >>> MAJOR     bold cyan.   Milestone / headline. First in each block.
-    >> medium    blue.         Shown at -V, -VV, -D, -DD.
-     > minor     default.      Shown at -VV, -DD.
+    >> medium    blue.         Shown at -V.
+     > minor     default.      Shown at -VV (and -D, -DD).
    ~~~ debug     dim (grey).   Shown at -D, -DD. On stderr.
     ~~ debug     dim (grey).   Shown at -D, -DD. On stderr.
      ~ debug     dim (grey).   Shown at -DD only. On stderr.
-  \$ cmd        dim (grey).   -V command trace (stderr). Echoed by run()
-                              just before exec; does NOT contaminate stdout
-                              captures (\$(...)) because the trace is on fd 2.
+  \$ cmd        dim (grey).   Command trace — shown at -VV (and -D, -DD),
+                              NOT at plain -V. On a dedicated fd (fd 3,
+                              dup'd from stderr), so it never contaminates
+                              stdout captures (\$(...)).
   ERROR:        red.          stderr. Always shown.
   WARN:         yellow.       stderr. Always shown.
   DONE :))      green inline. Success completion tag inside a headline.
   CLEAN :))     green inline. Repo-state marker.
   DIRTY (..)    yellow inline. Repo-state marker (in st / mc status lines).
+  ⌂             local-only marker (no remote to publish to). In st.
   [ABORT ..]    yellow inline. User-triggered abort marker.
 
-Verbose and debug are independent axes. Debug implies verbose (-D enables -V;
--DD enables -VV). No single output block may be gated across both axes.
+The command trace (-VV) and the debug lines (-D) are separate: -D
+implies -VV but neither implies -V. -DD adds 'set -x'.
 EOF
 }
 
@@ -7033,10 +7077,10 @@ _sm_run_here() {
     case "$1" in
       go)                    [ "$_sm_mode_set" -eq 0 ] && _sm_mode=go  && _sm_mode_set=1 ;;
       -T|--dry|--try|-n|--dry-run) [ "$_sm_mode_set" -eq 0 ] && _sm_mode=dry && _sm_mode_set=1 ;;
-      -D|--debug)            DBG=1; VRB=1 ;;
-      -DD|--deepdbg)         DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -D|--debug)            DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg)         DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -V|--verbose)          _sm_verbose=1; VRB=1 ;;
-      -VV)                   _sm_verbose=1; VRB=1; VERYVRB=1 ;;
+      -VV|--very-verbose)                   VERYVRB=1 ;;
       -i|--interactive)      _sm_interactive=1; require_tty submodules ;;
       --force)               _sm_force=1 ;;
       --list-ignored)        _sm_list_ignored=1 ;;
@@ -9667,9 +9711,49 @@ _RT_CONF_EOF
     ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 \
         && git -C kid submodule update --init -q )
     cd global || return 1
-    _rt_ok "flatten go kid --merge -V" _rt_my_git -V flatten go kid --merge || return 1
+    # -VV is the command-trace axis (‑V is human medium-detail; ‑D
+    # implies ‑VV). The trace must survive a per-command 2> redirect.
+    _rt_ok "flatten go kid --merge -VV" _rt_my_git -VV flatten go kid --merge || return 1
     _rt_contains "git add trace visible despite errlog redirect" "$_rt_err" '$ git add -f' || return 1
     _rt_contains "git commit trace visible despite errlog redirect" "$_rt_err" '$ git commit' || return 1
+    return 0
+  }
+
+  test_verbosity_axes_V_vs_VV_vs_D() {
+    # The verbosity model: -V = human medium detail, NO raw command
+    # trace; -VV = command trace only; -D implies -VV (commands) + debug
+    # but NOT -V (so -V's behaviour changes don't kick in under -D).
+    _rt_repo_file kid_o x.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd global || return 1
+    # -V must NOT emit the '$ <cmd>' command trace
+    _rt_my_git -V st >"$_rt_out" 2>"$_rt_err"
+    if grep -q '^\$ git ' "$_rt_err" "$_rt_out" 2>/dev/null; then
+      _rt_fail "-V must NOT show the raw command trace (that's -VV)"; return 1
+    fi
+    # -VV MUST emit the command trace
+    _rt_my_git -VV st >"$_rt_out" 2>"$_rt_err"
+    grep -q '^\$ git ' "$_rt_err" 2>/dev/null \
+      || { _rt_fail "-VV must show the command trace"; return 1; }
+    # -D MUST show the command trace too (implies -VV)
+    _rt_my_git -D st >"$_rt_out" 2>"$_rt_err"
+    grep -q '^\$ git ' "$_rt_err" 2>/dev/null \
+      || { _rt_fail "-D must imply -VV (show commands)"; return 1; }
+    return 0
+  }
+
+  test_st_verbose_shows_origin_remote() {
+    # -V surfaces the git SETUP — the origin remote URL — per repo (the
+    # most useful missing bit, per user). Full audit is 'my-git rem'.
+    _rt_repo_file origin_o x.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git remote add origin ../origin_o )
+    cd global || return 1
+    _rt_ok "-V st" _rt_my_git -V st || return 1
+    _rt_contains "-V shows the origin remote url line" "$_rt_out" "remote: origin ->" || return 1
     return 0
   }
 
@@ -10346,7 +10430,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -10405,9 +10489,9 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -V|--verbose)      VRB=1 ;;
-      -VV)               VRB=1; VERYVRB=1 ;;
-      -D|--debug)        DBG=1; VRB=1 ;;
-      -DD|--deepdbg)     DBG=1; DEEPDBG=1; VRB=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -VV|--very-verbose)               VERYVRB=1 ;;
+      -D|--debug)        DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg)     DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive)    RECURSIVE=1 ;;
       --run-tests)
         shift
