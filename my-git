@@ -66,20 +66,29 @@ log_error()     { printf '%sERROR: %s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
 log_ok()        { printf ' %sSUCCESS:%s %s\n' "$C_BOLD$C_GREEN" "$C_RESET" "$*"; }
 log_fail()      { printf ' %sFAIL:%s %s\n'    "$C_BOLD$C_RED"   "$C_RESET" "$*" >&2; }
 
-# _prompt_ysa <question> — one per-item interactive gate, FULLY annotated so
-# the choices are never cryptic. Prints '<question>  [Y]es / [s]kip / [a]bort:'
-# to the tty and reads one answer. Returns 0=yes (Enter/y), 1=skip (s),
-# 2=abort (a, anything else, or EOF — the caller does its own cleanup).
+# _prompt_ysa <question> — the ONE per-item interactive gate used everywhere
+# a repo-by-repo confirmation is needed (flatten's forced modes, unflatten,
+# --zip). FULLY annotated, re-asks on invalid input. Returns:
+#   0 = yes  (Enter / y)      — do this one
+#   1 = skip (s)              — leave this one, ask about the next
+#   2 = abort (a / EOF)       — stop entirely, do nothing more
+#   3 = go   (g)              — do this one AND all remaining, stop asking
+# The 's'/'a'/'g' letters match flatten's default (-i, no forced mode) choice
+# prompt, so every interactive prompt in my-git offers the same vocabulary.
 _prompt_ysa() {
-  printf '%s  %s[Y]es%s / %s[s]kip%s / %s[a]bort%s: ' \
-    "$1" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" >/dev/tty
-  IFS= read -r _pysa </dev/tty || _pysa=a
-  _pysa=$(printf '%s' "$_pysa" | tr -d '[:space:]')
-  case "$_pysa" in
-    ''|y|Y) return 0 ;;
-    s|S)    return 1 ;;
-    *)      return 2 ;;
-  esac
+  while :; do
+    printf '%s  %s[Y]es%s / %s[s]kip%s / %s[a]bort%s / %s[g]o%s (yes to this + all remaining): ' \
+      "$1" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" "$C_BOLD$C_GREEN" "$C_RESET" >/dev/tty
+    IFS= read -r _pysa </dev/tty || return 2
+    _pysa=$(printf '%s' "$_pysa" | tr -d '[:space:]')
+    case "$_pysa" in
+      ''|y|Y) return 0 ;;
+      s|S)    return 1 ;;
+      a|A)    return 2 ;;
+      g|G)    return 3 ;;
+      *) printf '    %s? please answer  Y=yes  s=skip  a=abort  g=go(all rest)%s\n' "$C_YELLOW" "$C_RESET" >/dev/tty ;;
+    esac
+  done
 }
 
 # ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
@@ -113,6 +122,14 @@ runq() {
   [ "$DBG" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
   "$@"
 }
+# trace / traceq — emit a command to the -VV (trace) or -D (traceq) command
+# stream WITHOUT executing it. For commands run() cannot wrap: pipelines and
+# commands inside a subshell ( ... ) — e.g. the discovery 'find' that feeds a
+# 'sed|grep' pipe. Keeps the -VV/-D command stream COMPLETE (every relevant
+# external command shows up), which run() alone can't guarantee. Return 0 so
+# these never affect the surrounding command's exit status.
+trace()  { [ "$VERYVRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; return 0; }
+traceq() { [ "$DBG"     = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; return 0; }
 show() {
   printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET"
 }
@@ -663,6 +680,7 @@ list_realized_dirs() {
   _lrd_collapse=${2:-}          # 'collapse' => keep only top-most of a nest
   [ -d "$_lrd_r" ] || return 0
   _lrd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  trace "(cd $_lrd_r && find . -name $_lrd_grd -prune -print)   # discover sidecars"
   ( cd "$_lrd_r" 2>/dev/null || exit 0
     # PERF: prune the CONTENTS of every git-internal dir (.git, .git.merged,
     # and the sidecar dir itself) — none of them can contain a sidecar we're
@@ -751,6 +769,7 @@ ensure_sidecar_exclude() {
 list_merged_dirs() {
   _lmd_r=$1
   [ -d "$_lmd_r" ] || return 0
+  trace "(cd $_lmd_r && find . -name .git.merged -print)   # discover merged paths"
   ( cd "$_lmd_r" 2>/dev/null || exit 0
     # PERF: prune git-internal dir contents (see list_realized_dirs).
     _pex="-path ./.git -o -name .git -o -name ${GIT_SIDECAR_DIRNAME:-.git.real}"
@@ -776,6 +795,7 @@ list_zipped_dirs() {
   _lzd_r=$1
   [ -d "$_lzd_r" ] || return 0
   _lzd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  trace "(cd $_lzd_r && find . \\( -name .git.zip -o -name $_lzd_grd.zip \\) -print)   # discover zipped git dirs"
   ( cd "$_lzd_r" 2>/dev/null || exit 0
     # PERF: prune git-internal dir contents (see list_realized_dirs).
     _pex="-path ./.git -o -name .git -o -name $_lzd_grd -o -name .git.merged"
@@ -888,6 +908,7 @@ list_unregistered_nested() {
     | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
   _realtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.real.XXXXXX")
   list_realized_dirs "$_r" > "$_realtmp" 2>/dev/null || : > "$_realtmp"
+  trace "(cd $_r && find . -name .git -print)   # discover UNREGISTERED nested repos"
   ( cd "$_r" 2>/dev/null || exit 0
     # Prune:
     #   - './.git' (the scope root itself — we only want NESTED repos)
@@ -3726,8 +3747,13 @@ _FL_ORP_EOF
       return 0
     fi
     if [ "$_fl_interactive" = 1 ]; then
-      _prompt_ysa "flatten --$3: apply to $1?"
-      case $? in 1) _FBC_CHOICE=skip; log_medium "skip  $1" ;; 2) return 2 ;; esac
+      _FBC_I=$((${_FBC_I:-0} + 1))
+      _prompt_ysa "flatten --$3 ($_FBC_I/$_FBC_TOTAL): apply to $1?"
+      case $? in
+        1) _FBC_CHOICE=skip; log_medium "skip  $1" ;;
+        2) return 2 ;;
+        3) _fl_interactive=0 ;;   # go: this one + all remaining, no more asking
+      esac
     fi
     return 0
   }
@@ -3735,6 +3761,8 @@ _FL_ORP_EOF
     _fbc_file=$1
     _fbc_mode=$2
     : > "$_fbc_file"
+    _FBC_I=0
+    _FBC_TOTAL=$((_fl_n_registered + _fl_n_nested + _fl_n_orphan))
     while IFS= read -r _p; do
       [ -n "$_p" ] || continue
       if ! _fl_submodule_initialized "$_p"; then
@@ -4144,14 +4172,17 @@ _FL_EMB_REALIZE_EOF
     set -- $_fl_zip_targets
     IFS=$_fl_oifs
     _fl_zip_ok=0; _fl_zip_fail=0; _fl_zip_skip=0
+    _fl_zip_total=$#; _fl_zip_i=0
     for _fl_zt in "$@"; do
       [ -n "$_fl_zt" ] || continue
+      _fl_zip_i=$((_fl_zip_i + 1))
       # -i: ask per repo (one by one), FULLY annotated.
       if [ "$_fl_interactive" = 1 ]; then
-        _prompt_ysa "flatten --zip: archive $_fl_zt?"
+        _prompt_ysa "flatten --zip ($_fl_zip_i/$_fl_zip_total): archive $_fl_zt?"
         case $? in
           1) _fl_zip_skip=$((_fl_zip_skip + 1)); log_medium "skip  $_fl_zt"; continue ;;
           2) log_major "aborted (${_fl_zip_ok} already archived)"; return 77 ;;
+          3) _fl_interactive=0 ;;   # go: this one + all remaining, no more asking
         esac
       fi
       if _zip_gitdir "$_fl_zt" "$_fl_keep"; then
@@ -4230,6 +4261,7 @@ _FL_EMB_REALIZE_EOF
   # a plain sort would put e.g. 'src/,foo' before 'src' itself
   # (','=0x2C sorts below '.'=0x2E) — this ordering doesn't affect
   # correctness here (see below), but keeps output stable/readable.
+  trace "(cd $_fl_top && find . -name .git -print)   # discover nested git repos to flatten"
   _fl_nested_all_raw=$(find . -path ./.git -prune -o \( -name .git -a \( -type d -o -type f \) \) -print 2>/dev/null | sed -e 's|^\./||' -e 's|/\.git$||')
   _fl_nested_all=$(printf '%s\n' "$_fl_nested_all_raw" | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- | sed 's|$|/.git|')
 
@@ -4419,6 +4451,11 @@ _FL_IGNCHK_ORPH_EOF
     exit 0
   fi
 
+  # 'go -i' asks repo by repo below, so skip the upfront batch plan (it reads
+  # as "about to do all N"). Analyze mode always shows the full plan.
+  if [ "$_fl_mode" = go ] && [ "$_fl_interactive" = 1 ]; then
+    log_major "$_fl_top: flatten${_fl_forced_mode:+ --$_fl_forced_mode} — asking one at a time (-i: [Y]es/[s]kip/[a]bort/[g]o)"
+  else
   log_major "$_fl_top: flatten plan"
   _fl_n_ign_nested=$(printf '%s' "$_fl_ignored_nested" | grep -c .)
   _fl_n_ign_reg=$(printf '%s' "$_fl_ignored_registered" | grep -c .)
@@ -4475,6 +4512,7 @@ _FL_IGNCHK_ORPH_EOF
   fi
 
   _fl_warn_registered
+  fi
 
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
@@ -5350,8 +5388,17 @@ cmd_unflatten() {
     exit 0
   fi
 
-  log_major "$_ufl_top: unflatten plan ($_ufl_n item(s))"
-  while IFS="$(printf '\t')" read -r _p _m; do
+  # With 'go -i' we ask repo by repo, so DON'T dump the whole plan first —
+  # that reads as "about to do all N". Just note the count; the per-item
+  # prompts below (each shown as i/N) are the interaction.
+  if [ "$_ufl_mode" = go ] && [ "$_ufl_interactive" = 1 ]; then
+    log_major "$_ufl_top: unflatten — $_ufl_n item(s), one at a time (-i: [Y]es/[s]kip/[a]bort/[g]o)"
+    _ufl_skip_plan=1
+  else
+    _ufl_skip_plan=0
+  fi
+  [ "$_ufl_skip_plan" = 1 ] || log_major "$_ufl_top: unflatten plan ($_ufl_n item(s))"
+  [ "$_ufl_skip_plan" = 1 ] || while IFS="$(printf '\t')" read -r _p _m; do
     [ -n "$_p" ] || continue
     if [ "$_m" = merge ]; then
       printf '  %s>> %s  (RECONSTRUCT via git subtree split — history before the merge is gone)%s\n' "$C_BLUE" "$_p" "$C_RESET"
@@ -5381,13 +5428,16 @@ cmd_unflatten() {
   # restore's own index changes (.status removal for sidecar, .git.merged
   # removal + .gitignore restore for merge) live under its own <path>.
   _ufl_commit_paths=""
+  _ufl_i=0
   while IFS="$(printf '\t')" read -r _p _m; do
     [ -n "$_p" ] || continue
+    _ufl_i=$((_ufl_i + 1))
     if [ "$_ufl_interactive" = 1 ]; then
-      _prompt_ysa "unflatten [$_m]: restore $_p?"
+      _prompt_ysa "unflatten [$_m] ($_ufl_i/$_ufl_n): restore $_p?"
       case $? in
         1) log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; rm -f "$_ufl_cand"; exit 77 ;;
+        3) _ufl_interactive=0 ;;   # go: this one + all remaining, no more asking
       esac
     fi
     log_dbg_med "unflatten apply: $_p (mode=$_m)"
@@ -6512,8 +6562,10 @@ Choosing a mode (all three behave the same way here):
                                toplevel (a live nested repo is zipped only
                                when named explicitly by path).
   go -i --sidecar|--merge|--zip
-                               instead of bulk, ask [Y]es / [s]kip / [a]bort
-                               per repo, one by one (works with EVERY mode).
+                               instead of bulk, ask per repo one by one (works
+                               with EVERY mode): [Y]es this one / [s]kip it /
+                               [a]bort all / [g]o = do this one + all the rest
+                               without asking again.
   <path> --sidecar|--merge|--zip
                                restrict to just that ONE repo/sidecar
                                (embedded, registered, orphan gitlink, or an
@@ -6690,8 +6742,9 @@ Modes:
   default (no 'go')   ANALYZE — print the plan (which paths, which
                       mechanism). No writes of any kind.
   go                  APPLY (bulk — all discovered items, no prompting).
-  go -i               instead of bulk, ask [Y]es / [s]kip / [a]bort per
-                      repo, one by one (works with EVERY mode).
+  go -i               instead of bulk, ask per repo one by one (works with
+                      EVERY mode): [Y]es this one / [s]kip it / [a]bort all /
+                      [g]o = do this one + all the rest without asking again.
 
 Bulk (no PATH): both modes are discoverable via their own on-disk
 marker — sidecars via GIT_SIDECAR_DIRNAME (same listing 'my-git st' uses
@@ -7302,6 +7355,7 @@ _sm_safe_git() {
 }
 
 _sm_find_leftovers() {
+  trace "find . -type d -name '*${_sm_PREEXISTING_SUFFIX}*'   # discover sm .preexisting leftovers"
   find . -mindepth 1 -type d -name "*${_sm_PREEXISTING_SUFFIX}*" \
        -not -path '*/.git/*' 2>/dev/null | sed 's|^\./||' | sort
 }
@@ -7499,6 +7553,7 @@ _sm_autocommit_if_safe() {
 #   .git/info/exclude block or to emit to the terminal. Returns 1 if none.
 _sm_collect_ignore_patterns() {
   _cip_tmp=$(mktemp "${TMPDIR:-/tmp}/syncignfind.XXXXXX")
+  trace "find . -mindepth 2 -name .git   # discover nested repos (ignore-pattern collection)"
   find . -mindepth 2 -name .git \( -type d -o -type f \) \
        -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_cip_tmp"
   _cip_patterns=$(
@@ -7950,6 +8005,7 @@ _CS_EOF
 
   if [ "$_sm_clean_stale" -eq 1 ]; then
     _cs_repos_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.csrepos.XXXXXX")
+    trace "find . -mindepth 2 -name .git   # discover nested repos (stale-registration scan)"
     {
       echo "."
       find . -mindepth 2 -name .git \( -type d -o -type f \) \
@@ -7993,6 +8049,7 @@ _CS_EOF
     echo "Ignored nested repos under $_sm_toplevel (marker: .git/$_sm_IGNORE_MARKER):"
     _n=0; _n_conflict=0
     _tmp=$(mktemp "${TMPDIR:-/tmp}/listign.XXXXXX")
+    trace "find . -mindepth 2 -name .git   # discover nested repos (--list-ignored)"
     find . -mindepth 2 -name .git \( -type d -o -type f \) \
          -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
     while IFS= read -r gp; do
@@ -8131,6 +8188,7 @@ _CS_EOF
     done
   fi
 
+  trace "find . -mindepth 2 -name .git   # discover nested repos to register (sm)"
   find . -mindepth 2 -name .git \( -type d -o -type f \) \
        -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_sm_tmpfile"
   # PATH-scoping: keep only the candidate AT the scoped path (its own
@@ -11348,6 +11406,27 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_vv_traces_discovery_finds() {
+    # -VV must show the discovery 'find' commands (HOW repos are located) —
+    # they run inside subshells/pipelines that run() can't wrap, so they get
+    # an explicit trace(). Without it, -VV listed repos with no command to
+    # explain them. The trace goes to fd 3 (dup of stderr) -> _rt_err.
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    mkdir -p top/sc && ( cd top/sc && git init --separate-git-dir=.git.real -q \
+      && rm -f .git && git --git-dir=.git.real config core.worktree .. )
+    mkdir -p top/zp && ( cd top/zp && git init --separate-git-dir=.git.real -q && rm -f .git \
+      && zip -qr .git.real.zip .git.real >/dev/null 2>&1 && rm -rf .git.real )
+    cd top || return 1
+    _rt_ok "st -VV runs" _rt_my_git -VV st "$PWD" || return 1
+    _rt_contains "-VV traces the sidecar discovery find" "$_rt_err" "discover sidecars" || return 1
+    _rt_contains "-VV traces the zipped discovery find" "$_rt_err" "discover zipped git dirs" || return 1
+    # plain -V (human axis) must NOT show the raw find trace
+    _rt_ok "st -V runs" _rt_my_git -V st "$PWD" || return 1
+    _rt_not_contains "-V stays clean of raw command trace" "$_rt_err" "discover sidecars" || return 1
+    return 0
+  }
+
   test_flatten_zip_local_only() {
     # --local-only restricts --zip to repos with NO remote (⌂ in st): a
     # sidecar WITH a remote is left alone, only the local-only one archived.
@@ -11451,7 +11530,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
