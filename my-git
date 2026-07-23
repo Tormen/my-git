@@ -4490,15 +4490,18 @@ _FL_IGNCHK_ORPH_EOF
     # a mode, so it can't act on its own.
     if [ "$_fl_mode" = go ]; then
       echo
-      log_major "Nothing changed: 'go' picked NO mode (--local-only is a filter, not a mode). Add one:"
+      log_major "Nothing changed — 'go' needs you to PICK A MODE ('go' alone only"
+      log_major "converts nested LIVE repos, and there are none here; --local-only is"
+      log_major "only a filter, not a mode). Pick one:"
       _fl_sugg=""
       [ "$_fl_local_only" = 1 ]  && _fl_sugg="$_fl_sugg --local-only"
       [ "$_fl_interactive" = 1 ] && _fl_sugg="$_fl_sugg -i"
       [ "${_fl_hint_sc:-0}" -gt 0 ] && \
-        printf '  %s>>   %s flatten go --zip%s     (archive the %s sidecar(s) above)%s\n' \
+        printf '  %s>>   --zip   ->  %s flatten go --zip%s     (archive the %s sidecar(s) above)%s\n' \
           "$C_BLUE" "$US" "$_fl_sugg" "$_fl_hint_sc" "$C_RESET"
+      printf '  %s>>   --sidecar / --merge  act on nested LIVE repos (none here)%s\n' "$C_BLUE" "$C_RESET"
       [ "${_fl_hint_zip:-0}" -gt 0 ] && \
-        printf '  %s>>   %s unflatten go --zip%s   (restore the %s zipped dir(s) above)%s\n' \
+        printf '  %s>>   (to RESTORE:  %s unflatten go --zip%s   — the %s zipped dir(s) above)%s\n' \
           "$C_BLUE" "$US" "$([ "$_fl_interactive" = 1 ] && printf ' -i')" "$_fl_hint_zip" "$C_RESET"
     fi
     [ "$_fl_n_registered" -gt 0 ] && _fl_warn_registered
@@ -11505,7 +11508,8 @@ _RT_STALE_CONF_EOF
     cd top || return 1
     _rt_ok "sidecar sc" _rt_my_git flatten go sc --sidecar || return 1
     _rt_ok "flatten go (no mode)" _rt_my_git flatten go || return 1
-    _rt_contains "says nothing changed / no mode" "$_rt_out" "Nothing changed: 'go' picked NO mode" || return 1
+    _rt_contains "says nothing changed" "$_rt_out" "Nothing changed" || return 1
+    _rt_contains "tells the user to pick a mode" "$_rt_out" "PICK A MODE" || return 1
     _rt_contains "echoes the --zip command" "$_rt_out" "flatten go --zip" || return 1
     _rt_isdir "sidecar untouched (go did nothing)" sc/.git.real || return 1
     return 0
