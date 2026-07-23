@@ -1486,7 +1486,7 @@ cmd_status() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive) RECURSIVE=1 ;;  # -R forces discovery in foreign scopes too
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "status: unknown option: $1" 64 ;;
@@ -2129,7 +2129,7 @@ cmd_masscommits() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _mc_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _mc_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1; require_tty masscommits ;;
@@ -2426,7 +2426,7 @@ cmd_pull() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _pl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _pl_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1; require_tty pull ;;
@@ -4042,7 +4042,7 @@ _FL_EMB_REALIZE_EOF
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _fl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _fl_mode=analyze ;;
       -i|--interactive) _fl_interactive=1; require_tty flatten ;;
@@ -5346,7 +5346,7 @@ cmd_unflatten() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       go)           _ufl_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _ufl_mode=analyze ;;
       -i|--interactive) _ufl_interactive=1; require_tty unflatten ;;
@@ -5650,7 +5650,7 @@ cmd_remote() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       --check)      RM_CHECK=1 ;;
       -R|--recursive) RECURSIVE=1 ;;
       --force)      RM_FORCE=1 ;;
@@ -5744,7 +5744,7 @@ cmd_sync() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "sync: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -6003,7 +6003,7 @@ cmd_claude_check() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
       -i|--interactive) INTERACTIVE=1; require_tty claude-check ;;
       -R|--recursive) RECURSIVE=1 ;;
@@ -6192,7 +6192,7 @@ cmd_audit() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive) RECURSIVE=1 ;;
       --claude)     _au_claude=1 ;;
       --sidecar)    _au_sidecar=1 ;;
@@ -6228,7 +6228,7 @@ cmd_repair() {
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose)          VERYVRB=1 ;;
       -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive) RECURSIVE=1 ;;
       go)           _rp_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _rp_mode=analyze ;;
@@ -6284,9 +6284,9 @@ Subcommands:
 
 Global options:
   -V, --verbose            Verbosity level 1
-  -VV                      Verbosity level 2
+  -VV, --very-verbose      Verbosity level 2
   -D, --debug              Debug level 1  (implies -V)
-  -DD, --deepdbg           Debug level 2  (implies -VV; enables set -x)
+  -DD, --deep-dbg          Debug level 2  (implies -VV; enables set -x)
   -R, --recursive          Force-recurse. For 'mc'/'sm': walk the full
                            submodule tree. For 'st': force discovery of
                            unregistered nested repos in a FOREIGN scope
@@ -7262,7 +7262,7 @@ show_help() {
     repair)              show_help_repair ;;
     config|--config|--create-config) show_help_config ;;
     verbose|-V|--verbose|-VV)        show_help_verbose ;;
-    debug|-D|--debug|-DD|--deepdbg)  show_help_debug ;;
+    debug|-D|--debug|-DD|--deepdbg|--deep-dbg)  show_help_debug ;;
     *) log_error "no help topic: $1"; echo >&2; show_help_top; return 1 ;;
   esac
 }
@@ -7902,7 +7902,7 @@ _sm_run_here() {
       go)                    [ "$_sm_mode_set" -eq 0 ] && _sm_mode=go  && _sm_mode_set=1 ;;
       -T|--dry|--try|-n|--dry-run) [ "$_sm_mode_set" -eq 0 ] && _sm_mode=dry && _sm_mode_set=1 ;;
       -D|--debug)            DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg)         DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg)         DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -V|--verbose)          _sm_verbose=1; VRB=1 ;;
       -VV|--very-verbose)                   VERYVRB=1 ;;
       -i|--interactive)      _sm_interactive=1; require_tty submodules ;;
@@ -11700,7 +11700,7 @@ main() {
       -V|--verbose)      VRB=1 ;;
       -VV|--very-verbose)               VERYVRB=1 ;;
       -D|--debug)        DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg)     DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      -DD|--deepdbg|--deep-dbg)     DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive)    RECURSIVE=1 ;;
       --run-tests)
         shift
@@ -11849,9 +11849,9 @@ _my-git() {
   local -a global_opts
   global_opts=(
     '(-V --verbose)'{-V,--verbose}'[Show more detail + subprocess trace]'
-    '-VV[Even more detail]'
+    '(-VV --very-verbose)'{-VV,--very-verbose}'[Even more detail]'
     '(-D --debug)'{-D,--debug}'[Implies -V; extra debug lines]'
-    '(-DD --deepdbg)'{-DD,--deepdbg}'[Implies -VV; enables set -x]'
+    '(-DD --deep-dbg)'{-DD,--deep-dbg}'[Implies -VV; enables set -x]'
     '(-R --recursive)'{-R,--recursive}'[Force-recurse the whole submodule tree]'
     '--config[Use a specific config file]:config file:_files'
     '--create-config[Write default config to first writable location]::target file:_files'
