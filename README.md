@@ -423,11 +423,12 @@ would otherwise decide per-item:
   repo/sidecar (embedded, registered submodule, orphan gitlink, or an
   existing sidecar for `--zip`) instead of the whole tree.
 
-`--local-only` (alias `--house`) restricts any mode to repos with **no
-remote** — the ones `st` marks with the house icon (⌂). The typical use is
-`my-git flatten go --zip --local-only` to archive only the unpublished
-sidecars. Same flag works for `--sidecar`/`--merge` too. (`unflatten`'s
-`-i` behaves identically, one repo at a time.)
+`--local-only` (alias `--house`) is a **generic filter over everything
+flatten does** — counts, the by-mode overview, the plan, and every mode's
+apply: keep only repos with **no remote** (the ones `st` marks with the
+house icon ⌂). The typical use is `my-git flatten go --zip --local-only` to
+archive only the unpublished sidecars, but it applies to
+`--sidecar`/`--merge` and bare `flatten` just the same.
 
 A nested repo carrying `.git/my-git-submodules.ignore` (the same marker
 `sm`/`mc` already honor) is left entirely untouched by default — not
