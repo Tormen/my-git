@@ -11838,10 +11838,11 @@ _my-git() {
     'fetch:Refs-only update, never merges'
     'sync:Composite sm -> pull -> mc (alias: syn)'
     'remote:List / audit git remotes (alias: rem)'
-    'flatten:Merge nested repos into outer as content (alias: fl)'
+    'flatten:Nested repo -> parent content; modes --sidecar/--merge/--zip (alias: fl)'
     'unflatten:Reverse of flatten — rebuild a live .git (alias: unfl)'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
-    'claude-check:Audit .claude/ symlink convention'
+    'audit:Read-only health checks (--claude and/or --sidecar)'
+    'repair:Fix sidecar setup problems (--sidecar; go to apply)'
     'help:Show help (help <topic> for a subcommand'\''s own page)'
   )
 
@@ -11929,9 +11930,12 @@ _my-git() {
         flatten|fl)
           _arguments \
             $global_opts \
-            '(-i --interactive)'{-i,--interactive}'[Per-item: choose skip/sidecar/merge/delete]' \
-            '(--sidecar --merge)--sidecar[Force sidecar mode: relocate .git into a self-contained GIT_SIDECAR_DIRNAME, history preserved]' \
-            '(--sidecar --merge)--merge[Force merge mode: .git deleted, .git.merged snapshot written first]' \
+            '(-i --interactive)'{-i,--interactive}'[Per repo: choose --sidecar/--merge/--zip (Y/s/a/g)]' \
+            '(--sidecar --merge --zip)--sidecar[Relocate each .git into a self-contained GIT_SIDECAR_DIRNAME, history kept]' \
+            '(--sidecar --merge --zip)--merge[Delete each .git (.git.merged snapshot written first); history not kept]' \
+            '(--sidecar --merge --zip)--zip[Archive each .git into a .zip (history kept, compressed)]' \
+            '(-k --keep)'{-k,--keep}'[--zip: keep the original git dir too (just create the .zip)]' \
+            '(--local-only --house)'{--local-only,--house}'[Filter to repos with NO remote (the house-icon repos)]' \
             '--rm-git[Permanently delete each nested .git (types "yes" to confirm)]' \
             '--force[Include my-git-submodules.ignore-marked repos too]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
@@ -11941,16 +11945,27 @@ _my-git() {
         unflatten|unfl)
           _arguments \
             $global_opts \
-            '(-i --interactive)'{-i,--interactive}'[Confirm Y/S/A per item]' \
-            '(--sidecar --merge)--sidecar[Exact, lossless restore from a GIT_SIDECAR_DIRNAME sidecar]' \
-            '(--sidecar --merge)--merge[Best-effort reconstruction via git subtree split, for a merged (git-deleted) path]' \
+            '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
+            '(--sidecar --merge --zip)--sidecar[Exact, lossless restore from a GIT_SIDECAR_DIRNAME sidecar]' \
+            '(--sidecar --merge --zip)--merge[Best-effort reconstruction via git subtree split, for a merged (git-deleted) path]' \
+            '(--sidecar --merge --zip)--zip[Restore a git dir archived by flatten --zip (.git.zip / GIT_SIDECAR_DIRNAME.zip)]' \
+            '(-k --keep)'{-k,--keep}'[--zip: keep the .zip after restoring]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
             '1: :(go)' \
             '*: :_directories'
           ;;
-        claude-check)
+        audit)
           _arguments \
             $global_opts \
+            '--claude[Run the .claude-setup check (same as claude-check)]' \
+            '--sidecar[Audit the setup of every sidecar under scope]' \
+            '*: :_directories'
+          ;;
+        repair)
+          _arguments \
+            $global_opts \
+            '--sidecar[Fix sidecar setup problems (exclude, tracked internals, core.worktree, content)]' \
+            '1: :(go)' \
             '*: :_directories'
           ;;
         *)
