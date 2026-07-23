@@ -156,8 +156,8 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
 | `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir: `--merge` (kept live/deleted), `--sidecar` (`.git.real`, history preserved), `--zip` (archived to `.git.zip`/`.git.real.zip`); `-i`/PATH for per-item or forced-mode control |
 | `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip` exact, `--merge` best-effort (`git subtree split`); auto-detects the mode per path |
-| `shadow`        |                | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
-| `unshadow`      |                | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
+| `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
+| `unshadow`      | `unsh`         | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
 | `audit`         |                | always    | Read-only health checks: `--claude` (`.claude/` symlink convention) and/or `--sidecar` (sidecar setup) |
 | `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |

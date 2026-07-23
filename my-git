@@ -2,7 +2,8 @@
 # my-git — multi-repo git dispatcher with recursive submodule support.
 #
 # Subcommands:  status|st|s   masscommits|mc|c   submodules|sub|sm   pull   sync
-#               remote   flatten|unflatten   shadow|unshadow   audit   repair
+#               remote   flatten|unflatten   shadow|sh   unshadow|unsh
+#               audit   repair
 # Global opts:  -V|-VV   -D|-DD   --config FILE   --create-config   -h|--help
 #
 # See:  my-git --help   (or: my-git --help <subcommand>)
@@ -6581,9 +6582,9 @@ Subcommands:
                            3 equal modes: --merge (kept/deleted) / --sidecar (.git.real,
                            history kept) / --zip (archived)
   unflatten | unfl         Reverse of flatten — rebuild a live .git (--merge/--sidecar/--zip; auto-detects)
-  shadow                   KEEP the nested .git live (IDE works) AND make the parent
+  shadow | sh              KEEP the nested .git live (IDE works) AND make the parent
                            track its files too — a content-mirror
-  unshadow                 Reverse of shadow — parent stops tracking; .git stays live
+  unshadow | unsh          Reverse of shadow — parent stops tracking; .git stays live
 
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
@@ -7138,7 +7139,7 @@ EOF
 
 show_help_shadow() {
   cat <<EOF
-my-git shadow
+my-git shadow   (alias: sh)
 
 usage: $US [-V|-D] shadow [go] [-i] [path]
 
@@ -7177,7 +7178,7 @@ EOF
 
 show_help_unshadow() {
   cat <<EOF
-my-git unshadow
+my-git unshadow   (alias: unsh)
 
 usage: $US [-V|-D] unshadow [go] [-i] [path]
 
@@ -7638,8 +7639,8 @@ show_help() {
     remote|rem)          show_help_remote ;;
     flatten|fl)          show_help_flatten ;;
     unflatten|unfl)      show_help_unflatten ;;
-    shadow)              show_help_shadow ;;
-    unshadow)            show_help_unshadow ;;
+    shadow|sh)           show_help_shadow ;;
+    unshadow|unsh)       show_help_unshadow ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     audit)               show_help_audit ;;
@@ -12117,17 +12118,22 @@ _RT_STALE_CONF_EOF
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd top && git clone -q ../kid_o a >/dev/null 2>&1 && git clone -q ../kid_o b >/dev/null 2>&1 )
     cd top || return 1
-    # toplevel path refused
-    if _rt_my_git shadow go . >"$_rt_out" 2>"$_rt_err"; then
+    # toplevel path refused (exercised via the 'sh' alias too)
+    if _rt_my_git sh go . >"$_rt_out" 2>"$_rt_err"; then
       _rt_fail "shadow of the toplevel itself should be refused"; return 1
     fi
     _rt_contains "refusal explains toplevel" "$_rt_err" "toplevel" || return 1
-    # bulk: both get mirrored
-    _rt_ok "bulk shadow go" _rt_my_git shadow go || return 1
+    # bulk: both get mirrored (via the 'sh' alias)
+    _rt_ok "bulk shadow go (alias sh)" _rt_my_git sh go || return 1
     [ -n "$(git ls-files -- a/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "a not mirrored"; return 1; }
     [ -n "$(git ls-files -- b/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "b not mirrored"; return 1; }
     _rt_isdir "a/.git live" a/.git || return 1
     _rt_isdir "b/.git live" b/.git || return 1
+    # unshadow via the 'unsh' alias untracks one of them
+    _rt_ok "unshadow go (alias unsh)" _rt_my_git unsh go a || return 1
+    if [ -n "$(git ls-files -- a 2>/dev/null | head -1)" ]; then
+      _rt_fail "unsh should have untracked a"; return 1
+    fi
     return 0
   }
 
@@ -12284,8 +12290,8 @@ main() {
     remote|rem)                 cmd_remote "$@" ;;
     flatten|fl)                 cmd_flatten "$@" ;;
     unflatten|unfl)             cmd_unflatten "$@" ;;
-    shadow)                     cmd_shadow "$@" ;;
-    unshadow)                   cmd_unshadow "$@" ;;
+    shadow|sh)                  cmd_shadow "$@" ;;
+    unshadow|unsh)              cmd_unshadow "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     audit)                      cmd_audit "$@" ;;
@@ -12334,8 +12340,8 @@ _my-git() {
     'remote:List / audit git remotes (alias: rem)'
     'flatten:Nested repo -> parent content; modes --sidecar/--merge/--zip (alias: fl)'
     'unflatten:Reverse of flatten — rebuild a live .git (alias: unfl)'
-    'shadow:Keep nested .git LIVE and also track its files in the parent (content-mirror)'
-    'unshadow:Reverse of shadow — parent stops tracking; .git stays live'
+    'shadow:Keep nested .git LIVE and also track its files in the parent; content-mirror (alias: sh)'
+    'unshadow:Reverse of shadow — parent stops tracking; .git stays live (alias: unsh)'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
     'audit:Read-only health checks (--claude and/or --sidecar)'
     'repair:Fix sidecar setup problems (--sidecar; go to apply)'
@@ -12450,7 +12456,7 @@ _my-git() {
             '1: :(go)' \
             '*: :_directories'
           ;;
-        shadow)
+        shadow|sh)
           _arguments \
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
@@ -12458,7 +12464,7 @@ _my-git() {
             '1: :(go)' \
             '*: :_directories'
           ;;
-        unshadow)
+        unshadow|unsh)
           _arguments \
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
