@@ -4135,6 +4135,22 @@ _FL_EMB_REALIZE_EOF
 
   log_dbg_med "flatten: top=$_fl_top scope='${_fl_scope_path:-<whole repo>}' forced_mode='${_fl_forced_mode:-<none>}' mode=$_fl_mode interactive=$_fl_interactive rmgit=$_fl_rmgit force=$_fl_force keep=$_fl_keep sidecar_dirname=$GIT_SIDECAR_DIRNAME"
 
+  # flatten needs a MODE. 'go' with no --sidecar/--merge/--zip and no -i is
+  # refused: flattening means DISPOSING of the nested .git (relocate / delete /
+  # archive). The old bare-'go' default only committed the files while keeping
+  # .git live — a content-mirror, not a flatten — so it's gone (a dedicated
+  # 'mirror' command can bring it back if ever needed). Analyze ('flatten'
+  # without 'go') still works and shows what a mode WOULD do.
+  if [ "$_fl_mode" = go ] && [ -z "$_fl_forced_mode" ] && [ "$_fl_interactive" != 1 ] \
+     && [ "${AUTO_SIDECAR_EMBEDDED:-0}" != 1 ] && [ "${AUTO_SIDECAR_SUBMODULES:-0}" != 1 ]; then
+    fatal "flatten go needs a mode — flattening disposes of each nested .git:
+   --sidecar   relocate it into a self-contained $GIT_SIDECAR_DIRNAME (history kept)
+   --merge     delete it (history NOT preserved; .git.merged snapshot written)
+   --zip       archive it into a .zip (history kept, compressed)
+  or choose per repo:   $US flatten go -i
+  (bare 'flatten go' no longer just mirrors files while keeping .git live.)" 64
+  fi
+
   # ── --zip mode ────────────────────────────────────────────────────────
   # Archive git dirs into a .zip (the 'gz' operation, ported here so my-git
   # never depends on a shell function). With a PATH: that one repo/sidecar.
@@ -4568,10 +4584,11 @@ _FL_IGNCHK_ORPH_EOF
   # analyze mode — print plan and bail. NOTHING is changed until 'go'.
   if [ "$_fl_mode" != "go" ]; then
     echo
-    log_major "This was analyze-only — re-run with 'go' to apply:"
-    printf '  %s>>   %s flatten go           (keep child repos)%s\n' "$C_BLUE" "$US" "$C_RESET"
-    printf '  %s>>   %s flatten go -i        (choose per item)%s\n' "$C_BLUE" "$US" "$C_RESET"
-    printf '  %s>>   %s flatten go --rm-git  (delete child repos)%s\n' "$C_BLUE" "$US" "$C_RESET"
+    log_major "This was analyze-only — re-run with 'go' AND a mode to apply:"
+    printf '  %s>>   %s flatten go --sidecar    (relocate each .git -> %s)%s\n' "$C_BLUE" "$US" "$GIT_SIDECAR_DIRNAME" "$C_RESET"
+    printf '  %s>>   %s flatten go --merge       (delete each .git; history not kept)%s\n' "$C_BLUE" "$US" "$C_RESET"
+    printf '  %s>>   %s flatten go --zip         (archive each .git -> .zip)%s\n' "$C_BLUE" "$US" "$C_RESET"
+    printf '  %s>>   %s flatten go -i            (choose --sidecar/--merge/--zip per repo)%s\n' "$C_BLUE" "$US" "$C_RESET"
     exit 0
   fi
 
@@ -9781,7 +9798,7 @@ _RT_CONF_EOF
       git commit -q -m addsrc )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     cd global || return 1
-    _rt_ok "flatten go" _rt_my_git flatten go || return 1
+    _rt_ok "flatten go --sidecar" _rt_my_git flatten go --sidecar || return 1
     _rt_gitlink_mode "src content converted to plain files" src/x.txt 100644 || return 1
     _rt_clean "clean after" || return 1
     return 0
@@ -11496,22 +11513,24 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  test_flatten_go_without_mode_guides() {
-    # 'flatten go' with no mode, when the only actionable items are existing
-    # sidecars (a --zip thing), must LOUDLY say nothing changed + echo the
-    # --zip command — not silently look like an analyze overview. And it must
-    # not touch the sidecar (go did nothing).
+  test_flatten_go_without_mode_refused() {
+    # Bare 'flatten go' (no mode, no -i) is REFUSED — flattening must pick a
+    # mode (--sidecar/--merge/--zip). The refusal explains it and touches
+    # nothing. (The old keep-live/mirror default is gone.)
     _rt_repo_file kid_o k.txt
     _rt_repo top
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd top && git clone -q ../kid_o sc >/dev/null 2>&1 )
     cd top || return 1
     _rt_ok "sidecar sc" _rt_my_git flatten go sc --sidecar || return 1
-    _rt_ok "flatten go (no mode)" _rt_my_git flatten go || return 1
-    _rt_contains "says nothing changed" "$_rt_out" "Nothing changed" || return 1
-    _rt_contains "tells the user to pick a mode" "$_rt_out" "PICK A MODE" || return 1
-    _rt_contains "echoes the --zip command" "$_rt_out" "flatten go --zip" || return 1
-    _rt_isdir "sidecar untouched (go did nothing)" sc/.git.real || return 1
+    # bare 'flatten go' must FAIL (need a mode); message goes to stderr
+    if _rt_my_git flatten go >"$_rt_out" 2>"$_rt_err"; then
+      _rt_fail "bare 'flatten go' should be refused (needs a mode)"; return 1
+    fi
+    _rt_contains "refusal explains it needs a mode" "$_rt_err" "flatten go needs a mode" || return 1
+    _rt_contains "refusal offers --sidecar" "$_rt_err" "--sidecar" || return 1
+    _rt_contains "refusal offers --zip" "$_rt_err" "--zip" || return 1
+    _rt_isdir "existing sidecar untouched" sc/.git.real || return 1
     return 0
   }
 
@@ -11620,7 +11639,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_guides test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
