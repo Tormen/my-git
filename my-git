@@ -4216,9 +4216,11 @@ _FL_EMB_REALIZE_EOF
   # ── --zip mode ────────────────────────────────────────────────────────
   # Archive git dirs into a .zip (the 'gz' operation, ported here so my-git
   # never depends on a shell function). With a PATH: that one repo/sidecar.
-  # Bulk (no PATH): every SIDECAR under the toplevel — compress them all;
-  # live nested repos are deliberately left alone in bulk (zip one on
-  # purpose by naming its path). Analyze by default; 'go' to apply.
+  # Bulk (no PATH): every SIDECAR (.git.real -> .git.real.zip) AND every plain
+  # live nested repo (.git -> .git.zip) under the toplevel — EXCEPT shadowed
+  # repos, whose live .git is being actively used (never bulk-zip those; zip
+  # one on purpose by naming its path if you really mean it). Pair with
+  # --local-only to archive just the no-remote (⌂) ones. Analyze by default.
   if [ "$_fl_forced_mode" = zip ]; then
     if [ -n "$_fl_scope_path" ]; then
       is_git_repo_or_flattened "$_fl_scope_path" || \
@@ -4229,10 +4231,19 @@ _FL_EMB_REALIZE_EOF
       fi
       _fl_zip_targets=$_fl_scope_path
     else
-      _fl_zip_targets=$(list_realized_dirs "$_fl_top")
+      # Sidecars (.git.real) + plain live nested repos (.git), MINUS shadowed
+      # repos (their live .git is in active use — never bulk-zip those).
+      _fl_zip_shadowed=$(list_shadowed_dirs "$_fl_top")
+      _fl_zip_live=$(list_unregistered_nested "$_fl_top" | while IFS= read -r _fl_zl; do
+        [ -n "$_fl_zl" ] || continue
+        printf '%s\n' "$_fl_zip_shadowed" | grep -qxF "$_fl_zl" && continue
+        printf '%s\n' "$_fl_zl"
+      done)
+      _fl_zip_targets=$(printf '%s\n%s\n' "$(list_realized_dirs "$_fl_top")" "$_fl_zip_live" \
+                          | grep -v '^$' | sort -u)
       if [ -z "$_fl_zip_targets" ]; then
-        log_major "flatten --zip: no sidecars under $_fl_top to archive"
-        log_medium "(pass a PATH to zip a specific live repo or sidecar)"
+        log_major "flatten --zip: no sidecars or plain live nested repos under $_fl_top to archive"
+        log_medium "(shadowed repos are skipped in bulk — zip one on purpose by naming its path)"
         return 0
       fi
     fi
@@ -5660,6 +5671,89 @@ _shadow_write_status() {
   } > "$_sws_file" 2>/dev/null || log_warn "$_sws_p: could not write $_sws_file (cosmetic only, not fatal)"
 }
 
+# The parent-repo pre-commit hook installed by 'shadow' bumps each shadowed
+# repo's 'last-shadowed' at COMMIT time (atomically, in the same commit) when
+# that commit stages content for it. This is the authoritative "mirror last
+# updated" timestamp — 'ga'/'git add' no longer touch it. The managed block is
+# delimited by these markers so we can install/refresh/remove it idempotently
+# and NEVER clobber a foreign pre-commit hook.
+_SHADOW_HOOK_BEGIN='# >>> my-git shadow (managed block — bumps last-shadowed on commit) >>>'
+_SHADOW_HOOK_END='# <<< my-git shadow (managed block) <<<'
+
+# _shadow_hook_block  — emit the managed block (without the '#!'/shebang, so it
+# can be appended to an existing shell hook too). Self-contained POSIX sh.
+_shadow_hook_block() {
+  printf '%s\n' "$_SHADOW_HOOK_BEGIN"
+  cat <<'HOOK'
+# Managed by 'my-git shadow'. For each shadowed repo (a dir with a live .git
+# and a .git.shadow.status marker) that THIS commit stages content into, bump
+# 'last-shadowed' to now and re-stage the marker so it rides in this commit.
+_mgs_top=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$_mgs_top" ]; then
+  _mgs_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  find "$_mgs_top" -type f -name .git.shadow.status 2>/dev/null | while IFS= read -r _mgs_f; do
+    _mgs_kid=${_mgs_f%/.git.shadow.status}
+    [ -e "$_mgs_kid/.git" ] || continue
+    # staged content under this repo, OTHER than the marker itself? (capture +
+    # test -n: robust to BSD grep returning 0 on empty input)
+    _mgs_chg=$(git -C "$_mgs_top" diff --cached --name-only -- "$_mgs_kid" 2>/dev/null | grep -v '/\.git\.shadow\.status$')
+    [ -n "$_mgs_chg" ] || continue
+    _mgs_tmp="$_mgs_f.mgs.$$"
+    awk -v now="$_mgs_now" '/^last-shadowed: /{print "last-shadowed: " now; next} {print}' "$_mgs_f" > "$_mgs_tmp" 2>/dev/null \
+      && mv "$_mgs_tmp" "$_mgs_f" 2>/dev/null \
+      && git -C "$_mgs_top" add -f -- "$_mgs_f" 2>/dev/null
+  done
+fi
+HOOK
+  printf '%s\n' "$_SHADOW_HOOK_END"
+}
+
+# _shadow_install_hook <abs-git-dir>  — ensure the parent's pre-commit hook
+# carries the managed block. Creates it if absent; leaves ours as-is if already
+# present; refuses to touch a FOREIGN hook (warns with the manual snippet).
+_shadow_install_hook() {
+  _sih_gd=$1
+  [ -n "$_sih_gd" ] && [ -d "$_sih_gd" ] || return 0
+  _sih_hook="$_sih_gd/hooks/pre-commit"
+  if [ -f "$_sih_hook" ]; then
+    if grep -qF "$_SHADOW_HOOK_BEGIN" "$_sih_hook" 2>/dev/null; then
+      log_dbg_med "shadow: pre-commit hook already carries the managed block ($_sih_hook)"
+      return 0
+    fi
+    log_warn "shadow: $_sih_hook already exists and is NOT managed by my-git — NOT modifying it. 'last-shadowed' won't auto-update on commit until you paste the managed block into it (see '$US --help shadow')."
+    return 0
+  fi
+  run mkdir -p "$_sih_gd/hooks" 2>/dev/null
+  { printf '#!/bin/sh\n'; _shadow_hook_block; } > "$_sih_hook" 2>/dev/null \
+    && chmod +x "$_sih_hook" 2>/dev/null \
+    && log_dbg_med "shadow: installed pre-commit hook ($_sih_hook)" \
+    || log_warn "shadow: could not write pre-commit hook at $_sih_hook (last-shadowed won't auto-update on commit)"
+}
+
+# _shadow_uninstall_hook <abs-git-dir>  — remove the managed block when the last
+# shadow is gone. If the hook was ONLY our block (we created it), delete it;
+# otherwise strip just our lines and leave the rest of a foreign hook intact.
+_shadow_uninstall_hook() {
+  _suh_gd=$1
+  [ -n "$_suh_gd" ] && [ -d "$_suh_gd" ] || return 0
+  _suh_hook="$_suh_gd/hooks/pre-commit"
+  [ -f "$_suh_hook" ] || return 0
+  grep -qF "$_SHADOW_HOOK_BEGIN" "$_suh_hook" 2>/dev/null || return 0
+  # Strip our block (from BEGIN to END inclusive).
+  _suh_tmp="$_suh_hook.mgs.$$"
+  awk -v b="$_SHADOW_HOOK_BEGIN" -v e="$_SHADOW_HOOK_END" '
+    index($0,b){skip=1} skip{ if(index($0,e))skip=0; next } {print}' \
+    "$_suh_hook" > "$_suh_tmp" 2>/dev/null || { rm -f "$_suh_tmp"; return 0; }
+  # If what remains is just a shebang + blank lines, remove the file entirely.
+  if [ -z "$(grep -vE '^#!|^[[:space:]]*$' "$_suh_tmp" 2>/dev/null | head -1)" ]; then
+    rm -f "$_suh_hook" "$_suh_tmp" 2>/dev/null
+    log_dbg_med "shadow: removed now-empty pre-commit hook ($_suh_hook)"
+  else
+    cat "$_suh_tmp" > "$_suh_hook" 2>/dev/null; rm -f "$_suh_tmp" 2>/dev/null
+    log_dbg_med "shadow: stripped the managed block from $_suh_hook (left the rest)"
+  fi
+}
+
 # _shadow_one <path>  — the move-aside bootstrap for ONE nested repo. Writes
 # the .git.shadow.status marker, stages its files (incl. the marker) into the
 # parent index, and excludes the marker from the nested repo's own status; a
@@ -5791,9 +5885,15 @@ cmd_shadow() {
     eval "run git commit -q -m \"my-git shadow: content-mirror into the parent (live .git kept)\" -- $_sh_commit" >/dev/null 2>&1 \
       || log_warn "shadow: commit failed — staged content left for manual commit"
   fi
+  # Install the parent pre-commit hook that keeps 'last-shadowed' current at
+  # commit time (idempotent; never clobbers a foreign hook).
+  if [ "$_sh_ok" -gt 0 ]; then
+    _sh_gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null)
+    _shadow_install_hook "$_sh_gitdir"
+  fi
   echo
   if [ "$_sh_ok" -gt 0 ]; then
-    log_ok "shadow: $_sh_ok repo(s) now mirrored into the parent — their .git is still LIVE (IDE works). New files: run 'ga' (or 'mc') to keep the mirror current.$([ "$_sh_skip" -gt 0 ] && printf ' %s skipped.' "$_sh_skip")$([ "$_sh_fail" -gt 0 ] && printf ' %s FAILED.' "$_sh_fail")"
+    log_ok "shadow: $_sh_ok repo(s) now mirrored into the parent — their .git is still LIVE (IDE works). Ordinary 'git add'/'mc' keep the mirror current; 'last-shadowed' bumps on commit.$([ "$_sh_skip" -gt 0 ] && printf ' %s skipped.' "$_sh_skip")$([ "$_sh_fail" -gt 0 ] && printf ' %s FAILED.' "$_sh_fail")"
   else
     log_major "shadow: nothing shadowed$([ "$_sh_skip" -gt 0 ] && printf ' (%s skipped)' "$_sh_skip")$([ "$_sh_fail" -gt 0 ] && printf ' (%s failed)' "$_sh_fail")."
   fi
@@ -5914,6 +6014,11 @@ cmd_unshadow() {
       :
     else
       log_warn "unshadow: commit failed — staged removal left for manual commit"
+    fi
+    # If no shadowed repo remains under the parent, retire the pre-commit hook
+    # (removes our managed block; deletes the hook only if it was solely ours).
+    if [ -z "$(list_shadowed_dirs "$_ush_top")" ]; then
+      _shadow_uninstall_hook "$(git rev-parse --absolute-git-dir 2>/dev/null)"
     fi
   fi
   echo
@@ -7064,9 +7169,12 @@ Choosing a mode (all three behave the same way here):
                                prompting. --sidecar/--merge convert every
                                nested LIVE repo (incl. registered submodules,
                                which bare 'go' leaves untouched); --zip
-                               archives every existing SIDECAR under the
-                               toplevel (a live nested repo is zipped only
-                               when named explicitly by path).
+                               archives every SIDECAR (.git.real -> .zip) AND
+                               every plain live nested repo (.git -> .zip)
+                               under the toplevel — EXCEPT shadowed repos
+                               (skipped in bulk; zip one by naming its path).
+                               Pair with --local-only to archive just the ⌂
+                               ones.
   go -i --sidecar|--merge|--zip
                                instead of bulk, ask per repo one by one (works
                                with EVERY mode): [Y]es this one / [s]kip it /
@@ -7304,8 +7412,18 @@ plain 'git add' / 'git add -A' / 'git status' all descend into it normally.
 Afterwards the two stay in sync with NO special mechanism:
   - ordinary 'git add' / 'mc' (git add -A) carry new files + mods + deletions
     straight through — the live .git no longer blocks them;
-  - the 'ga' shell alias adds nothing extra here; it just bumps the marker's
-    'last-shadowed' timestamp for repos it actually staged (etc/zshrc.mine).
+  - 'last-shadowed' is bumped at COMMIT time by a pre-commit hook that shadow
+    installs in the PARENT repo (see below) — 'ga'/'git add' don't touch it.
+
+The pre-commit hook:
+  Installed at <parent-git-dir>/hooks/pre-commit as a small managed block
+  (delimited by 'my-git shadow (managed block ...)' markers). On every commit
+  it bumps 'last-shadowed' to now, and re-stages the marker so it rides in the
+  SAME commit, for each shadowed repo that commit stages content into (only
+  those — untouched repos are left alone). It is idempotent, and NEVER
+  clobbers a pre-existing foreign pre-commit hook (it warns instead, and you
+  can paste the managed block in by hand). 'unshadow' removes the block when
+  the last shadow under the parent is gone (deleting the hook if it was ours).
 
 Targets:
   <path>       shadow (or re-shadow, refreshing last-shadowed) that one repo.
@@ -12065,6 +12183,33 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_flatten_zip_bulk_includes_plain_live_repos() {
+    # Bulk 'flatten --zip' archives PLAIN live nested repos (.git -> .git.zip),
+    # not just sidecars — but SKIPS shadowed repos (live .git in active use).
+    # --local-only narrows to the no-remote (⌂) ones.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && mkdir loc && cd loc && git init -q && git config user.email t@t.com \
+        && git config user.name t && echo a > f && git add f && git commit -qm x )   # plain, no remote
+    ( cd top && git clone -q ../kid_o pub >/dev/null 2>&1 )                            # plain, has origin
+    ( cd top && git clone -q ../kid_o shad >/dev/null 2>&1 )                           # will be shadowed
+    cd top || return 1
+    _rt_ok "shadow shad" _rt_my_git shadow go shad || return 1
+    _rt_ok "flatten --zip --local-only go" _rt_my_git flatten go --zip --local-only || return 1
+    # plain local-only repo -> zipped
+    _rt_exists "plain local-only .git archived" loc/.git.zip || return 1
+    _rt_absent "plain local-only live .git gone" loc/.git || return 1
+    # plain repo WITH a remote -> excluded by --local-only
+    _rt_absent "published plain repo NOT archived" pub/.git.zip || return 1
+    _rt_isdir "published plain repo still live" pub/.git || return 1
+    # shadowed repo -> never bulk-zipped, stays live + shadowed
+    _rt_absent "shadowed repo NOT archived" shad/.git.zip || return 1
+    _rt_isdir "shadowed repo still live" shad/.git || return 1
+    _rt_exists "shadowed marker intact" shad/.git.shadow.status || return 1
+    return 0
+  }
+
   test_flatten_go_without_mode_refused() {
     # Bare 'flatten go' (no mode, no -i) is REFUSED — flattening must pick a
     # mode (--sidecar/--merge/--zip). The refusal explains it and touches
@@ -12344,7 +12489,65 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_upstream_on_other_branch_message test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_shadow_bulk_and_refuses_toplevel"
+  test_shadow_hook_bumps_last_shadowed_on_commit() {
+    # shadow installs a parent pre-commit hook that bumps 'last-shadowed' at
+    # COMMIT time — ONLY for shadowed repos that commit stages content into,
+    # atomically (marker rides in the same commit). Untouched repos stay put;
+    # the hook is retired when the last shadow is removed.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o a >/dev/null 2>&1 && git clone -q ../kid_o b >/dev/null 2>&1 )
+    cd top || return 1
+    _rt_ok "shadow go" _rt_my_git shadow go || return 1
+    _rt_exists "pre-commit hook installed" .git/hooks/pre-commit || return 1
+    grep -qF 'my-git shadow (managed block' .git/hooks/pre-commit \
+      || { _rt_fail "hook missing the managed block"; return 1; }
+    _a0=$(sed -n 's/^last-shadowed: //p' a/.git.shadow.status | head -1)
+    _b0=$(sed -n 's/^last-shadowed: //p' b/.git.shadow.status | head -1)
+    # touch a NEW file in 'a' only, then a normal commit
+    echo new > a/brand.txt
+    sleep 1
+    git add -A >/dev/null 2>&1
+    git commit -q -m "touch a" >/dev/null 2>&1 || { _rt_fail "commit failed"; return 1; }
+    _a1=$(sed -n 's/^last-shadowed: //p' a/.git.shadow.status | head -1)
+    _b1=$(sed -n 's/^last-shadowed: //p' b/.git.shadow.status | head -1)
+    [ "$_a0" != "$_a1" ] || { _rt_fail "a's last-shadowed should bump on commit (was $_a0)"; return 1; }
+    [ "$_b0" = "$_b1" ] || { _rt_fail "b (untouched) last-shadowed must NOT change"; return 1; }
+    # bumped marker rode in the commit — nothing left staged/dirty
+    if [ -n "$(git status --porcelain a/.git.shadow.status 2>/dev/null)" ]; then
+      _rt_fail "a's marker left dirty — not committed atomically by the hook"; return 1
+    fi
+    git show --stat --oneline HEAD 2>/dev/null | grep -qF 'a/.git.shadow.status' \
+      || { _rt_fail "the bumped marker should be part of that commit"; return 1; }
+    # remove the last shadow -> hook retired
+    _rt_ok "unshadow go" _rt_my_git unshadow go || return 1
+    _rt_absent "pre-commit hook retired after last unshadow" .git/hooks/pre-commit || return 1
+    return 0
+  }
+
+  test_shadow_hook_preserves_foreign_precommit() {
+    # A pre-existing FOREIGN pre-commit hook must never be clobbered — shadow
+    # warns and leaves it intact (last-shadowed just won't auto-bump).
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd top || return 1
+    mkdir -p .git/hooks
+    printf '#!/bin/sh\necho custom-hook\nexit 0\n' > .git/hooks/pre-commit
+    chmod +x .git/hooks/pre-commit
+    _rt_ok "shadow go with a foreign hook" _rt_my_git shadow go kid || return 1
+    _rt_contains "warns it won't touch the foreign hook" "$_rt_err" "NOT managed by my-git" || return 1
+    if grep -qF 'my-git shadow' .git/hooks/pre-commit; then
+      _rt_fail "foreign pre-commit hook was clobbered"; return 1
+    fi
+    grep -qF 'echo custom-hook' .git/hooks/pre-commit \
+      || { _rt_fail "foreign hook content was lost"; return 1; }
+    return 0
+  }
+
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_upstream_on_other_branch_message test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
