@@ -40,16 +40,18 @@ own submodules' commit SHAs. What lives *inside* a submodule is that
 submodule's responsibility, not the super's. `-R` is the escape hatch
 for "I want ONE command to settle a whole nested tree."
 
-## Nested repos: three cases
+## Nested repos: archived / private / published
 
-Every nested `.git` in a tree my-git manages is exactly one of three
-cases, and each has exactly one right answer:
+Every nested `.git` in a tree my-git manages falls into one of these
+cases; the right answer for a **published** repo depends on how often you
+still develop it here:
 
 | # | Case | Meaning | Handling |
 |---|------|---------|----------|
 | 1 | **Archived** | Kept only for its history; never developed or pushed to again. | `my-git flatten go <path> --zip` — archive its `.git` (or a `.git.real` sidecar, `+.status`) into a single `.zip` the parent tracks as content (`st` shows it `[zipped]`); `unflatten --zip` restores it, `-k`/`--keep` archives alongside instead of replacing. The `gz`/`gu` shell aliases (`etc/zshrc.mine`) do the same thing interactively without my-git. |
-| 2 | **Private** | Developed here, but never published outside this machine (no real origin). | `my-git flatten go` merges it into the parent as plain content and drops its `.git`. No separate history is kept — a repo that's never published shouldn't have had its own identity to begin with. |
-| 3 | **Published** | Developed here AND pushed to its own origin (e.g. GitHub). | Toggle between `flatten --sidecar` (relocate its `.git` into a self-contained `.git.real` alongside the parent-tracked files) and `unflatten --sidecar` (bring it back to its normal live `.git` to resume developing/pushing) as needed — the parent still fully captures its files either way, not just its origin URL, so a fresh clone of the parent needs no extra `submodule update` step. |
+| 2 | **Private** | Developed here, but never published outside this machine (no real origin). | `my-git flatten go <path> --merge` merges it into the parent as plain content and **deletes** its `.git`. No separate history is kept — a repo that's never published shouldn't have had its own identity to begin with. |
+| 3a | **Published, seldom changed here** | Pushed to its own origin; you rarely edit it locally. | Toggle `flatten --sidecar` (relocate its `.git` into a self-contained `.git.real` alongside the parent-tracked files) ↔ `unflatten --sidecar` (back to a live `.git` to resume developing/pushing). The parent captures its files either way, so a fresh clone needs no `submodule update`. **Caveat:** while sidecared, its git dir is `.git.real`, which **no IDE/editor recognizes** — fine when you're not actively editing it. |
+| 3b | **Published, actively developed here** | Pushed to its origin AND edited here often, so you need live IDE git integration. | **Content-mirror** — keep the **live `.git`** (so the IDE works) *and* have the parent track its files too. Bootstrap once (momentarily set `.git` aside, `git add -f` its files into the parent, restore the live `.git`); thereafter `mc`'s `git add -A` carries mods+deletions and the `ga` alias force-adds any *new* files by explicit path. Sidecaring is **unacceptable** here — `.git.real` breaks IDE git. *(This one-shot bootstrap is not yet a single my-git command — planned as a dedicated `mirror`; today it's the `ga` alias plus the manual bootstrap. See `README.OLD.md`.)* |
 
 Concrete examples on this machine:
 
@@ -616,15 +618,15 @@ merged paths via `.git.merged` (`[merged]`), zipped paths via `.git*.zip`
 
 ## Not yet implemented
 
-Everything the three-case model called for is built: `flatten`/
-`unflatten` with `--sidecar`/`--merge`, the `.status`/`.git.merged`
-snapshots, the sidecar-aware `ga`/`gz`/`gu` aliases, and self-deploying
-zsh completions (see below). What's left is unrelated to the case
-model — older exploration parked in [README.OLD.md](README.OLD.md): a
-live content-mirror for case 3 that keeps a *published,
-still-developed* repo's `.git` live while the parent *also* tracks its
-bytes directly. None of it has a decided, concise answer yet — that's
-why it's parked rather than folded in here.
+Most of the case model is built: `flatten`/`unflatten` with
+`--sidecar`/`--merge`/`--zip`, the `.status`/`.git.merged` snapshots, the
+sidecar-aware `ga`/`gz`/`gu` aliases, and self-deploying zsh completions
+(see below). The one piece **not yet a single command** is **case 3b's
+content-mirror** — keeping an actively-developed *published* repo's `.git`
+**live** (so the IDE works) while the parent *also* tracks its bytes,
+bootstrapped once then maintained by `ga`. It's parked in
+[README.OLD.md](README.OLD.md) as a planned dedicated `mirror` command;
+today it's the `ga` alias plus the manual bootstrap.
 
 **Zsh completions** deploy themselves on first real use — every
 invocation that reaches an actual subcommand (not `--run-tests`,
