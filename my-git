@@ -3573,13 +3573,13 @@ _FL_ADD_EOF
         printf 'registered\t%s\t%s\n' "$_p" "$_ch" >> "$_fl_choices_file"
         continue
       fi
-      printf "  's' skip      — leave alone (standard 'go' default for registered subs)\n" >/dev/tty
-      printf "  'r' sidecar   — merge files into parent repo, relocate git history into %s/%s — self-contained, portable, no ongoing parent-side bookkeeping    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
-      printf "  'f' flatten   — merge files into parent repo, keep nested git history under .git/modules/%s/ as backup    [-i EXCLUSIVE CHOICE]\n" "$_name" >/dev/tty
-      printf "  'd' delete    — merge files AND delete nested git history under .git/modules/%s/ (irreversible)             [-i EXCLUSIVE CHOICE]\n" "$_name" >/dev/tty
-      printf "  'a' abort     — cancel the whole flatten\n" >/dev/tty
-      printf "  'g' go        — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
-      printf "  UPPERCASE any choice (e.g. 'S') to bulk-apply it to every remaining registered submodule only\n" >/dev/tty
+      printf "  's' sidecar  — absorb files into the parent, RELOCATE git history into %s/%s (self-contained, portable, no parent-side bookkeeping)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
+      printf "  'm' merge    — absorb files into the parent, DELETE nested git history under .git/modules/%s/ (a .git.merged snapshot is written first)    [-i EXCLUSIVE CHOICE]\n" "$_name" >/dev/tty
+      printf "  'k' skip     — leave the submodule registered, untouched (default for registered subs)\n" >/dev/tty
+      printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
+      printf "  'g' go       — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+      printf "  (to ZIP-archive one instead: '%s flatten go %s --zip' — not offered per-item here yet)\n" "$US" "$_p" >/dev/tty
+      printf "  UPPERCASE a mode (S/M) to bulk-apply it to every remaining registered submodule only\n" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
         printf '  choice: ' >/dev/tty
@@ -3589,12 +3589,11 @@ _FL_ADD_EOF
           _ch=skip
         else
         case "$_fl_ans_letter" in
-          s)     _ch=skip ;;
-          r)     _ch=sidecar ;;
-          f)     _ch=flatten ;;
-          d)     _ch=delete ;;
+          s)     _ch=sidecar ;;
+          m)     _ch=delete ;;   # 'merge' = delete history AFTER writing a .git.merged snapshot
+          k)     _ch=skip ;;
           a)     printf '  -> abort\n' >/dev/tty; return 77 ;;
-          *)     printf "  ? unrecognized: '%s' — please answer s, r, f, d, a, or g (or UPPERCASE of s/r/f/d)\n" "$_ans" >/dev/tty ;;
+          *)     printf "  ? unrecognized: '%s' — please answer s, m, k, a, or g (UPPERCASE S/M = bulk)\n" "$_ans" >/dev/tty ;;
         esac
         fi
       done
@@ -3614,7 +3613,7 @@ _FL_REG_EOF
       _fl_item_dead=0
       _fl_realize_would_fail "$_p" && _fl_item_dead=1
       if [ "$_fl_item_dead" = 1 ]; then
-        printf "  %s⚠ this item's git history is already gone (its gitdir pointer doesn't resolve, even via %s) — 'sidecar' will fail here; 'flatten' or 'delete' instead%s\n" \
+        printf "  %s⚠ this item's git history is already gone (its gitdir pointer doesn't resolve, even via %s) — 'sidecar' will fail here; use 'm' merge instead%s\n" \
           "$C_YELLOW" "$GIT_SIDECAR_DIRNAME" "$C_RESET" >/dev/tty
       fi
       if [ "$_fl_global_go" = 1 ]; then
@@ -3625,21 +3624,21 @@ _FL_REG_EOF
       if [ -n "$_fl_emb_bulk" ]; then
         _ch=$_fl_emb_bulk
         if [ "$_ch" = sidecar ] && [ "$_fl_item_dead" = 1 ]; then
-          _ch=flatten
-          printf "  (bulk choice in effect: sidecar — but this item's history is already gone, so sidecar would fail; applying 'flatten' here instead)\n" >/dev/tty
+          _ch=delete
+          printf "  (bulk choice in effect: sidecar — but this item's history is already gone, so sidecar would fail; applying 'merge' here instead)\n" >/dev/tty
         else
           printf "  (bulk choice in effect: %s)\n" "$_ch" >/dev/tty
         fi
         printf 'embedded\t%s\t%s\n' "$_p" "$_ch" >> "$_fl_choices_file"
         continue
       fi
-      printf "  'f' flatten   — merge files into parent repo, keep the nested .git so its history stays usable (standard 'go')\n" >/dev/tty
-      printf "  'r' sidecar   — merge files into parent repo, relocate git history into %s/%s — self-contained, no live .git left sitting in the tree    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
-      printf "  'd' delete    — merge files AND delete the nested .git (standard 'go --rm-git')\n" >/dev/tty
-      printf "  's' skip      — leave alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
-      printf "  'a' abort     — cancel the whole flatten\n" >/dev/tty
-      printf "  'g' go        — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
-      printf "  UPPERCASE any choice (e.g. 'S') to bulk-apply it to every remaining embedded repo only\n" >/dev/tty
+      printf "  's' sidecar  — absorb files into the parent, RELOCATE history into %s/%s (self-contained, no live .git left)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
+      printf "  'm' merge    — absorb files into the parent, DELETE the nested .git (a .git.merged snapshot is written first, so 'unflatten --merge' can reconstruct)\n" >/dev/tty
+      printf "  'k' skip     — leave alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
+      printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
+      printf "  'g' go       — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+      printf "  (to ZIP-archive one instead: '%s flatten go %s --zip' — not offered per-item here yet)\n" "$US" "$_p" >/dev/tty
+      printf "  UPPERCASE a mode (S/M) to bulk-apply it to every remaining embedded repo only\n" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
         printf '  choice: ' >/dev/tty
@@ -3649,20 +3648,19 @@ _FL_REG_EOF
           _ch=skip
         else
         case "$_fl_ans_letter" in
-          f)     _ch=flatten ;;
-          r)     _ch=sidecar ;;
-          d)     _ch=delete ;;
-          s)     _ch=skip ;;
+          s)     _ch=sidecar ;;
+          m)     _ch=delete ;;   # 'merge' = delete .git AFTER writing a .git.merged snapshot
+          k)     _ch=skip ;;
           a)     printf '  -> abort\n' >/dev/tty; return 77 ;;
-          *)     printf "  ? unrecognized: '%s' — please answer f, r, d, s, a, or g (or UPPERCASE of f/r/d/s)\n" "$_ans" >/dev/tty ;;
+          *)     printf "  ? unrecognized: '%s' — please answer s, m, k, a, or g (UPPERCASE S/M = bulk)\n" "$_ans" >/dev/tty ;;
         esac
         fi
       done
       [ "$_fl_ans_mode" = typebulk ] && _fl_emb_bulk=$_ch
       [ "$_fl_ans_mode" = global ]   && _fl_global_go=1
       if [ "$_ch" = sidecar ] && [ "$_fl_item_dead" = 1 ]; then
-        printf "  (this item's history is already gone — sidecar would fail; applying 'flatten' here instead)\n" >/dev/tty
-        _ch=flatten
+        printf "  (this item's history is already gone — sidecar would fail; applying 'merge' here instead)\n" >/dev/tty
+        _ch=delete
       fi
       printf 'embedded\t%s\t%s\n' "$_p" "$_ch" >> "$_fl_choices_file"
     done <<_FL_EMB_EOF
