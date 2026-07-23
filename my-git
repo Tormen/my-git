@@ -1,7 +1,8 @@
 #!/bin/sh
 # my-git — multi-repo git dispatcher with recursive submodule support.
 #
-# Subcommands:  status|st|s   masscommits|mc|c   submodules|sub|sm   claude-check
+# Subcommands:  status|st|s   masscommits|mc|c   submodules|sub|sm   pull   sync
+#               remote   flatten|unflatten   shadow|unshadow   audit   repair
 # Global opts:  -V|-VV   -D|-DD   --config FILE   --create-config   -h|--help
 #
 # See:  my-git --help   (or: my-git --help <subcommand>)
@@ -5547,6 +5548,258 @@ cmd_unflatten() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════
+# ═══ SHADOW / UNSHADOW (content-mirror: keep .git LIVE, parent tracks files)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# 'shadow' is the case-3b answer (README): a nested repo you actively develop
+# here AND publish to its own origin. UNLIKE flatten (which disposes of the
+# live .git — relocate/delete/archive), shadow KEEPS the live .git so the
+# IDE/editor git integration keeps working, while making the PARENT ALSO track
+# its files (a content-mirror / copy). Bootstrap via MOVE-ASIDE: momentarily
+# move <path>/.git out of the worktree so 'git add -f' stages the files as
+# ordinary content (git's embedded-repo boundary is gone while .git is
+# absent), then restore the live .git. Thereafter 'mc's git add -A carries
+# mods+deletions and the 'ga' alias force-adds NEW files by explicit path.
+# 'unshadow' reverses it: 'git rm --cached' the parent's copy (the live .git
+# is left alone — it was already live).
+
+# _shadow_one <path>  — the move-aside bootstrap for ONE nested repo. Stages
+# its files into the parent index; a trap restores .git on interrupt so a
+# crash can't lose it. Does NOT commit (caller commits, scoped). Runs in a
+# subshell so the trap is contained; the staged index lives on disk and
+# persists past it. Returns 0 on success.
+_shadow_one() {
+  _sho_p=$1
+  _sho_gd="$_sho_p/.git"
+  [ -e "$_sho_gd" ] || { log_error "shadow: $_sho_p has no live .git — nothing to shadow"; return 1; }
+  log_dbg_med "shadow: $_sho_p — move .git aside, 'git add -f', restore .git live"
+  ( _sho_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.shadow.XXXXXX") || { log_error "shadow: mktemp -d failed"; exit 1; }
+    # restore .git on interrupt (contained to this subshell)
+    trap 'mv -- "$_sho_tmp/gitdir" "$_sho_gd" 2>/dev/null' INT TERM HUP
+    if ! run mv -- "$_sho_gd" "$_sho_tmp/gitdir"; then
+      log_error "shadow: $_sho_p: could not move .git aside"; rmdir "$_sho_tmp" 2>/dev/null; exit 1
+    fi
+    run git add -f -- "$_sho_p"; _sho_rc=$?
+    if ! run mv -- "$_sho_tmp/gitdir" "$_sho_gd"; then
+      log_error "shadow: $_sho_p: FAILED to restore .git! It is at $_sho_tmp/gitdir — move it back to $_sho_gd BY HAND."; exit 2
+    fi
+    rmdir "$_sho_tmp" 2>/dev/null
+    exit $_sho_rc
+  )
+}
+
+# my-git shadow [go] [-i] [path]     (analyze by default)
+cmd_shadow() {
+  _sh_mode=analyze; _sh_interactive=0; _sh_scope_raw=""; _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help shadow; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      go)           _sh_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _sh_mode=analyze ;;
+      -i|--interactive) _sh_interactive=1; require_tty shadow ;;
+      -R|--recursive) RECURSIVE=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "shadow: unknown option: $1" 64 ;;
+      *)            [ -n "$_sh_scope_raw" ] && fatal "shadow: only one path argument is supported" 64
+                    _sh_scope_raw=$1 ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+  _sh_top=$(git_toplevel_of "$PWD"); [ -n "$_sh_top" ] || fatal "shadow: not inside a git repo" 1
+  _sh_scope=""
+  if [ -n "$_sh_scope_raw" ]; then
+    _sh_abs=$(cd "$_sh_scope_raw" 2>/dev/null && pwd -P) || fatal "shadow: '$_sh_scope_raw': no such directory" 1
+    _sh_top_abs=$(cd "$_sh_top" 2>/dev/null && pwd -P)
+    case "$_sh_abs" in
+      "$_sh_top_abs")   fatal "shadow: '$_sh_scope_raw' is the toplevel itself, not a nested repo" 64 ;;
+      "$_sh_top_abs"/*) _sh_scope=${_sh_abs#"$_sh_top_abs"/} ;;
+      *)                fatal "shadow: '$_sh_scope_raw' is not inside $_sh_top" 64 ;;
+    esac
+  fi
+  cd "$_sh_top" || fatal "shadow: cannot cd to $_sh_top" 1
+
+  if [ -n "$_sh_scope" ]; then
+    [ -e "$_sh_scope/.git" ] || fatal "shadow: '$_sh_scope' is not a nested LIVE repo (no live .git). shadow keeps a live .git — for a sidecar/merged/zipped path use flatten/unflatten." 1
+    _sh_list=$_sh_scope
+  else
+    _sh_list=$(list_unregistered_nested "$_sh_top")
+    if [ -z "$_sh_list" ]; then
+      log_major "$_sh_top: no embedded nested repos to shadow (name a PATH to shadow one explicitly)"
+      exit 0
+    fi
+  fi
+
+  if [ "$_sh_mode" != go ]; then
+    log_major "$_sh_top: shadow plan (keep the LIVE .git; make the parent track the files too)"
+    printf '%s\n' "$_sh_list" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      printf '  %s>> %s   (git add -f its files -> parent; .git stays LIVE — IDE keeps working)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+    done
+    echo
+    log_major "This was analyze-only — re-run with 'go' to apply:"
+    printf '  %s>>   %s shadow go %s%s%s\n' "$C_BLUE" "$US" "$([ "$_sh_interactive" = 1 ] && printf -- '-i ')" "${_sh_scope:-}" "$C_RESET"
+    exit 0
+  fi
+
+  _sh_oifs=$IFS; IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $_sh_list
+  IFS=$_sh_oifs
+  _sh_ok=0; _sh_fail=0; _sh_skip=0; _sh_i=0; _sh_total=$#; _sh_commit=""
+  for _p in "$@"; do
+    [ -n "$_p" ] || continue
+    _sh_i=$((_sh_i + 1))
+    if [ "$_sh_interactive" = 1 ]; then
+      _prompt_ysa "[$_sh_i of $_sh_total] \"$_p\" shadow (keep .git live, copy files to parent) ?"
+      case $? in
+        1) _sh_skip=$((_sh_skip + 1)); log_medium "skip  $_p"; continue ;;
+        2) log_major "aborted"; break ;;
+        3) _sh_interactive=0 ;;
+      esac
+    fi
+    if _shadow_one "$_p"; then
+      _sh_ok=$((_sh_ok + 1)); _sh_commit="$_sh_commit $(shell_escape "$_p")"
+      log_ok "shadow: $_p — files mirrored to parent (.git kept live)"
+    else
+      _sh_fail=$((_sh_fail + 1))
+    fi
+  done
+  if [ -n "$_sh_commit" ] && ! eval "run git diff --cached --quiet -- $_sh_commit" 2>/dev/null; then
+    eval "run git commit -q -m \"my-git shadow: content-mirror into the parent (live .git kept)\" -- $_sh_commit" >/dev/null 2>&1 \
+      || log_warn "shadow: commit failed — staged content left for manual commit"
+  fi
+  echo
+  if [ "$_sh_ok" -gt 0 ]; then
+    log_ok "shadow: $_sh_ok repo(s) now mirrored into the parent — their .git is still LIVE (IDE works). New files: run 'ga' (or 'mc') to keep the mirror current.$([ "$_sh_skip" -gt 0 ] && printf ' %s skipped.' "$_sh_skip")$([ "$_sh_fail" -gt 0 ] && printf ' %s FAILED.' "$_sh_fail")"
+  else
+    log_major "shadow: nothing shadowed$([ "$_sh_skip" -gt 0 ] && printf ' (%s skipped)' "$_sh_skip")$([ "$_sh_fail" -gt 0 ] && printf ' (%s failed)' "$_sh_fail")."
+  fi
+  [ "$_sh_fail" = 0 ]
+}
+
+# my-git unshadow [go] [-i] [path]     (analyze by default)
+cmd_unshadow() {
+  _ush_mode=analyze; _ush_interactive=0; _ush_scope_raw=""; _args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help unshadow; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose)          VERYVRB=1 ;;
+      -D|--debug)   DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      go)           _ush_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _ush_mode=analyze ;;
+      -i|--interactive) _ush_interactive=1; require_tty unshadow ;;
+      -R|--recursive) RECURSIVE=1 ;;
+      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      -*)           fatal "unshadow: unknown option: $1" 64 ;;
+      *)            [ -n "$_ush_scope_raw" ] && fatal "unshadow: only one path argument is supported" 64
+                    _ush_scope_raw=$1 ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  eval "set -- $_args"
+  _ush_top=$(git_toplevel_of "$PWD"); [ -n "$_ush_top" ] || fatal "unshadow: not inside a git repo" 1
+  _ush_scope=""
+  if [ -n "$_ush_scope_raw" ]; then
+    _ush_abs=$(cd "$_ush_scope_raw" 2>/dev/null && pwd -P) || fatal "unshadow: '$_ush_scope_raw': no such directory" 1
+    _ush_top_abs=$(cd "$_ush_top" 2>/dev/null && pwd -P)
+    case "$_ush_abs" in
+      "$_ush_top_abs")   fatal "unshadow: '$_ush_scope_raw' is the toplevel itself, not a nested repo" 64 ;;
+      "$_ush_top_abs"/*) _ush_scope=${_ush_abs#"$_ush_top_abs"/} ;;
+      *)                 fatal "unshadow: '$_ush_scope_raw' is not inside $_ush_top" 64 ;;
+    esac
+  fi
+  cd "$_ush_top" || fatal "unshadow: cannot cd to $_ush_top" 1
+
+  # A SHADOWED repo = a nested LIVE repo whose files the parent tracks.
+  if [ -n "$_ush_scope" ]; then
+    [ -e "$_ush_scope/.git" ] || fatal "unshadow: '$_ush_scope' has no live .git — it isn't a shadowed repo" 1
+    [ -n "$(git ls-files -- "$_ush_scope" 2>/dev/null | head -1)" ] || \
+      fatal "unshadow: '$_ush_scope' is not shadowed — the parent tracks none of its files" 1
+    _ush_list=$_ush_scope
+  else
+    _ush_list=$(list_unregistered_nested "$_ush_top" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      [ -n "$(git ls-files -- "$_p" 2>/dev/null | head -1)" ] && printf '%s\n' "$_p"
+    done)
+    if [ -z "$_ush_list" ]; then
+      log_major "$_ush_top: nothing to unshadow (no nested LIVE repo whose files the parent tracks)"
+      exit 0
+    fi
+  fi
+
+  if [ "$_ush_mode" != go ]; then
+    log_major "$_ush_top: unshadow plan (stop the parent tracking these; the live .git is left untouched)"
+    printf '%s\n' "$_ush_list" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      printf '  %s>> %s   (git rm --cached its files from the parent; .git stays LIVE)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+    done
+    echo
+    log_major "This was analyze-only — re-run with 'go' to apply:"
+    printf '  %s>>   %s unshadow go %s%s%s\n' "$C_BLUE" "$US" "$([ "$_ush_interactive" = 1 ] && printf -- '-i ')" "${_ush_scope:-}" "$C_RESET"
+    exit 0
+  fi
+
+  # A 'git rm --cached' removal lives ONLY in the index — the files stay in
+  # the worktree. 'git commit -- <path>' would take the WORKTREE view of that
+  # path (files present) and so commit NOTHING; we must commit the index
+  # as-is (no pathspec). To avoid sweeping in the user's OTHER staged work,
+  # bail out of committing if the index already has staged changes.
+  trace "(git diff --cached --name-only)   # unshadow: any pre-existing staged changes?"
+  _ush_pre_staged=$( git diff --cached --name-only 2>/dev/null | head -1 )
+
+  _ush_oifs=$IFS; IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $_ush_list
+  IFS=$_ush_oifs
+  _ush_ok=0; _ush_fail=0; _ush_skip=0; _ush_i=0; _ush_total=$#
+  for _p in "$@"; do
+    [ -n "$_p" ] || continue
+    _ush_i=$((_ush_i + 1))
+    if [ "$_ush_interactive" = 1 ]; then
+      _prompt_ysa "[$_ush_i of $_ush_total] \"$_p\" unshadow (stop parent tracking; keep .git live) ?"
+      case $? in
+        1) _ush_skip=$((_ush_skip + 1)); log_medium "skip  $_p"; continue ;;
+        2) log_major "aborted"; break ;;
+        3) _ush_interactive=0 ;;
+      esac
+    fi
+    if run git rm -r --cached -q -- "$_p" >/dev/null 2>&1; then
+      _ush_ok=$((_ush_ok + 1))
+      log_ok "unshadow: $_p — parent stopped tracking it (.git still live)"
+    else
+      _ush_fail=$((_ush_fail + 1)); log_fail "unshadow: $_p — git rm --cached failed"
+    fi
+  done
+  if [ "$_ush_ok" -gt 0 ]; then
+    if [ -n "$_ush_pre_staged" ]; then
+      log_warn "unshadow: your index already had staged changes before this ran — NOT committing the removal automatically (it would sweep them in). Commit/reset your index, the removal is staged and ready."
+    elif run git commit -q -m "my-git unshadow: stop mirroring into the parent (live .git kept)" >/dev/null 2>&1; then
+      :
+    else
+      log_warn "unshadow: commit failed — staged removal left for manual commit"
+    fi
+  fi
+  echo
+  if [ "$_ush_ok" -gt 0 ]; then
+    log_ok "unshadow: $_ush_ok repo(s) — parent no longer tracks them; each is a plain nested LIVE repo again.$([ "$_ush_skip" -gt 0 ] && printf ' %s skipped.' "$_ush_skip")$([ "$_ush_fail" -gt 0 ] && printf ' %s FAILED.' "$_ush_fail")"
+  else
+    log_major "unshadow: nothing unshadowed$([ "$_ush_skip" -gt 0 ] && printf ' (%s skipped)' "$_ush_skip")."
+  fi
+  [ "$_ush_fail" = 0 ]
+}
+
+# ═════════════════════════════════════════════════════════════════════════
 # ═══ REMOTE (list / check) ══════════════════════════════════════════════
 # ═════════════════════════════════════════════════════════════════════════
 #
@@ -6322,9 +6575,16 @@ Subcommands:
   pull | pl                Fetch + fast-forward merge (analyze / 'go'; -R top-down)
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
-  flatten | fl             Nested repo -> parent content; 3 equal modes for its git dir:
-                           --merge (kept/deleted) / --sidecar (.git.real, history kept) / --zip (archived)
+
+  NESTED-REPO STRUCTURE — turn a nested repo into parent-tracked content (and back):
+  flatten | fl             Nested repo -> parent content; DISPOSES of its live .git.
+                           3 equal modes: --merge (kept/deleted) / --sidecar (.git.real,
+                           history kept) / --zip (archived)
   unflatten | unfl         Reverse of flatten — rebuild a live .git (--merge/--sidecar/--zip; auto-detects)
+  shadow                   KEEP the nested .git live (IDE works) AND make the parent
+                           track its files too — a content-mirror
+  unshadow                 Reverse of shadow — parent stops tracking; .git stays live
+
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
   audit                    Read-only health checks (--claude and/or --sidecar)
@@ -6876,6 +7136,73 @@ Scope:
 EOF
 }
 
+show_help_shadow() {
+  cat <<EOF
+my-git shadow
+
+usage: $US [-V|-D] shadow [go] [-i] [path]
+
+The OPPOSITE trade-off from 'flatten'. flatten gets RID of a nested repo's
+live '.git'; shadow KEEPS it live — so your IDE/editor git integration
+keeps working — while ALSO making the parent repo track the nested repo's
+files (a content-mirror / copy). Use it for a repo you both PUBLISH to its
+own origin AND actively develop here (README's case 3b): sidecaring it would
+break IDE git (nothing recognizes '.git.real'); shadow doesn't.
+
+How (move-aside bootstrap, done once per repo):
+  - briefly move <path>/.git OUT of the worktree, so git stops treating the
+    dir as a nested-repo boundary;
+  - 'git add -f' its files into the PARENT index (plain content);
+  - move .git BACK (live again), and commit the staged content.
+  A trap restores .git on interrupt so a crash can't lose it.
+
+Afterwards the two stay in sync with no special command:
+  - mods + deletions ride on 'mc's ordinary 'git add -A';
+  - NEW files are force-added by the 'ga' shell alias (etc/zshrc.mine).
+
+Targets:
+  <path>       shadow just that one nested live repo.
+  (no path)    every EMBEDDED nested live repo under the toplevel.
+               Registered submodules are NOT shadowed (deregister first).
+
+Modes (same shape as flatten):
+  default      ANALYZE — print the plan, change nothing.
+  go           APPLY.
+  go -i        ask [Y]es/[s]kip/[a]bort/[g]o per repo, one at a time.
+
+Reverse:       $US unshadow   (stop the parent tracking it; .git stays live)
+See also:      $US --help flatten
+EOF
+}
+
+show_help_unshadow() {
+  cat <<EOF
+my-git unshadow
+
+usage: $US [-V|-D] unshadow [go] [-i] [path]
+
+Reverse of 'shadow'. A shadowed repo has a LIVE '.git' AND its files tracked
+by the parent; unshadow makes the parent STOP tracking them ('git rm -r
+--cached' + commit) so it's a plain nested live repo again. It does NOT
+touch '.git' — that was already live (this is the asymmetry with
+'unflatten', which REBUILDS a .git). The files stay on disk; the nested
+repo keeps working.
+
+Targets:
+  <path>       unshadow just that one repo (must be shadowed: live .git +
+               parent-tracked files).
+  (no path)    every nested LIVE repo under the toplevel whose files the
+               parent currently tracks.
+
+Modes (same shape as flatten):
+  default      ANALYZE — print the plan, change nothing.
+  go           APPLY.
+  go -i        ask [Y]es/[s]kip/[a]bort/[g]o per repo, one at a time.
+
+See also:      $US --help shadow
+EOF
+}
+
 show_help_sync() {
   cat <<EOF
 my-git sync  (alias: syn)
@@ -7311,6 +7638,8 @@ show_help() {
     remote|rem)          show_help_remote ;;
     flatten|fl)          show_help_flatten ;;
     unflatten|unfl)      show_help_unflatten ;;
+    shadow)              show_help_shadow ;;
+    unshadow)            show_help_unshadow ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     audit)               show_help_audit ;;
@@ -11720,7 +12049,89 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar"
+  test_shadow_keeps_git_live_and_parent_tracks() {
+    # shadow = content-mirror: the nested repo's LIVE .git is KEPT (so IDE git
+    # keeps working) AND the parent starts tracking its files too. Analyze is
+    # read-only; 'go' does the move-aside bootstrap and commits.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o kid >/dev/null 2>&1 )   # embedded nested LIVE repo
+    cd top || return 1
+    _kid_head_before=$(git -C kid rev-parse HEAD 2>/dev/null)
+    # analyze changes nothing
+    _rt_ok "shadow analyze" _rt_my_git shadow kid || return 1
+    _rt_contains "analyze names the repo" "$_rt_out" "kid" || return 1
+    if [ -n "$(git ls-files -- kid 2>/dev/null | head -1)" ]; then
+      _rt_fail "analyze must NOT stage/track kid's files"; return 1
+    fi
+    # go
+    _rt_ok "shadow go" _rt_my_git shadow go kid || return 1
+    _rt_isdir ".git kept LIVE" kid/.git || return 1
+    _khb=$(git -C kid rev-parse HEAD 2>/dev/null)
+    [ "$_khb" = "$_kid_head_before" ] || { _rt_fail "nested repo HEAD changed: $_kid_head_before != $_khb"; return 1; }
+    if [ -z "$(git ls-files -- kid/k.txt 2>/dev/null | head -1)" ]; then
+      _rt_fail "parent should now track kid/k.txt (content-mirror)"; return 1
+    fi
+    # tracked as plain content, NOT a gitlink
+    _rt_gitlink_mode "kid/k.txt tracked as blob not gitlink" kid/k.txt 100644 || return 1
+    _rt_clean "commit left the tree clean" || return 1
+    return 0
+  }
+
+  test_unshadow_stops_parent_tracking() {
+    # unshadow reverses shadow: the parent stops tracking the files
+    # ('git rm --cached' + commit) but the nested LIVE .git is UNTOUCHED.
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd top || return 1
+    _rt_ok "shadow go (set up)" _rt_my_git shadow go kid || return 1
+    [ -n "$(git ls-files -- kid/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "setup: parent should track kid/k.txt"; return 1; }
+    # analyze changes nothing
+    _rt_ok "unshadow analyze" _rt_my_git unshadow kid || return 1
+    [ -n "$(git ls-files -- kid/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "analyze must NOT untrack"; return 1; }
+    # go
+    _rt_ok "unshadow go" _rt_my_git unshadow go kid || return 1
+    if [ -n "$(git ls-files -- kid 2>/dev/null | head -1)" ]; then
+      _rt_fail "parent should no longer track kid's files"; return 1
+    fi
+    _rt_isdir ".git still live after unshadow" kid/.git || return 1
+    _rt_exists "worktree file still on disk" kid/k.txt || return 1
+    # The removal must be COMMITTED (index-as-is, not the worktree view which
+    # would recommit the still-present files). Nothing staged should remain.
+    if [ -n "$(git diff --cached --name-only 2>/dev/null | head -1)" ]; then
+      _rt_fail "the cached removal should have been committed, not left staged"; return 1
+    fi
+    # kid is a plain embedded nested repo again — to the parent it now shows as
+    # a normal untracked dir ('?? kid/'), which is the correct pre-shadow state.
+    return 0
+  }
+
+  test_shadow_bulk_and_refuses_toplevel() {
+    # No-path shadow targets every embedded nested LIVE repo; naming the
+    # toplevel itself is refused (it's not a nested repo).
+    _rt_repo_file kid_o k.txt
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git clone -q ../kid_o a >/dev/null 2>&1 && git clone -q ../kid_o b >/dev/null 2>&1 )
+    cd top || return 1
+    # toplevel path refused
+    if _rt_my_git shadow go . >"$_rt_out" 2>"$_rt_err"; then
+      _rt_fail "shadow of the toplevel itself should be refused"; return 1
+    fi
+    _rt_contains "refusal explains toplevel" "$_rt_err" "toplevel" || return 1
+    # bulk: both get mirrored
+    _rt_ok "bulk shadow go" _rt_my_git shadow go || return 1
+    [ -n "$(git ls-files -- a/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "a not mirrored"; return 1; }
+    [ -n "$(git ls-files -- b/k.txt 2>/dev/null | head -1)" ] || { _rt_fail "b not mirrored"; return 1; }
+    _rt_isdir "a/.git live" a/.git || return 1
+    _rt_isdir "b/.git live" b/.git || return 1
+    return 0
+  }
+
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_unshadow_stops_parent_tracking test_shadow_bulk_and_refuses_toplevel"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -11873,6 +12284,8 @@ main() {
     remote|rem)                 cmd_remote "$@" ;;
     flatten|fl)                 cmd_flatten "$@" ;;
     unflatten|unfl)             cmd_unflatten "$@" ;;
+    shadow)                     cmd_shadow "$@" ;;
+    unshadow)                   cmd_unshadow "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     claude-check)               cmd_claude_check "$@" ;;
     audit)                      cmd_audit "$@" ;;
@@ -11921,6 +12334,8 @@ _my-git() {
     'remote:List / audit git remotes (alias: rem)'
     'flatten:Nested repo -> parent content; modes --sidecar/--merge/--zip (alias: fl)'
     'unflatten:Reverse of flatten — rebuild a live .git (alias: unfl)'
+    'shadow:Keep nested .git LIVE and also track its files in the parent (content-mirror)'
+    'unshadow:Reverse of shadow — parent stops tracking; .git stays live'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
     'audit:Read-only health checks (--claude and/or --sidecar)'
     'repair:Fix sidecar setup problems (--sidecar; go to apply)'
@@ -12031,6 +12446,22 @@ _my-git() {
             '(--sidecar --merge --zip)--merge[Best-effort reconstruction via git subtree split, for a merged (git-deleted) path]' \
             '(--sidecar --merge --zip)--zip[Restore a git dir archived by flatten --zip (.git.zip / GIT_SIDECAR_DIRNAME.zip)]' \
             '(-k --keep)'{-k,--keep}'[--zip: keep the .zip after restoring]' \
+            '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
+            '1: :(go)' \
+            '*: :_directories'
+          ;;
+        shadow)
+          _arguments \
+            $global_opts \
+            '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
+            '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
+            '1: :(go)' \
+            '*: :_directories'
+          ;;
+        unshadow)
+          _arguments \
+            $global_opts \
+            '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
             '1: :(go)' \
             '*: :_directories'

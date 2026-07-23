@@ -51,7 +51,7 @@ still develop it here:
 | 1 | **Archived** | Kept only for its history; never developed or pushed to again. | `my-git flatten go <path> --zip` — archive its `.git` (or a `.git.real` sidecar, `+.status`) into a single `.zip` the parent tracks as content (`st` shows it `[zipped]`); `unflatten --zip` restores it, `-k`/`--keep` archives alongside instead of replacing. The `gz`/`gu` shell aliases (`etc/zshrc.mine`) do the same thing interactively without my-git. |
 | 2 | **Private** | Developed here, but never published outside this machine (no real origin). | `my-git flatten go <path> --merge` merges it into the parent as plain content and **deletes** its `.git`. No separate history is kept — a repo that's never published shouldn't have had its own identity to begin with. |
 | 3a | **Published, seldom changed here** | Pushed to its own origin; you rarely edit it locally. | Toggle `flatten --sidecar` (relocate its `.git` into a self-contained `.git.real` alongside the parent-tracked files) ↔ `unflatten --sidecar` (back to a live `.git` to resume developing/pushing). The parent captures its files either way, so a fresh clone needs no `submodule update`. **Caveat:** while sidecared, its git dir is `.git.real`, which **no IDE/editor recognizes** — fine when you're not actively editing it. |
-| 3b | **Published, actively developed here** | Pushed to its origin AND edited here often, so you need live IDE git integration. | **Content-mirror** — keep the **live `.git`** (so the IDE works) *and* have the parent track its files too. Bootstrap once (momentarily set `.git` aside, `git add -f` its files into the parent, restore the live `.git`); thereafter `mc`'s `git add -A` carries mods+deletions and the `ga` alias force-adds any *new* files by explicit path. Sidecaring is **unacceptable** here — `.git.real` breaks IDE git. *(This one-shot bootstrap is not yet a single my-git command — planned as a dedicated `mirror`; today it's the `ga` alias plus the manual bootstrap. See `README.OLD.md`.)* |
+| 3b | **Published, actively developed here** | Pushed to its origin AND edited here often, so you need live IDE git integration. | `my-git shadow go <path>` (a content-mirror) — keep the **live `.git`** (so the IDE works) *and* have the parent track its files too. It bootstraps once (momentarily sets `.git` aside, `git add -f` its files into the parent, restores the live `.git`); thereafter `mc`'s `git add -A` carries mods+deletions and the `ga` alias force-adds any *new* files by explicit path. `unshadow` reverses it (parent stops tracking; `.git` stays live). Sidecaring is **unacceptable** here — `.git.real` breaks IDE git. |
 
 Concrete examples on this machine:
 
@@ -133,9 +133,9 @@ my-git sm -R go                # register everything, walking the whole tree top
 my-git sm --clean-stale        # ONLY remove stale registrations, anywhere in the tree
 my-git sync go -R              # one-shot: sm → pull → mc across the tree
 my-git remote --check -R       # audit remotes (⚠ on suspicious URLs)
-my-git claude-check            # audit .claude/ symlink convention
+my-git audit --claude          # audit .claude/ symlink convention
 my-git flatten                 # analyze: nested repos this would merge as content (THIS repo)
-my-git flatten go               # apply: merge them in, embedded repos keep a working .git in place
+my-git flatten go --merge       # apply one of the 3 modes (--merge/--sidecar/--zip)
 my-git flatten go -i              # per-item: choose skip/sidecar/merge/delete for each nested repo
 my-git flatten go subkid --sidecar  # sidecar just ONE nested repo (path-scoped)
 my-git flatten go --sidecar         # bulk: sidecar EVERY nested repo, incl. registered submodules
@@ -156,7 +156,10 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
 | `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir: `--merge` (kept live/deleted), `--sidecar` (`.git.real`, history preserved), `--zip` (archived to `.git.zip`/`.git.real.zip`); `-i`/PATH for per-item or forced-mode control |
 | `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip` exact, `--merge` best-effort (`git subtree split`); auto-detects the mode per path |
-| `claude-check`  |                | always    | Audit `.claude/` symlink convention (read-only by default)                        |
+| `shadow`        |                | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
+| `unshadow`      |                | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
+| `audit`         |                | always    | Read-only health checks: `--claude` (`.claude/` symlink convention) and/or `--sidecar` (sidecar setup) |
+| `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
 
@@ -616,17 +619,16 @@ marker: sidecars via `GIT_SIDECAR_DIRNAME` (`st` marks `[sidecar]`),
 merged paths via `.git.merged` (`[merged]`), zipped paths via `.git*.zip`
 (`[zipped]`) — unless restricted to one with a mode flag.
 
-## Not yet implemented
+## Completeness
 
-Most of the case model is built: `flatten`/`unflatten` with
+The whole case model is now built: `flatten`/`unflatten` with
 `--sidecar`/`--merge`/`--zip`, the `.status`/`.git.merged` snapshots, the
-sidecar-aware `ga`/`gz`/`gu` aliases, and self-deploying zsh completions
-(see below). The one piece **not yet a single command** is **case 3b's
-content-mirror** — keeping an actively-developed *published* repo's `.git`
-**live** (so the IDE works) while the parent *also* tracks its bytes,
-bootstrapped once then maintained by `ga`. It's parked in
-[README.OLD.md](README.OLD.md) as a planned dedicated `mirror` command;
-today it's the `ga` alias plus the manual bootstrap.
+sidecar-aware `ga`/`gz`/`gu` aliases, and case 3b's `shadow`/`unshadow`
+content-mirror (keeping an actively-developed *published* repo's `.git`
+**live** so the IDE works while the parent *also* tracks its bytes —
+bootstrapped by `shadow go`, then maintained by `mc`'s `git add -A` plus
+the `ga` alias for new files). Historical design notes are parked in
+[README.OLD.md](README.OLD.md).
 
 **Zsh completions** deploy themselves on first real use — every
 invocation that reaches an actual subcommand (not `--run-tests`,
@@ -755,7 +757,7 @@ my-git unflatten go py/my-plex --sidecar
 my-git unflatten go some/old/kid --merge
 ```
 
-## Scope resolution (st / mc / claude-check)
+## Scope resolution (st / mc / audit)
 
 1. **Explicit `paths...`** — operate on each.
 2. **No paths + CWD is inside a git repo** — operate on that repo + its submodules.
@@ -807,7 +809,7 @@ resolves a repo's toplevel itself (e.g. `flatten`), not just inside `sm`.
 
 ## `.claude` setup enforcement
 
-`mc` (and the standalone `claude-check`) enforces the convention that each
+`mc` (and the standalone `audit --claude`) enforces the convention that each
 project's `.claude/` is a **symlink** into `$CLAUDE_PROJECT_DIR_CENTRAL_REPO`,
 not a real directory inside the project repo. On each repo:
 
