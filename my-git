@@ -1323,6 +1323,16 @@ status_summary() {
     fail:*) printf '[ERROR] %s\n' "${_action#fail:}"; return 1 ;;
     skip|warn) echo "[SKIPPED — cross-user policy]"; return 0 ;;
   esac
+  # A '.git' that is a DIRECTORY but has no HEAD is NOT a valid git dir: git
+  # repository discovery would WALK UP to the enclosing repo, so 'git status'
+  # here would silently report THAT repo's state (dirty count, branch) under
+  # this path — misleading. Detect the broken gitdir and say so instead of
+  # masquerading as the parent. (A '.git' FILE / gitfile-pointer that doesn't
+  # resolve is handled separately below, on the git-status failure path.)
+  if [ -d "$_r/.git" ] && [ ! -e "$_r/.git/HEAD" ]; then
+    echo "[BROKEN .git — invalid gitdir (no HEAD): history missing; git would resolve to the enclosing repo]"
+    return 1
+  fi
   # ONE git call for everything: '-b' adds a leading '## <branch>...
   # <upstream> [ahead N, behind M]' header, so status + branch + upstream
   # + ahead/behind all come back together — replacing the four separate
@@ -3623,9 +3633,9 @@ _FL_REG_EOF
       fi
       if [ -n "$_fl_emb_bulk" ]; then
         _ch=$_fl_emb_bulk
-        if [ "$_ch" = sidecar ] && [ "$_fl_item_dead" = 1 ]; then
+        if { [ "$_ch" = sidecar ] || [ "$_ch" = zip ]; } && [ "$_fl_item_dead" = 1 ]; then
+          printf "  (bulk choice in effect: %s — but this item's history is already gone, so %s would fail; applying 'merge' here instead)\n" "$_ch" "$_ch" >/dev/tty
           _ch=delete
-          printf "  (bulk choice in effect: sidecar — but this item's history is already gone, so sidecar would fail; applying 'merge' here instead)\n" >/dev/tty
         else
           printf "  (bulk choice in effect: %s)\n" "$_ch" >/dev/tty
         fi
@@ -3634,11 +3644,11 @@ _FL_REG_EOF
       fi
       printf "  's' sidecar  — absorb files into the parent, RELOCATE history into %s/%s (self-contained, no live .git left)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
       printf "  'm' merge    — absorb files into the parent, DELETE the nested .git (a .git.merged snapshot is written first, so 'unflatten --merge' can reconstruct)\n" >/dev/tty
+      printf "  'z' zip      — absorb files into the parent, ARCHIVE the nested .git into %s/.git.zip (history kept, compressed; restore with 'unflatten --zip')    [-i EXCLUSIVE CHOICE]\n" "$_p" >/dev/tty
       printf "  'k' skip     — leave alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
       printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
       printf "  'g' go       — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
-      printf "  (to ZIP-archive one instead: '%s flatten go %s --zip' — not offered per-item here yet)\n" "$US" "$_p" >/dev/tty
-      printf "  UPPERCASE a mode (S/M) to bulk-apply it to every remaining embedded repo only\n" >/dev/tty
+      printf "  UPPERCASE a mode (S/M/Z) to bulk-apply it to every remaining embedded repo only\n" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
         printf '  choice: ' >/dev/tty
@@ -3650,16 +3660,17 @@ _FL_REG_EOF
         case "$_fl_ans_letter" in
           s)     _ch=sidecar ;;
           m)     _ch=delete ;;   # 'merge' = delete .git AFTER writing a .git.merged snapshot
+          z)     _ch=zip ;;
           k)     _ch=skip ;;
           a)     printf '  -> abort\n' >/dev/tty; return 77 ;;
-          *)     printf "  ? unrecognized: '%s' — please answer s, m, k, a, or g (UPPERCASE S/M = bulk)\n" "$_ans" >/dev/tty ;;
+          *)     printf "  ? unrecognized: '%s' — please answer s, m, z, k, a, or g (UPPERCASE S/M/Z = bulk)\n" "$_ans" >/dev/tty ;;
         esac
         fi
       done
       [ "$_fl_ans_mode" = typebulk ] && _fl_emb_bulk=$_ch
       [ "$_fl_ans_mode" = global ]   && _fl_global_go=1
-      if [ "$_ch" = sidecar ] && [ "$_fl_item_dead" = 1 ]; then
-        printf "  (this item's history is already gone — sidecar would fail; applying 'merge' here instead)\n" >/dev/tty
+      if { [ "$_ch" = sidecar ] || [ "$_ch" = zip ]; } && [ "$_fl_item_dead" = 1 ]; then
+        printf "  (this item's history is already gone — %s would fail; applying 'merge' here instead)\n" "$_ch" >/dev/tty
         _ch=delete
       fi
       printf 'embedded\t%s\t%s\n' "$_p" "$_ch" >> "$_fl_choices_file"
@@ -3907,6 +3918,7 @@ _FBC_ORP_EOF
   _fl_interactive_apply() {
     _fl_choices_file=$1
     _fl_nested_delete=""   # paths whose .git get rm -rf'd before main flow
+    _fl_nested_zip=""      # paths whose .git get archived to .git.zip before main flow
     _fl_modules_delete=""  # .git/modules/<name>/ paths to rm -rf after commit
     _fl_realized=""        # paths successfully realized (self-contained .git.real) — added to content directly, NOT via the move-out/restore dance
     # Pass 1: registered subs
@@ -4011,6 +4023,12 @@ $_p"
           fi
           _fl_nested_delete="$_fl_nested_delete
 $_p/.git" ;;
+        zip)
+          # archive the live .git into <path>/.git.zip (history kept, compressed).
+          # No merge snapshot — the .zip IS the preserved history. The main flow
+          # zips it (removing the live .git) then absorbs the files + the .zip.
+          _fl_nested_zip="$_fl_nested_zip
+$_p/.git" ;;
         skip)
           _fl_nested=$(printf '%s\n' "$_fl_nested" | grep -Fxv "$_p/.git")
           ;;
@@ -4065,6 +4083,7 @@ _FL_EMB_REALIZE_EOF
     _fl_orphan=$(printf '%s\n' "$_fl_orphan" | grep -v '^$' | sort -u)
     _fl_registered=$(printf '%s\n' "$_fl_registered" | grep -v '^$' | sort -u)
     _fl_nested_delete=$(printf '%s\n' "$_fl_nested_delete" | grep -v '^$' | sort -u)
+    _fl_nested_zip=$(printf '%s\n' "$_fl_nested_zip" | grep -v '^$' | sort -u)
     _fl_modules_delete=$(printf '%s\n' "$_fl_modules_delete" | grep -v '^$' | sort -u)
     _fl_realized=$(printf '%s\n' "$_fl_realized" | grep -v '^$' | sort -u)
     _fl_n_nested=$(printf '%s' "$_fl_nested" | grep -c .)
@@ -4698,6 +4717,7 @@ _FL_IGNCHK_ORPH_EOF
   # type, so all-Enter ≡ same outcome as plain 'go'. Choices tagged
   # [-i EXCLUSIVE CHOICE] are not reachable via bare 'go' / 'go --rm-git'.
   _fl_nested_delete=""    # paths whose .git get rm -rf'd before main flow (per-item delete)
+  _fl_nested_zip=""       # paths whose .git get ARCHIVED to .git.zip before main flow (per-item zip)
   _fl_modules_delete=""   # .git/modules/<name>/ paths to rm -rf after commit (registered+delete)
   _fl_realized=""         # paths successfully realized (self-contained $GIT_SIDECAR_DIRNAME)
   if [ "$_fl_interactive" = 1 ] && [ -z "$_fl_forced_mode" ]; then
@@ -5066,6 +5086,29 @@ _FL_ROLLBACK_EOF
 $_fl_orphan
 _FL_ORPHAN_EOF
 
+  # Per-item zip (from -i 'z'): ARCHIVE each chosen .git into <path>/.git.zip
+  # BEFORE anything else touches it. Done here (ahead of the --rm-git and
+  # move-out blocks) so those correctly see the live .git as already gone: the
+  # move-out loop skips these (nothing to move), any --rm-git 'rm -rf .git' is a
+  # harmless no-op, and the main 'git add' stages the worktree files + the new
+  # .git.zip as ordinary content (st then tags the dir [zipped]).
+  if [ -n "$_fl_nested_zip" ]; then
+    while IFS= read -r _n; do
+      [ -n "$_n" ] || continue
+      _zp=$(printf '%s' "$_n" | sed 's|/\.git$||')
+      log_medium "zip      $_zp  (.git -> .git.zip)"
+      _fl_index_touched=1
+      if ! _zip_gitdir "$_zp" 0; then
+        log_warn "zip failed for $_zp — its .git is left in place (will be flattened as live content instead)"
+        # keep it out of the 'already-zipped' skip lists so the normal
+        # move-out/add path still handles it with its live .git.
+        _fl_nested_zip=$(printf '%s\n' "$_fl_nested_zip" | grep -Fxv "$_n")
+      fi
+    done <<_FL_ZIP_EOF
+$_fl_nested_zip
+_FL_ZIP_EOF
+  fi
+
   if [ "$_fl_rmgit" = 1 ] && [ -n "$_fl_nested" ]; then
     # Destructive path: explicit 'yes' confirmation required.
     # Only reachable when something is actually LEFT in $_fl_nested —
@@ -5174,11 +5217,15 @@ _FL_DEL_EOF
 
   # Preserve-history path: move each nested .git OUTSIDE the outer
   # worktree, commit, then restore. Trap already armed above.
-  # Items in _fl_nested_delete are skipped (their .git is already gone).
+  # Items in _fl_nested_delete (rm'd) and _fl_nested_zip (archived to .git.zip)
+  # are skipped — their live .git is already gone, nothing to move out.
   _fl_i=0
   while IFS= read -r _n; do
     [ -n "$_n" ] || continue
     if [ -n "$_fl_nested_delete" ] && printf '%s\n' "$_fl_nested_delete" | grep -Fxq "$_n"; then
+      continue
+    fi
+    if [ -n "$_fl_nested_zip" ] && printf '%s\n' "$_fl_nested_zip" | grep -Fxq "$_n"; then
       continue
     fi
     _fl_i=$((_fl_i + 1))
@@ -5233,7 +5280,8 @@ _FL_EOF
     exit 0
   fi
   _fl_n_realized=$(printf '%s' "${_fl_realized:-}" | grep -c .)
-  _fl_msg="my-git flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged, $_fl_n_realized repo(s) sidecared"
+  _fl_n_zip=$(printf '%s' "${_fl_nested_zip:-}" | grep -c .)
+  _fl_msg="my-git flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged, $_fl_n_realized repo(s) sidecared$([ "$_fl_n_zip" -gt 0 ] && printf ', %s zipped' "$_fl_n_zip")"
   _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
   _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
   # shellcheck disable=SC2086
@@ -5795,13 +5843,17 @@ _shadow_one() {
   log_dbg_med "shadow: $_sho_p — write .git.shadow.status, move .git aside, 'git add -f', restore .git live"
   # Write the marker while .git is still live (reads HEAD/remote from it).
   _shadow_write_status "$_sho_p"
-  # Keep the marker out of the NESTED repo's own status (the parent tracks it,
-  # the nested repo shouldn't see it as an untracked file). Idempotent.
+  # Keep the marker (and any '.git.shadow.status.*' temp file a bump might
+  # briefly leave behind on interrupt) out of the NESTED repo's own status —
+  # the parent tracks the marker, the nested repo shouldn't see either as
+  # untracked. Idempotent; both patterns added if missing.
   if [ -d "$_sho_gd" ]; then
-    if ! grep -qxF '.git.shadow.status' "$_sho_gd/info/exclude" 2>/dev/null; then
-      { mkdir -p "$_sho_gd/info" 2>/dev/null && printf '.git.shadow.status\n' >> "$_sho_gd/info/exclude"; } 2>/dev/null \
-        || log_dbg_med "shadow: $_sho_p — could not add .git.shadow.status to .git/info/exclude (cosmetic)"
-    fi
+    mkdir -p "$_sho_gd/info" 2>/dev/null || true
+    for _sho_pat in '.git.shadow.status' '.git.shadow.status.*'; do
+      grep -qxF "$_sho_pat" "$_sho_gd/info/exclude" 2>/dev/null && continue
+      printf '%s\n' "$_sho_pat" >> "$_sho_gd/info/exclude" 2>/dev/null \
+        || log_dbg_med "shadow: $_sho_p — could not add '$_sho_pat' to .git/info/exclude (cosmetic)"
+    done
   fi
   ( _sho_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.shadow.XXXXXX") || { log_error "shadow: mktemp -d failed"; exit 1; }
     # restore .git on interrupt (contained to this subshell)
@@ -6021,12 +6073,13 @@ cmd_unshadow() {
     fi
     if run git rm -r --cached -q -- "$_p" >/dev/null 2>&1; then
       _ush_ok=$((_ush_ok + 1))
-      # Remove the on-disk marker (git rm --cached only unstaged it) and its
-      # nested-repo exclude line, so the dir is a plain nested repo again.
+      # Remove the on-disk marker + any stray temp, and its nested-repo exclude
+      # lines, so the dir is a plain nested repo again.
       run rm -f -- "$_p/.git.shadow.status" 2>/dev/null
-      if [ -f "$_p/.git/info/exclude" ] && grep -qxF '.git.shadow.status' "$_p/.git/info/exclude" 2>/dev/null; then
+      rm -f -- "$_p"/.git.shadow.status.* 2>/dev/null || true
+      if [ -f "$_p/.git/info/exclude" ] && grep -qE '^\.git\.shadow\.status' "$_p/.git/info/exclude" 2>/dev/null; then
         _ush_exc_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.unshadow.XXXXXX" 2>/dev/null) \
-          && grep -vxF '.git.shadow.status' "$_p/.git/info/exclude" > "$_ush_exc_tmp" 2>/dev/null \
+          && grep -vxF -e '.git.shadow.status' -e '.git.shadow.status.*' "$_p/.git/info/exclude" > "$_ush_exc_tmp" 2>/dev/null \
           && cat "$_ush_exc_tmp" > "$_p/.git/info/exclude" 2>/dev/null
         rm -f "$_ush_exc_tmp" 2>/dev/null
       fi
@@ -11892,6 +11945,30 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_st_broken_gitdir_not_masquerade_as_parent() {
+    # A nested dir whose '.git' is a DIRECTORY with no HEAD (invalid gitdir —
+    # e.g. history lost, only a config left) must NOT report the enclosing
+    # repo's status: git discovery would walk up and 'git status' would show
+    # the PARENT's dirty count under this path. st must flag it [BROKEN .git].
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd top || return 1
+    # make the PARENT clearly dirty, so a leak would be obvious
+    echo one > p1.txt; echo two > p2.txt; git add -A; git commit -qm seed
+    echo more >> p1.txt
+    # a nested dir with a config-only .git (no HEAD/objects/refs)
+    mkdir -p kid/.git && printf '[core]\n\trepositoryformatversion = 0\n' > kid/.git/config
+    echo hi > kid/x.txt
+    _rt_ok "st runs" _rt_my_git -R st "$PWD" || return 1
+    _rt_contains "broken gitdir flagged" "$_rt_out" "[BROKEN .git" || return 1
+    # the parent's dirty tally must NOT appear on kid's line
+    _kidline=$(grep -F 'kid' "$_rt_out" | grep -v '^/' | head -1)
+    case "$_kidline" in
+      *DIRTY*) _rt_fail "kid wrongly shows a DIRTY count (leaked from the parent): $_kidline"; return 1 ;;
+    esac
+    return 0
+  }
+
   test_st_upstream_on_other_branch_message() {
     # A repo WITH a remote whose CURRENT branch has no upstream (a local branch
     # like 'mine') but ANOTHER branch (master) tracks origin must read
@@ -12235,6 +12312,56 @@ _RT_STALE_CONF_EOF
     _rt_absent "shadowed repo NOT archived" shad/.git.zip || return 1
     _rt_isdir "shadowed repo still live" shad/.git || return 1
     _rt_exists "shadowed marker intact" shad/.git.shadow.status || return 1
+    return 0
+  }
+
+  test_flatten_i_zip_choice_archives_via_menu() {
+    # The per-item 'flatten go -i' menu's 'z' choice archives a live nested
+    # .git into .git.zip and absorbs the files into the parent (st -> [zipped]).
+    # The menu reads /dev/tty, so drive it through a pty (python3). Skips
+    # cleanly (pass) if python3 is unavailable.
+    command -v python3 >/dev/null 2>&1 || { return 0; }
+    _rt_repo top
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd top && git init -q kid && cd kid && git config user.email t@t.com \
+        && git config user.name t && echo hello > f.txt && git add f.txt && git commit -qm i )
+    cd top || return 1
+    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.ptydrv.XXXXXX.py") || { _rt_fail "mktemp py failed"; return 1; }
+    cat > "$_rt_drv" <<'PYDRV'
+import os, pty, sys, time, select
+mygit, conf = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["/bin/sh", mygit, "--config", conf, "flatten", "go", "-i"])
+sent = 0
+seq = [b"z\n", b"y\n"]   # z = zip this item; y = confirm the plan
+t0 = time.time()
+buf = b""
+while time.time() - t0 < 20:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if fd in r:
+        try: d = os.read(fd, 4096)
+        except OSError: break
+        if not d: break
+        buf += d
+        low = d.lower()
+        if sent < len(seq) and (b"choice:" in low or b"proceed" in low):
+            os.write(fd, seq[sent]); sent += 1
+try: os.waitpid(pid, 0)
+except OSError: pass
+PYDRV
+    _rt_ok "drive -i menu via pty (choose zip)" python3 "$_rt_drv" "$_rt_self" "$_rt_conf_path" || { rm -f "$_rt_drv"; return 1; }
+    rm -f "$_rt_drv"
+    _rt_exists "kid/.git archived to .git.zip" kid/.git.zip || return 1
+    _rt_absent "kid live .git gone" kid/.git || return 1
+    [ -n "$(git ls-files -- kid/f.txt 2>/dev/null | head -1)" ] || { _rt_fail "parent should track kid/f.txt (absorbed)"; return 1; }
+    [ -n "$(git ls-files -- kid/.git.zip 2>/dev/null | head -1)" ] || { _rt_fail "parent should track kid/.git.zip"; return 1; }
+    _rt_ok "st shows the zipped dir" _rt_my_git st "$PWD" || return 1
+    _rt_contains "tagged [zipped]" "$_rt_out" "[zipped]" || return 1
+    # round-trips back to a live repo
+    _rt_ok "unflatten go (auto zip)" _rt_my_git unflatten go kid || return 1
+    _rt_isdir "kid/.git restored live" kid/.git || return 1
+    _rt_absent "kid/.git.zip removed" kid/.git.zip || return 1
     return 0
   }
 
@@ -12607,7 +12734,7 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_upstream_on_other_branch_message test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
