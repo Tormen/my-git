@@ -4608,6 +4608,10 @@ _FL_IGNCHK_ORPH_EOF
     else
       printf '  %s>> --zip     :  0   archive a repo/sidecar       (none found here)%s\n' "$C_BLUE" "$C_RESET"
     fi
+    if [ -n "$_fl_shadowed_skipped" ]; then
+      printf '  %s>> (%s SHADOWED repo(s) skipped — content-mirror with a live .git; '\''unshadow <path>'\'' first to flatten/zip one)%s\n' \
+        "$C_BLUE" "$(printf '%s' "$_fl_shadowed_skipped" | grep -c .)" "$C_RESET"
+    fi
     if [ "$_fl_ign_total" -gt 0 ]; then
       printf '  %s>> (%s nested repo(s) marked my-git-submodules.ignore, left untouched — --force to include)%s\n' \
         "$C_BLUE" "$_fl_ign_total" "$C_RESET"
