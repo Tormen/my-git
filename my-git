@@ -3627,7 +3627,7 @@ _FL_REG_EOF
       fi
       printf "  'S' sidecar  — absorb files into the parent, RELOCATE history into %s/%s (self-contained, no live .git left)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
       printf "  'M' merge    — absorb files into the parent, DELETE the nested .git (a .git.merged snapshot is written first, so 'unflatten --merge' can reconstruct)\n" >/dev/tty
-      printf "  'Z' zip      — absorb files into the parent, ARCHIVE the nested .git into %s/.git.zip (history kept, compressed; restore with 'unflatten --zip')    [-i EXCLUSIVE CHOICE]\n" "$_p" >/dev/tty
+      printf "  'Z' zip      — ARCHIVE the nested .git into %s/.git.zip and commit ONLY that archive (history kept, compressed; worktree files left as-is; restore with 'unflatten --zip')    [-i EXCLUSIVE CHOICE]\n" "$_p" >/dev/tty
       printf "  'i' ignore   — leave this repo alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
       printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
       printf "  'g' go       — GO: apply the choices made so far NOW; every remaining undecided item is ignored (stops asking; a final Y/n confirm follows)\n" >/dev/tty
@@ -4008,10 +4008,13 @@ $_p"
 $_p/.git" ;;
         zip)
           # archive the live .git into <path>/.git.zip (history kept, compressed).
-          # No merge snapshot — the .zip IS the preserved history. The main flow
-          # zips it (removing the live .git) then absorbs the files + the .zip.
+          # No merge snapshot — the .zip IS the preserved history. ZIP does NOT
+          # absorb the repo's worktree files: only the .git.zip is committed (the
+          # main zip loop stages just that). So REMOVE it from _fl_nested — it
+          # must not go through the move-out / whole-path 'git add' pipeline.
           _fl_nested_zip="$_fl_nested_zip
-$_p/.git" ;;
+$_p/.git"
+          _fl_nested=$(printf '%s\n' "$_fl_nested" | grep -Fxv "$_p/.git") ;;
         skip)
           _fl_nested=$(printf '%s\n' "$_fl_nested" | grep -Fxv "$_p/.git")
           ;;
@@ -4757,7 +4760,9 @@ _FL_IGNCHK_ORPH_EOF
     _fl_index_touched=0
     _fl_interactive_apply "$_fl_choices"
     rm -f "$_fl_choices"
-    if [ "$_fl_n_nested" -eq 0 ] && [ "$_fl_n_orphan" -eq 0 ] && [ -z "$_fl_realized" ]; then
+    # zip paths are tracked separately in _fl_nested_zip (not _fl_nested), so
+    # include them here or an all-zip run would wrongly look like "nothing".
+    if [ "$_fl_n_nested" -eq 0 ] && [ "$_fl_n_orphan" -eq 0 ] && [ -z "$_fl_realized" ] && [ -z "$_fl_nested_zip" ]; then
       log_major "$_fl_top: nothing to flatten after interactive choices"
       _fl_warn_registered
       exit 0
@@ -4927,8 +4932,14 @@ _FL_AUTO_EMB_EOF
   # and for the trap's 'git restore --staged -- <paths>' rollback if we
   # fail after touching the index.
   if ! _fl_build_paths_argv; then
-    log_error "could not compute path list"
-    exit 1
+    # An all-zip run has NO whole-path content to add (zip commits only the
+    # .git.zip archive, staged separately in the zip loop) — an empty path list
+    # is expected there, not an error. Otherwise it's a real failure.
+    if [ -z "$_fl_nested_zip" ]; then
+      log_error "could not compute path list"
+      exit 1
+    fi
+    _fl_paths_raw=""; _fl_argv=""
   fi
 
   # A path can be BOTH a nested embedded repo AND carry a stale 160000
@@ -5109,22 +5120,29 @@ _FL_ROLLBACK_EOF
 $_fl_orphan
 _FL_ORPHAN_EOF
 
-  # Per-item zip (from -i 'z'): ARCHIVE each chosen .git into <path>/.git.zip
-  # BEFORE anything else touches it. Done here (ahead of the --rm-git and
-  # move-out blocks) so those correctly see the live .git as already gone: the
-  # move-out loop skips these (nothing to move), any --rm-git 'rm -rf .git' is a
-  # harmless no-op, and the main 'git add' stages the worktree files + the new
-  # .git.zip as ordinary content (st then tags the dir [zipped]).
+  # Per-item zip (from -i 'Z'): ARCHIVE each chosen .git into <path>/.git.zip
+  # and commit ONLY that .git.zip — zip does NOT absorb the repo's worktree
+  # files (unlike sidecar/merge). Done here, ahead of the --rm-git/move-out
+  # blocks. We stage just the archive (not the whole path) and add it to the
+  # commit's path list (_fl_argv). st then tags the dir [zipped].
+  _fl_zipped_staged=0
   if [ -n "$_fl_nested_zip" ]; then
     while IFS= read -r _n; do
       [ -n "$_n" ] || continue
       _zp=$(printf '%s' "$_n" | sed 's|/\.git$||')
-      log_medium "zip      $_zp  (.git -> .git.zip)"
+      log_medium "zip      $_zp  (.git -> .git.zip; only the archive is committed)"
       _fl_index_touched=1
-      if ! _zip_gitdir "$_zp" 0; then
-        log_warn "zip failed for $_zp — its .git is left in place (will be flattened as live content instead)"
-        # keep it out of the 'already-zipped' skip lists so the normal
-        # move-out/add path still handles it with its live .git.
+      if _zip_gitdir "$_zp" 0; then
+        # stage ONLY the archive that _zip_gitdir just wrote (.git.zip for a
+        # plain repo, GIT_SIDECAR_DIRNAME.zip for a sidecar) — never the files.
+        if [ -f "$_zp/.git.zip" ]; then _fl_zname=".git.zip"; else _fl_zname="${GIT_SIDECAR_DIRNAME:-.git.real}.zip"; fi
+        if run git add -f -- "$_zp/$_fl_zname" >/dev/null 2>&1; then
+          _fl_zipped_staged=1
+        else
+          log_warn "zip: git add of $_zp/$_fl_zname failed"
+        fi
+      else
+        log_warn "zip failed for $_zp — its .git is left in place (skipped)"
         _fl_nested_zip=$(printf '%s\n' "$_fl_nested_zip" | grep -Fxv "$_n")
       fi
     done <<_FL_ZIP_EOF
@@ -5273,7 +5291,9 @@ _FL_EOF
   fi
   log_major "staging & committing flattened content (only paths flatten touched)..."
   _fl_index_touched=1
-  if ! _fl_add_paths_robust; then
+  # An all-zip run has no whole-path content to add ('_fl_paths_raw' empty) —
+  # the .git.zip archive was already staged in the zip loop, so skip the add.
+  if [ -n "$_fl_paths_raw" ] && ! _fl_add_paths_robust; then
     if [ -n "${_fl_realized:-}" ]; then
       # Nothing could be staged in THIS repo right now, but real,
       # permanent file-level work still happened (realize's rename) —
@@ -5294,7 +5314,9 @@ _FL_EOF
   fi
   # Filter out paths that have no staged content (nested dir was empty).
   _fl_filter_to_staged
-  if [ -z "$_fl_argv" ]; then
+  # zip stages only its .git.zip (not a path in _fl_argv), so allow the commit
+  # to proceed when a zip archive was staged even if _fl_argv is otherwise empty.
+  if [ -z "$_fl_argv" ] && [ "${_fl_zipped_staged:-0}" != 1 ]; then
     log_major "nothing to commit (all nested dirs were empty after .git move-out)"
     _fl_rollback
     rm -rf "$_fl_save_root"
@@ -7244,9 +7266,11 @@ Merge every nested git repo under the CURRENT super-repo into the
 super's history as regular tracked content. Callable from anywhere
 inside the repo (auto-scopes to the toplevel).
 
-THREE EQUAL modes. They share one first step — the nested repo's files
-become regular tracked content in the parent — and differ only in what
-happens to the git dir itself. Every item is handled by exactly ONE mode:
+THREE modes, differing in what happens to the git dir. --sidecar and --merge
+also absorb the nested repo's worktree files into the parent as regular tracked
+content; --zip does NOT — it commits ONLY the .git.zip archive and leaves the
+worktree files exactly as they were (track them later with 'mc' if you want).
+Every item is handled by exactly ONE mode:
 
   --merge     the git dir stays LIVE in place, or is DELETED. my-git does
               NOT preserve the pre-merge history (only what the parent's
@@ -7263,7 +7287,8 @@ happens to the git dir itself. Every item is handled by exactly ONE mode:
               restores the EXACT prior state (lossless).
   --zip       the git dir is ARCHIVED into a compact '.git.zip' (plain repo)
               or 'GIT_SIDECAR_DIRNAME.zip' (an existing sidecar) beside the
-              files, then removed; the parent tracks the .zip as content
+              files, then removed; the parent commits ONLY that .zip as content
+              (the worktree files are NOT absorbed — unlike --sidecar/--merge)
               ('$US st' shows the dir [zipped]). Lossless — integrity-checked
               ('unzip -t') before anything is removed; tracked worktree
               dotfiles (.gitignore, .gitmodules, …) are left in place.
@@ -12384,8 +12409,14 @@ PYDRV
     _rt_contains "summary lists the zip choice (not empty)" "$_rt_out" "zip embedded nested" || return 1
     _rt_exists "kid/.git archived to .git.zip" kid/.git.zip || return 1
     _rt_absent "kid live .git gone" kid/.git || return 1
-    [ -n "$(git ls-files -- kid/f.txt 2>/dev/null | head -1)" ] || { _rt_fail "parent should track kid/f.txt (absorbed)"; return 1; }
+    # zip commits ONLY the .git.zip archive — it does NOT absorb the repo's
+    # worktree files (unlike sidecar/merge). kid/f.txt stays on disk but the
+    # parent does not track it.
     [ -n "$(git ls-files -- kid/.git.zip 2>/dev/null | head -1)" ] || { _rt_fail "parent should track kid/.git.zip"; return 1; }
+    if [ -n "$(git ls-files -- kid/f.txt 2>/dev/null | head -1)" ]; then
+      _rt_fail "zip must NOT absorb the repo's worktree files (kid/f.txt should not be tracked)"; return 1
+    fi
+    _rt_exists "kid/f.txt still on disk" kid/f.txt || return 1
     _rt_ok "st shows the zipped dir" _rt_my_git st "$PWD" || return 1
     _rt_contains "tagged [zipped]" "$_rt_out" "[zipped]" || return 1
     # round-trips back to a live repo
