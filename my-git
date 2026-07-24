@@ -3549,7 +3549,7 @@ _FL_ADD_EOF
         printf "  's' skip        — leave the .gitmodules registration as-is (default)\n" >/dev/tty
         printf "  'x' deregister  — remove the .gitmodules/index registration; nothing to flatten/sidecar (no clone exists)    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
         printf "  'a' abort       — cancel the whole flatten\n" >/dev/tty
-        printf "  'g' go          — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+        printf "  'g' go          — GO: apply the choices made so far NOW; every remaining undecided item is ignored (stops asking; a final Y/n confirm follows)\n" >/dev/tty
         _ch=""
         while [ -z "$_ch" ]; do
           printf '  choice: ' >/dev/tty
@@ -3580,9 +3580,9 @@ _FL_ADD_EOF
       fi
       printf "  'S' sidecar  — absorb files into the parent, RELOCATE git history into %s/%s (self-contained, portable, no parent-side bookkeeping)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
       printf "  'M' merge    — absorb files into the parent, DELETE nested git history under .git/modules/%s/ (a .git.merged snapshot is written first)    [-i EXCLUSIVE CHOICE]\n" "$_name" >/dev/tty
-      printf "  'k' skip     — leave the submodule registered, untouched (default for registered subs)\n" >/dev/tty
+      printf "  'i' ignore   — leave the submodule registered, untouched (default for registered subs)\n" >/dev/tty
       printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
-      printf "  'g' go       — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+      printf "  'g' go       — GO: apply the choices made so far NOW; every remaining undecided item is ignored (stops asking; a final Y/n confirm follows)\n" >/dev/tty
       printf "  %s(modes are UPPERCASE on purpose — shift = a deliberate choice; to apply one mode to ALL: '%s flatten go --sidecar|--merge')%s\n" "$C_DIM" "$US" "$C_RESET" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
@@ -3595,10 +3595,10 @@ _FL_ADD_EOF
         case "$_fl_ans_letter" in
           S)     _ch=sidecar ;;
           M)     _ch=delete ;;   # 'merge' = delete history AFTER writing a .git.merged snapshot
-          k)     _ch=skip ;;
+          i)     _ch=skip ;;     # 'ignore' = leave the submodule registered, untouched
           a)     printf '  -> abort\n' >/dev/tty; return 77 ;;
           s|m)   printf "  ? modes are UPPERCASE (shift): use '%s' — lowercase is not accepted for a destructive mode\n" "$(printf '%s' "$_ans" | tr 'a-z' 'A-Z')" >/dev/tty ;;
-          *)     printf "  ? unrecognized: '%s' — answer S, M (mode), or k, a, g\n" "$_ans" >/dev/tty ;;
+          *)     printf "  ? unrecognized: '%s' — answer S, M (mode), or i, a, g\n" "$_ans" >/dev/tty ;;
         esac
         fi
       done
@@ -3628,9 +3628,9 @@ _FL_REG_EOF
       printf "  'S' sidecar  — absorb files into the parent, RELOCATE history into %s/%s (self-contained, no live .git left)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
       printf "  'M' merge    — absorb files into the parent, DELETE the nested .git (a .git.merged snapshot is written first, so 'unflatten --merge' can reconstruct)\n" >/dev/tty
       printf "  'Z' zip      — absorb files into the parent, ARCHIVE the nested .git into %s/.git.zip (history kept, compressed; restore with 'unflatten --zip')    [-i EXCLUSIVE CHOICE]\n" "$_p" >/dev/tty
-      printf "  'k' skip     — leave alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
+      printf "  'i' ignore   — leave this repo alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
       printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
-      printf "  'g' go       — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+      printf "  'g' go       — GO: apply the choices made so far NOW; every remaining undecided item is ignored (stops asking; a final Y/n confirm follows)\n" >/dev/tty
       printf "  %s(modes are UPPERCASE on purpose — shift = a deliberate choice; to apply one mode to ALL: '%s flatten go --sidecar|--merge|--zip')%s\n" "$C_DIM" "$US" "$C_RESET" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
@@ -3644,10 +3644,10 @@ _FL_REG_EOF
           S)     _ch=sidecar ;;
           M)     _ch=delete ;;   # 'merge' = delete .git AFTER writing a .git.merged snapshot
           Z)     _ch=zip ;;
-          k)     _ch=skip ;;
+          i)     _ch=skip ;;     # 'ignore' = leave this repo alone
           a)     printf '  -> abort\n' >/dev/tty; return 77 ;;
           s|m|z) printf "  ? modes are UPPERCASE (shift): use '%s' — lowercase is not accepted for a destructive mode\n" "$(printf '%s' "$_ans" | tr 'a-z' 'A-Z')" >/dev/tty ;;
-          *)     printf "  ? unrecognized: '%s' — answer S, M, Z (mode), or k, a, g\n" "$_ans" >/dev/tty ;;
+          *)     printf "  ? unrecognized: '%s' — answer S, M, Z (mode), or i, a, g\n" "$_ans" >/dev/tty ;;
         esac
         fi
       done
@@ -3690,7 +3690,7 @@ _FL_EMB_EOF
       printf "  'u' unstage   — remove the gitlink from the parent index (standard 'go')\n" >/dev/tty
       printf "  's' skip      — leave gitlink in place    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
       printf "  'a' abort     — cancel the whole flatten\n" >/dev/tty
-      printf "  'g' go        — stop asking about EVERYTHING remaining (all types); leave every not-yet-decided item untouched (skip)\n" >/dev/tty
+      printf "  'g' go        — GO: apply the choices made so far NOW; every remaining undecided item is ignored (stops asking; a final Y/n confirm follows)\n" >/dev/tty
       _ch=""
       while [ -z "$_ch" ]; do
         printf '  choice: ' >/dev/tty
@@ -3730,8 +3730,9 @@ _FL_ORP_EOF
                  "registered:skip:keep registered submodule untouched (default)" \
                  "embedded:flatten:flatten embedded nested (preserve .git)" \
                  "embedded:sidecar:sidecar embedded nested (self-contained $GIT_SIDECAR_DIRNAME, no live .git left)" \
-                 "embedded:delete:flatten embedded nested + DELETE .git" \
-                 "embedded:skip:skip embedded nested" \
+                 "embedded:delete:merge embedded nested + DELETE .git (.git.merged snapshot first)" \
+                 "embedded:zip:zip embedded nested (.git -> .git.zip, history archived)" \
+                 "embedded:skip:ignore embedded nested (left alone)" \
                  "orphan:unstage:unstage orphan gitlink (default)" \
                  "orphan:skip:skip orphan gitlink"
     do
@@ -12368,6 +12369,7 @@ PYDRV
     rm -f "$_rt_drv"
     _rt_contains "menu offers uppercase 'Z' zip" "$_rt_out" "'Z' zip" || return 1
     _rt_contains "lowercase mode rejected" "$_rt_out" "modes are UPPERCASE" || return 1
+    _rt_contains "summary lists the zip choice (not empty)" "$_rt_out" "zip embedded nested" || return 1
     _rt_exists "kid/.git archived to .git.zip" kid/.git.zip || return 1
     _rt_absent "kid live .git gone" kid/.git || return 1
     [ -n "$(git ls-files -- kid/f.txt 2>/dev/null | head -1)" ] || { _rt_fail "parent should track kid/f.txt (absorbed)"; return 1; }
