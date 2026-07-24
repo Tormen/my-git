@@ -1323,15 +1323,21 @@ status_summary() {
     fail:*) printf '[ERROR] %s\n' "${_action#fail:}"; return 1 ;;
     skip|warn) echo "[SKIPPED — cross-user policy]"; return 0 ;;
   esac
-  # A '.git' that is a DIRECTORY but has no HEAD is NOT a valid git dir: git
-  # repository discovery would WALK UP to the enclosing repo, so 'git status'
-  # here would silently report THAT repo's state (dirty count, branch) under
-  # this path — misleading. Detect the broken gitdir and say so instead of
-  # masquerading as the parent. (A '.git' FILE / gitfile-pointer that doesn't
-  # resolve is handled separately below, on the git-status failure path.)
+  # A '.git' DIRECTORY that git can't use as a repo (e.g. only a config, no
+  # HEAD/objects/refs) makes git discovery WALK UP to the enclosing repo — so
+  # 'git status' here would silently report THAT repo's state (dirty count,
+  # branch) under this path. Let GIT be the judge: ask where the repo toplevel
+  # actually resolves; if it isn't THIS path, git found an ancestor, not a repo
+  # here. The cheap 'no HEAD' test is only a fast gate so valid repos (the vast
+  # majority) never pay for the extra rev-parse. (A '.git' FILE / gitfile
+  # pointer that doesn't resolve is handled on the git-status failure path.)
   if [ -d "$_r/.git" ] && [ ! -e "$_r/.git/HEAD" ]; then
-    echo "[BROKEN .git — invalid gitdir (no HEAD): history missing; git would resolve to the enclosing repo]"
-    return 1
+    _ss_gittop=$(run_as_owner_capture "$_r" git rev-parse --show-toplevel 2>/dev/null)
+    _ss_rabs=$(cd "$_r" 2>/dev/null && pwd -P)
+    if [ "$_ss_gittop" != "$_ss_rabs" ]; then
+      echo "[BROKEN .git — git finds no repo here; it resolves to the enclosing repo${_ss_gittop:+: $_ss_gittop}]"
+      return 1
+    fi
   fi
   # ONE git call for everything: '-b' adds a leading '## <branch>...
   # <upstream> [ahead N, behind M]' header, so status + branch + upstream
@@ -11960,7 +11966,7 @@ _RT_STALE_CONF_EOF
     mkdir -p kid/.git && printf '[core]\n\trepositoryformatversion = 0\n' > kid/.git/config
     echo hi > kid/x.txt
     _rt_ok "st runs" _rt_my_git -R st "$PWD" || return 1
-    _rt_contains "broken gitdir flagged" "$_rt_out" "[BROKEN .git" || return 1
+    _rt_contains "broken gitdir flagged (git-judged)" "$_rt_out" "[BROKEN .git" || return 1
     # the parent's dirty tally must NOT appear on kid's line
     _kidline=$(grep -F 'kid' "$_rt_out" | grep -v '^/' | head -1)
     case "$_kidline" in
