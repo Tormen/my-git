@@ -6983,7 +6983,8 @@ Subcommands:
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   ignore / unignore        Toggle the GENERIC "leave this nested repo alone" marker
-                           <path>...: st won't descend, sm won't register, mc/flatten skip it
+                           (analyze/go; bare 'unignore' = whole tree). Ignored:
+                           st won't descend, sm won't register, mc/flatten skip it
 
   NESTED-REPO STRUCTURE — turn a nested repo into parent-tracked content (and back):
   flatten | fl             Nested repo -> parent content; DISPOSES of its live .git.
@@ -8270,55 +8271,145 @@ _ign_gitpath_of() {
   fi
 }
 
+# Print repo paths (relative to cwd) that carry the ignore marker — the bulk
+# target set for a bare 'unignore'. Same discovery as 'sm --list-ignored'
+# (live nested '.git' at depth >= 2).
+_ign_list_ignored() {
+  find "${1:-.}" -mindepth 2 -name .git \( -type d -o -type f \) 2>/dev/null | sort \
+    | while IFS= read -r _ili_gp; do
+        _ili_sp=${_ili_gp%/.git}; _ili_sp=${_ili_sp#./}
+        _sm_is_ignored "$_ili_gp" "$_ili_sp" && printf '%s\n' "$_ili_sp"
+      done
+}
+
+# Consistent with flatten/unflatten/shadow/unshadow: analyze by default, 'go'
+# to apply, '-i' to confirm per repo, and a bare verb acts tree-wide. 'ignore'
+# needs a <path> (no bulk 'ignore everything'); bare 'unignore' targets EVERY
+# ignored repo under the toplevel.
 _ignore_apply() {
   _ia_mode=$1; shift    # 'ignore' | 'unignore'
+  _ia_go=analyze
+  _ia_i=0
+  _ia_scope_raw=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help)
-        printf 'usage: %s %s <path>...\n' "$US" "$_ia_mode"
-        printf '  Toggle the generic nested-repo ignore marker (%s).\n' "$_sm_IGNORE_MARKER"
+        printf 'usage: %s %s [go] [-i] %s\n' "$US" "$_ia_mode" \
+          "$([ "$_ia_mode" = unignore ] && printf '[<path>]' || printf '<path>')"
+        printf '  Toggle the generic nested-repo ignore marker (%s) — analyze by\n' "$_sm_IGNORE_MARKER"
+        printf '  default, apply with '\''go'\'' (-i to confirm per repo).\n'
         printf '  An ignored repo is left alone by ALL my-git ops: st won'\''t descend,\n'
         printf '  sm won'\''t register it as a submodule, mc/flatten skip it.\n'
-        printf '  See currently-ignored repos with:  %s sm --list-ignored\n' "$US"
+        [ "$_ia_mode" = unignore ] && \
+          printf '  With no <path>, acts on EVERY ignored repo under the toplevel.\n'
+        printf '  List current: %s sm --list-ignored\n' "$US"
         exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose) VERYVRB=1 ;;
+      -D|--debug) DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      go) _ia_go=go ;;
+      -n|-T|--try|--dry|--dry-run) _ia_go=analyze ;;
+      -i|--interactive) _ia_i=1; require_tty "$_ia_mode" ;;
       --) shift; break ;;
-      -*) fatal "$_ia_mode: unknown option: $1  (usage: $US $_ia_mode <path>...)" 64 ;;
-      *) break ;;
+      -*) fatal "$_ia_mode: unknown option: $1" 64 ;;
+      *) [ -n "$_ia_scope_raw" ] && fatal "$_ia_mode: only one path argument is supported (got '$_ia_scope_raw' and '$1')" 64
+         _ia_scope_raw=$1 ;;
     esac
     shift
   done
-  [ $# -gt 0 ] || fatal "$_ia_mode: needs at least one <path> (a nested git repo). See '$US $_ia_mode --help'." 64
-  _ia_ok=0; _ia_noop=0; _ia_fail=0
-  for _ia_p in "$@"; do
-    _ia_p=${_ia_p%/}
-    if [ ! -d "$_ia_p" ]; then
-      log_error "$_ia_mode: '$_ia_p': no such directory"; _ia_fail=$((_ia_fail + 1)); continue
+  if [ $# -gt 0 ]; then
+    [ -n "$_ia_scope_raw" ] && fatal "$_ia_mode: only one path argument is supported" 64
+    _ia_scope_raw=$1
+  fi
+
+  _ia_top=$(git_toplevel_of "$PWD"); [ -n "$_ia_top" ] || fatal "$_ia_mode: not inside a git repo" 1
+  _ia_scope=""
+  if [ -n "$_ia_scope_raw" ]; then
+    _ia_abs=$(cd "$_ia_scope_raw" 2>/dev/null && pwd -P) || fatal "$_ia_mode: '$_ia_scope_raw': no such directory" 1
+    _ia_top_abs=$(cd "$_ia_top" 2>/dev/null && pwd -P)
+    case "$_ia_abs" in
+      "$_ia_top_abs")   fatal "$_ia_mode: '$_ia_scope_raw' is the toplevel itself, not a nested repo" 64 ;;
+      "$_ia_top_abs"/*) _ia_scope=${_ia_abs#"$_ia_top_abs"/} ;;
+      *)                fatal "$_ia_mode: '$_ia_scope_raw' is not inside $_ia_top" 64 ;;
+    esac
+  fi
+  cd "$_ia_top" || fatal "$_ia_mode: cannot cd to $_ia_top" 1
+
+  # Build the target list.
+  if [ -n "$_ia_scope" ]; then
+    _ign_gitpath_of "$_ia_scope" >/dev/null 2>&1 \
+      || fatal "$_ia_mode: '$_ia_scope' is not a nested git repo (no .git or ${GIT_SIDECAR_DIRNAME:-.git.real})" 1
+    _ia_list=$_ia_scope
+  elif [ "$_ia_mode" = ignore ]; then
+    fatal "ignore: needs a <path> to ignore (there is no bulk 'ignore everything' — it would be a foot-gun). Ignore one repo:  $US ignore go <path>" 64
+  else
+    _ia_list=$(_ign_list_ignored ".")
+    [ -n "$_ia_list" ] || { log_major "$_ia_top: nothing to unignore (no repo carries the $_sm_IGNORE_MARKER marker)"; exit 0; }
+  fi
+
+  # Analyze (default): show the plan, don't touch anything.
+  if [ "$_ia_go" != go ]; then
+    log_major "$_ia_top: $_ia_mode plan"
+    printf '%s\n' "$_ia_list" | while IFS= read -r _p; do
+      [ -n "$_p" ] || continue
+      _gp=$(_ign_gitpath_of "$_p" 2>/dev/null) || continue
+      if [ "$_ia_mode" = ignore ]; then
+        if _sm_is_ignored "$_gp" "$_p"; then
+          printf '  %s>> %s   (already ignored — no change)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+        else
+          printf '  %s>> %s   (mark ignored — my-git will leave it alone)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+        fi
+      else
+        printf '  %s>> %s   (remove ignore marker — my-git includes it again)%s\n' "$C_BLUE" "$_p" "$C_RESET"
+      fi
+    done
+    echo
+    log_major "This was analyze-only — re-run with 'go' to apply:"
+    printf '  %s>>   %s %s go %s%s%s\n' "$C_BLUE" "$US" "$_ia_mode" \
+      "$([ "$_ia_i" = 1 ] && printf -- '-i ')" "${_ia_scope_raw:-}" "$C_RESET"
+    exit 0
+  fi
+
+  # Apply.
+  _ia_ok=0; _ia_noop=0; _ia_fail=0; _ia_skip=0; _ia_n=0
+  _ia_total=$(printf '%s\n' "$_ia_list" | grep -c .)
+  _ia_oifs=$IFS; IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $_ia_list
+  IFS=$_ia_oifs
+  for _p in "$@"; do
+    [ -n "$_p" ] || continue
+    _ia_n=$((_ia_n + 1))
+    if [ "$_ia_i" = 1 ]; then
+      _prompt_ysa "[$_ia_n of $_ia_total] \"$_p\" $_ia_mode ?"
+      case $? in
+        1) _ia_skip=$((_ia_skip + 1)); log_medium "skip  $_p"; continue ;;
+        2) log_major "aborted"; break ;;
+        3) _ia_i=0 ;;
+      esac
     fi
-    if ! _ia_gp=$(_ign_gitpath_of "$_ia_p"); then
-      log_error "$_ia_mode: '$_ia_p' is not a nested git repo (no .git or ${GIT_SIDECAR_DIRNAME:-.git.real})"
-      _ia_fail=$((_ia_fail + 1)); continue
+    if ! _gp=$(_ign_gitpath_of "$_p" 2>/dev/null); then
+      log_error "$_ia_mode: '$_p' is not a nested git repo"; _ia_fail=$((_ia_fail + 1)); continue
     fi
     if [ "$_ia_mode" = ignore ]; then
-      if _sm_is_ignored "$_ia_gp" "$_ia_p"; then
-        log_medium "already ignored: $_ia_p"; _ia_noop=$((_ia_noop + 1))
-      elif _sm_mark_ignored "$_ia_gp" "$_ia_p" >/dev/null; then
-        log_ok "ignored $_ia_p — my-git will leave it alone (st won't descend; sm won't register; mc/flatten skip it)"
+      if _sm_is_ignored "$_gp" "$_p"; then
+        log_medium "already ignored: $_p"; _ia_noop=$((_ia_noop + 1))
+      elif _sm_mark_ignored "$_gp" "$_p" >/dev/null; then
+        log_ok "ignored $_p — my-git will leave it alone (st won't descend; sm won't register; mc/flatten skip it)"
         _ia_ok=$((_ia_ok + 1))
-      else
-        _ia_fail=$((_ia_fail + 1))
-      fi
+      else _ia_fail=$((_ia_fail + 1)); fi
     else
-      if ! _sm_is_ignored "$_ia_gp" "$_ia_p"; then
-        log_medium "not ignored: $_ia_p"; _ia_noop=$((_ia_noop + 1))
-      elif _sm_unmark_ignored "$_ia_gp" "$_ia_p"; then
-        log_ok "unignored $_ia_p — my-git includes it again ('sm go' may now register it as a submodule)"
+      if ! _sm_is_ignored "$_gp" "$_p"; then
+        log_medium "not ignored: $_p"; _ia_noop=$((_ia_noop + 1))
+      elif _sm_unmark_ignored "$_gp" "$_p"; then
+        log_ok "unignored $_p — my-git includes it again ('sm go' may now register it as a submodule)"
         _ia_ok=$((_ia_ok + 1))
-      else
-        _ia_fail=$((_ia_fail + 1))
-      fi
+      else _ia_fail=$((_ia_fail + 1)); fi
     fi
   done
-  log_major "$_ia_mode: $_ia_ok changed, $_ia_noop already in state$([ "$_ia_fail" -gt 0 ] && printf ', %s FAILED' "$_ia_fail")"
+  log_major "$_ia_mode: $_ia_ok changed, $_ia_noop no-op$([ "$_ia_skip" -gt 0 ] && printf ', %s skipped' "$_ia_skip")$([ "$_ia_fail" -gt 0 ] && printf ', %s FAILED' "$_ia_fail")"
   [ "$_ia_fail" -eq 0 ]
 }
 
@@ -12205,31 +12296,42 @@ _RT_STALE_CONF_EOF
   }
 
   test_ignore_unignore_toggles_marker() {
-    # Top-level 'ignore'/'unignore' toggle the GENERIC nested-repo marker
-    # (not sm-specific): after 'ignore', st tags the repo [.., ignored];
-    # 'unignore' removes it. Idempotent, and errors on a non-repo path.
+    # 'ignore'/'unignore' follow the analyze/go idiom (like flatten/unshadow):
+    # analyze by default, 'go' applies. Bare 'unignore' acts tree-wide; bare
+    # 'ignore' is refused (no bulk ignore-everything). Marker toggle drives the
+    # [.., ignored] tag.
     _rt_repo_file kid_o x.txt
     _rt_repo root
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd root && git clone -q ../kid_o kid >/dev/null 2>&1 )
     cd root || return 1
-    _rt_absent "not ignored yet" kid/.git/my-git.ignore || return 1
-    _rt_ok "ignore kid" _rt_my_git ignore kid || return 1
-    _rt_exists "marker written" kid/.git/my-git.ignore || return 1
+    # analyze must NOT write.
+    _rt_ok "ignore kid (analyze)" _rt_my_git ignore kid || return 1
+    _rt_contains "analyze shows the plan" "$_rt_out" "mark ignored" || return 1
+    _rt_absent "analyze wrote nothing" kid/.git/my-git.ignore || return 1
+    # go applies.
+    _rt_ok "ignore go kid" _rt_my_git ignore go kid || return 1
+    _rt_exists "marker written by go" kid/.git/my-git.ignore || return 1
     _rt_ok "st -R after ignore" _rt_my_git -R st || return 1
     grep 'kid' "$_rt_out" | grep -q ', ignored\]' \
-      || { _rt_fail "kid should be tagged [.., ignored] after ignore"; return 1; }
-    # idempotent: a second ignore is a no-op.
-    _rt_ok "ignore again" _rt_my_git ignore kid || return 1
-    _rt_contains "reports already in state" "$_rt_out" "already in state" || return 1
-    # unignore removes it.
-    _rt_ok "unignore kid" _rt_my_git unignore kid || return 1
-    _rt_absent "marker removed" kid/.git/my-git.ignore || return 1
-    _rt_ok "unignore again (noop)" _rt_my_git unignore kid || return 1
-    # error path: not a repo.
-    if _rt_my_git ignore no-such-dir >"$_rt_out" 2>"$_rt_err"; then
-      _rt_fail "ignore on a missing path should fail"; return 1
+      || { _rt_fail "kid should be tagged [.., ignored] after ignore go"; return 1; }
+    # idempotent go.
+    _rt_ok "ignore go again" _rt_my_git ignore go kid || return 1
+    _rt_contains "reports no-op" "$_rt_out" "no-op" || return 1
+    # bare 'ignore go' (no path) is refused — no bulk ignore-everything.
+    if _rt_my_git ignore go >"$_rt_out" 2>"$_rt_err"; then
+      _rt_fail "bare 'ignore go' (no path) should be refused"; return 1
     fi
+    # bare 'unignore' acts tree-wide: analyze lists kid, changes nothing.
+    _rt_ok "unignore (bulk analyze)" _rt_my_git unignore || return 1
+    _rt_contains "bulk analyze lists kid" "$_rt_out" "kid" || return 1
+    _rt_exists "bulk analyze wrote nothing" kid/.git/my-git.ignore || return 1
+    # bulk go removes it.
+    _rt_ok "unignore go (bulk)" _rt_my_git unignore go || return 1
+    _rt_absent "marker removed by bulk go" kid/.git/my-git.ignore || return 1
+    # bare unignore with nothing ignored -> graceful message, not an error.
+    _rt_ok "unignore again (nothing left)" _rt_my_git unignore || return 1
+    _rt_contains "nothing to unignore" "$_rt_out" "nothing to unignore" || return 1
     return 0
   }
 
