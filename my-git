@@ -6983,7 +6983,7 @@ Subcommands:
   fetch                    Fetch only (alias: pull --fetch-only)
   submodules | sub | sm    Nested-repo registration (single level; -R = full top-down walk)
   unsm | unsub             Reverse of sm: de-register submodule(s) back to raw-nested-git
-                           (drop .gitmodules + gitlink, de-absorb .git; repo stays live)
+                           (whole tree; drop .gitmodules + gitlink, de-absorb .git; repo stays live)
   ignore / unignore        Toggle the GENERIC "leave this nested repo alone" marker
                            (analyze/go; bare 'unignore' = whole tree). Ignored:
                            st won't descend, sm won't register, mc/flatten skip it
@@ -8990,7 +8990,7 @@ _unsm_flush_parent() {
 }
 
 cmd_unsm() {
-  _un_mode=analyze; _un_i=0; _un_rec=0; _un_scope_raw=""
+  _un_mode=analyze; _un_i=0; _un_scope_raw=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help)
@@ -8998,13 +8998,13 @@ cmd_unsm() {
         printf '  Reverse of '\''sm'\'': de-register submodule(s) back to raw-nested-git\n'
         printf '  (drop .gitmodules + gitlink, de-absorb .git/modules/<name> -> <path>/.git;\n'
         printf '  the repo stays LIVE). Analyze by default, apply with '\''go'\'' (-i per repo).\n'
-        printf '  No path: this repo'\''s direct submodules (-R: the whole tree).\n'
+        printf '  No path: EVERY registered submodule in the tree (matching st'\''s view).\n'
         printf '  A <path> scopes to one registered submodule anywhere in the tree.\n'
         exit 0 ;;
       go) _un_mode=go ;;
       -n|-T|--try|--dry|--dry-run) _un_mode=analyze ;;
       -i|--interactive) _un_i=1; require_tty unsm ;;
-      -R|--recursive) _un_rec=1 ;;
+      -R|--recursive) : ;;   # unsm is whole-tree by default; -R accepted (no-op) for muscle memory
       -V|--verbose) VRB=1 ;;
       -VV|--very-verbose) VERYVRB=1 ;;
       -D|--debug) DBG=1; VERYVRB=1 ;;
@@ -9034,7 +9034,7 @@ cmd_unsm() {
   else
     _un_top=$(git_toplevel_of "$PWD"); [ -n "$_un_top" ] || { rm -f "$_un_tmp"; fatal "unsm: not inside a git repo" 1; }
     _un_top=$( cd "$_un_top" && pwd -P )
-    _unsm_discover "$_un_top" "$_un_rec" >> "$_un_tmp"
+    _unsm_discover "$_un_top" 1 >> "$_un_tmp"
     _un_where=$_un_top
   fi
   sort -o "$_un_tmp" "$_un_tmp"
@@ -9042,7 +9042,7 @@ cmd_unsm() {
   _un_n=$(grep -c . "$_un_tmp")
   if [ "$_un_n" -eq 0 ]; then
     rm -f "$_un_tmp"
-    log_major "$_un_where: nothing to unsm (no registered submodule$([ "$_un_rec" = 1 ] || [ -n "$_un_scope_raw" ] || printf ' at this level — try -R')) "
+    log_major "$_un_where: nothing to unsm (no registered submodule found in the tree)"
     exit 0
   fi
 
@@ -9055,8 +9055,8 @@ cmd_unsm() {
   if [ "$_un_mode" != go ]; then
     echo
     log_major "This was analyze-only — re-run with 'go' to apply:"
-    printf '  %s>>   %s unsm go %s%s%s%s\n' "$C_BLUE" "$US" \
-      "$([ "$_un_i" = 1 ] && printf -- '-i ')" "$([ "$_un_rec" = 1 ] && printf -- '-R ')" "${_un_scope_raw:-}" "$C_RESET"
+    printf '  %s>>   %s unsm go %s%s%s\n' "$C_BLUE" "$US" \
+      "$([ "$_un_i" = 1 ] && printf -- '-i ')" "${_un_scope_raw:-}" "$C_RESET"
     rm -f "$_un_tmp"; exit 0
   fi
 
