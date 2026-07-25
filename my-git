@@ -2769,7 +2769,10 @@ _EOF
       # the realized item itself (the most common case).
       _fl_realdirs_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flrealdirs.XXXXXX")
       find "$_fap" -type d -name "$GIT_SIDECAR_DIRNAME" 2>/dev/null > "$_fl_realdirs_tmp"
-      set -- run git add -f -- "$_fap"
+      # advice.addEmbeddedRepo=false: the content being added can contain a
+      # further nested live repo — silence git's long embedded-repo hint
+      # (my-git handles nesting deliberately). See shadow for the same.
+      set -- run git -c advice.addEmbeddedRepo=false add -f -- "$_fap"
       while IFS= read -r _fl_rd; do
         [ -n "$_fl_rd" ] || continue
         set -- "$@" ":(exclude)$_fl_rd"
@@ -4754,10 +4757,14 @@ _FL_IGNCHK_ORPH_EOF
       fi
     done
     if [ "$_fl_rmgit" != 1 ] && [ "${AUTO_SIDECAR_EMBEDDED:-0}" != 1 ]; then
-      printf '  %s>> each keeps its live .git in place (cd + git pull/push still works).%s\n' "$C_BLUE" "$C_RESET"
-      printf '  %s>> use %s flatten go -i to sidecar any (self-contained %s)%s\n' \
-        "$C_BLUE" "$US" "$GIT_SIDECAR_DIRNAME" "$C_RESET"
-      printf '  %s>> or AUTO_SIDECAR_EMBEDDED=1 in config sidecars all automatically.%s\n' "$C_BLUE" "$C_RESET"
+      # Describe what happens to each .git — MODE-AWARE, so it never claims
+      # ".git kept" when --merge/--zip/--sidecar will actually dispose of it.
+      case "$_fl_forced_mode" in
+        sidecar) printf '  %s>> --sidecar: each .git is RELOCATED to ./%s (history kept; restore with %s unflatten --sidecar). cd + git keep working via the sidecar.%s\n' "$C_BLUE" "$GIT_SIDECAR_DIRNAME" "$US" "$C_RESET" ;;
+        merge)   printf '  %s>> --merge: each live .git is DELETED (a ./.git.merged snapshot is written first so %s unflatten --merge can reconstruct; pre-merge history is NOT kept). cd + git STOP working in these dirs.%s\n' "$C_BLUE" "$US" "$C_RESET" ;;
+        zip)     printf '  %s>> --zip: each .git is ARCHIVED to ./.git.zip (restore with %s unflatten --zip). cd + git will not work until restored.%s\n' "$C_BLUE" "$US" "$C_RESET" ;;
+        *)       printf '  %s>> the live .git is untouched for now — but '\''go'\'' needs a mode, and each disposes of the .git differently: --sidecar keeps history (./%s), --merge DELETES it, --zip archives it (or -i to choose per repo; AUTO_SIDECAR_EMBEDDED=1 sidecars all).%s\n' "$C_BLUE" "$GIT_SIDECAR_DIRNAME" "$C_RESET" ;;
+      esac
     fi
   fi
   if [ "$_fl_n_orphan" -gt 0 ]; then
@@ -5984,7 +5991,11 @@ _shadow_one() {
     if ! run mv -- "$_sho_gd" "$_sho_tmp/gitdir"; then
       log_error "shadow: $_sho_p: could not move .git aside"; rmdir "$_sho_tmp" 2>/dev/null; exit 1
     fi
-    run git add -f -- "$_sho_p"; _sho_rc=$?
+    # advice.addEmbeddedRepo=false: a shadowed repo may itself contain nested
+    # repos (their own live .git) — git would print its long "adding embedded
+    # git repository" hint for each. That's expected here (my-git manages
+    # nesting deliberately), so silence the noise.
+    run git -c advice.addEmbeddedRepo=false add -f -- "$_sho_p"; _sho_rc=$?
     if ! run mv -- "$_sho_tmp/gitdir" "$_sho_gd"; then
       log_error "shadow: $_sho_p: FAILED to restore .git! It is at $_sho_tmp/gitdir — move it back to $_sho_gd BY HAND."; exit 2
     fi
@@ -11827,7 +11838,7 @@ _RT_CONF_EOF
     # -VV is the command-trace axis (‑V is human medium-detail; ‑D
     # implies ‑VV). The trace must survive a per-command 2> redirect.
     _rt_ok "flatten go kid --merge -VV" _rt_my_git -VV flatten go kid --merge || return 1
-    _rt_contains "git add trace visible despite errlog redirect" "$_rt_err" '$ git add -f' || return 1
+    _rt_contains "git add trace visible despite errlog redirect" "$_rt_err" '$ git -c advice.addEmbeddedRepo=false add -f' || return 1
     _rt_contains "git commit trace visible despite errlog redirect" "$_rt_err" '$ git commit' || return 1
     return 0
   }
