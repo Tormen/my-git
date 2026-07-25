@@ -646,11 +646,11 @@ Default is a one-line-per-repo ascii-art tree. Each line renders the repo's
 branch position in the tree followed by its state summary:
 
 ```text
-/LINKS/global                          CLEAN :))
-├── src [registered]                   DIRTY (18)  [M:1 ??:17]
-│   ├── py/my-plex [registered]        CLEAN :))
-│   └── sh/my-git [unregistered]       DIRTY (2)  [M:2]
-└── etc [registered]                   CLEAN, ahead 1
+/LINKS/global                            CLEAN :))
+├── src [registered-sm]                  DIRTY (18)  [M:1 ??:17]
+│   ├── py/my-plex [registered-sm]       CLEAN :))
+│   └── sh/my-git [raw-nested-git]       DIRTY (2)  [M:2]
+└── etc [registered-sm]                  CLEAN, ahead 1
 ```
 
 States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
@@ -658,25 +658,28 @@ States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
 `DIRTY (N) [M:.. A:.. D:.. R:.. ??:..]`, `[SKIPPED — cross-user policy]`,
 `[ERROR …]`.
 
-The tree includes **both** registered submodules and unregistered nested
-git repos found on disk. Marks shown after the display name make registration
-state explicit:
+The tree includes **both** submodule-registered and raw (unregistered)
+nested git repos found on disk. The first word of the mark says what the
+nested git **is** relative to its parent — `registered-sm` (a registered
+submodule) vs `raw-nested-git` (a bare nested `.git`, not a submodule) —
+whereas `sidecar`/`merged`/`zipped`/`shadowed` are *transformed* states of
+such a repo, so the label is not a simple registered/unregistered binary:
 
-- `[registered]` — nested git repo registered in `.gitmodules`; `sm` has
-  nothing to do for this entry.
-- `[unregistered]` — nested git repo not yet in `.gitmodules`. Run
-  `my-git sm go` to register.
-- `[registered, ignored]` — registered submodule **also** carrying the
+- `[registered-sm]` — nested git repo registered as a submodule in
+  `.gitmodules`; `sm` has nothing to do for this entry.
+- `[raw-nested-git]` — nested git repo not registered as a submodule (not
+  yet in `.gitmodules`). Run `my-git sm go` to register it as one.
+- `[registered-sm, ignored]` — registered submodule **also** carrying the
   `my-git-submodules.ignore` marker. Conflict state; inspect with
   `my-git sm --list-ignored`.
-- `[unregistered, ignored]` — unregistered nested repo carrying the ignore
+- `[raw-nested-git, ignored]` — raw nested repo carrying the ignore
   marker; `sm go` skips it and `st` does not descend into its subtree.
 - `[STALE REGISTRATION]` — entry in `.gitmodules` whose on-disk path does
   not exist. Run `my-git sm --clean-stale` to remove **only** this —
-  `sm go` also adds new unregistered repos and rebinds moved ones,
+  `sm go` also adds new raw nested repos and rebinds moved ones,
   which you may not want at the same time. Note the entry may live in
-  a *nested* repo's own `.gitmodules` (e.g. shown under an
-  `[unregistered]` parent in the tree) — `sm --clean-stale` walks the
+  a *nested* repo's own `.gitmodules` (e.g. shown under a
+  `[raw-nested-git]` parent in the tree) — `sm --clean-stale` walks the
   whole tree regardless of depth, so it still finds and fixes it from
   anywhere.
 - `[sidecar]` — directory containing a `GIT_SIDECAR_DIRNAME` (a former

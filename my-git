@@ -1372,12 +1372,12 @@ status_summary() {
                 *)  _ssrealfb=$(cd "$_r" 2>/dev/null && cd "$_ssptrfb" 2>/dev/null && pwd -P) ;;
               esac
               if [ -n "$_ssrealfb" ] && [ -d "$_ssrealfb" ]; then
-                echo "[unregistered — resolvable via ${GIT_SIDECAR_DIRNAME:-.git.real}; run flatten to fix]"
+                echo "[BROKEN gitdir pointer — history recoverable via ${GIT_SIDECAR_DIRNAME:-.git.real}; run flatten to fix]"
                 return 1
               fi
               ;;
           esac
-          echo "[unregistered — history already gone (dead gitdir pointer, unresolvable); flatten/delete via flatten -i]"
+          echo "[BROKEN gitdir pointer — history already gone (unresolvable); flatten/delete via flatten -i]"
           return 1
         fi
       fi
@@ -1652,10 +1652,10 @@ cmd_status() {
         | while IFS="$(printf '\t')" read -r _left _abs _tag; do
             _mark=""
             case "$_tag" in
-              reg)       _mark="[registered]" ;;
-              unreg)     _mark="[unregistered]" ;;
-              unreg-ign) _mark="[unregistered, ignored]" ;;
-              reg-ign)   _mark="[registered, ignored]" ;;
+              reg)       _mark="[registered-sm]" ;;
+              unreg)     _mark="[raw-nested-git]" ;;
+              unreg-ign) _mark="[raw-nested-git, ignored]" ;;
+              reg-ign)   _mark="[registered-sm, ignored]" ;;
               stale)     _mark="[STALE REGISTRATION]" ;;
               realized)  _mark="[sidecar]" ;;
               merged)    _mark="[merged]" ;;
@@ -1755,7 +1755,7 @@ cmd_status() {
     printf '  %s>> state:   %sCLEAN :))%s  CLEAN, ahead/behind N  DIVERGED (ahead X, behind Y)  DIRTY (N) [...]  CLEAN (remote for "OTHER" but not for current branch "NAME")%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
     printf '  %s>> dirty:   M=modified  A=added  D=deleted  R=renamed  ??=untracked  ?=other  (counts inside [ ])%s\n' "$C_BLUE" "$C_RESET"
-    printf '  %s>> tags:    [registered]=in .gitmodules  [unregistered]=nested repo not registered  [sidecar]=self-contained history relocated to ./%s  [merged]=.git deleted, see ./.git.merged  [zipped]=git dir archived by gz (./.git.zip / ./.git.real.zip), restore with gu  [shadowed]=live .git KEPT + files also mirrored into the parent (see ./.git.shadow.status; undo: unshadow)  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
+    printf '  %s>> tags:    [registered-sm]=nested git registered as a submodule in .gitmodules  [raw-nested-git]=nested git NOT registered as a submodule  [sidecar]=self-contained history relocated to ./%s  [merged]=.git deleted, see ./.git.merged  [zipped]=git dir archived by gz (./.git.zip / ./.git.real.zip), restore with gu  [shadowed]=live .git KEPT + files also mirrored into the parent (see ./.git.shadow.status; undo: unshadow)  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
       "$C_BLUE" "${GIT_SIDECAR_DIRNAME:-.git.real}" "$C_RESET"
     printf '  %s>> flags (column after the tag): %s⌂%s = local-only (no remote configured — nothing to publish to);  blank = has a remote (publishable)%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
@@ -7016,16 +7016,19 @@ Default output: ONE LINE PER REPO, ascii-art tree prefix. States:
   [SKIPPED — cross-user …]  — cross-user policy (warn/ignore) suppressed
   [ERROR …]                 — per-repo failure; doesn't abort the run
 
-The tree includes BOTH registered submodules and unregistered nested git
-repos found on disk. Marks shown after the display name:
-  [registered]              — nested git repo registered in .gitmodules
-                              ('sm' is happy; no action required from 'sm')
-  [unregistered]            — nested git repo not yet in .gitmodules
-                              (run '$US sm go' to register)
-  [registered, ignored]     — registered submodule ALSO carrying the ignore
+The tree includes BOTH submodule-registered and raw (unregistered) nested git
+repos found on disk. Marks shown after the display name. The FIRST word says
+what the nested git IS relative to its parent — 'registered-sm' (a registered
+submodule) vs 'raw-nested-git' (a bare nested .git, not a submodule) — while
+'sidecar'/'merged'/'zipped'/'shadowed' are transformed states of such a repo:
+  [registered-sm]           — nested git repo registered as a submodule in
+                              .gitmodules ('sm' is happy; no action required)
+  [raw-nested-git]          — nested git repo NOT registered as a submodule
+                              (run '$US sm go' to register it as one)
+  [registered-sm, ignored]  — registered submodule ALSO carrying the ignore
                               marker ('.git/my-git-submodules.ignore') — this
                               is a conflict; see 'sm --list-ignored'
-  [unregistered, ignored]   — unregistered nested repo carrying the ignore
+  [raw-nested-git, ignored] — raw nested repo carrying the ignore
                               marker; 'sm go' will skip it. Subtree NOT
                               descended.
   [STALE REGISTRATION]      — entry in .gitmodules whose on-disk path does
@@ -7532,7 +7535,7 @@ How (move-aside bootstrap, done once per repo):
   A trap restores .git on interrupt so a crash can't lose it.
 
 The '.git.shadow.status' marker is how 'st' knows to tag the dir [shadowed]
-instead of [unregistered]. It's ordinary parent-tracked content.
+instead of [raw-nested-git]. It's ordinary parent-tracked content.
 
 Why the bootstrap is a one-time thing: git won't 'git add' a file inside a
 dir that has its own live .git — it wants to make a gitlink instead. Moving
@@ -9328,7 +9331,7 @@ _CS_EOF
   # Cross-submodule scan: find unregistered non-ignored nested repos that live
   # INSIDE registered submodules (sm can't register them from here — they
   # belong to their parent submodule — but it MUST mention them so the user
-  # isn't left wondering why 'st' shows [unregistered] that 'sm go' ignores).
+  # isn't left wondering why 'st' shows [raw-nested-git] that 'sm go' ignores).
   _sm_cross_tmp=$(mktemp "${TMPDIR:-/tmp}/smcross.XXXXXX")
   find_cross_submodule_unregistered "$(pwd -P)" > "$_sm_cross_tmp" 2>/dev/null || : > "$_sm_cross_tmp"
   _sm_c_cross=$(awk 'NF' "$_sm_cross_tmp" 2>/dev/null | wc -l | tr -d ' ')
@@ -12688,10 +12691,10 @@ PYDRV
     # the marker is excluded from the NESTED repo's own status (stays clean)
     _kid_dirt=$(git -C kid status --porcelain 2>/dev/null)
     [ -z "$_kid_dirt" ] || { _rt_fail "nested repo should stay clean (marker excluded), got: $(printf '%s' "$_kid_dirt" | tr '\n' '|')"; return 1; }
-    # st tags it [shadowed], not [unregistered]
+    # st tags it [shadowed], not [raw-nested-git]
     _rt_ok "st shows the shadowed repo" _rt_my_git st "$PWD" || return 1
     _rt_contains "tagged [shadowed]" "$_rt_out" "[shadowed]" || return 1
-    _rt_not_contains "not tagged [unregistered]" "$_rt_out" "[unregistered]" || return 1
+    _rt_not_contains "not tagged [raw-nested-git]" "$_rt_out" "[raw-nested-git]" || return 1
     return 0
   }
 
