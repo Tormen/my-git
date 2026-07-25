@@ -219,7 +219,7 @@ repo is processed.
 
 ### Ignore marker (respected by both `sm` and `mc`)
 
-A nested repo that carries `.git/my-git-submodules.ignore` is treated
+A nested repo that carries `.git/my-git.ignore` is treated
 as **leave alone** by both subcommands. `mc` silently skips such repos
 (counted as `ignored=N` in the summary). Pass `--force` to override the
 markers for a single run — identical semantics to `sm --force`.
@@ -282,7 +282,7 @@ design.
 | already registered (path + url match)                                        | no-op                                             | no-op                                                |
 | nested inside an existing repo boundary (registered **or not**)              | silent skip (counted in summary)                  | silent skip (counted in summary)                     |
 | stale registration (`.gitmodules` entry, no dir on disk)                     | auto-remove                                       | prompt `[Y]es / [S]kip / [A]bort`                    |
-| carries `my-git-submodules.ignore` marker                                    | silent skip; `--force` treats as fresh            | silent skip; `--force` treats as fresh               |
+| carries `my-git.ignore` marker                                    | silent skip; `--force` treats as fresh            | silent skip; `--force` treats as fresh               |
 | marker + `.gitmodules` path mismatch (ignore here, registered elsewhere)     | `CONFLICT` note, skip                             | prompt `[U]pdate / [R]emove / [S]kip / [A]bort`      |
 | moved (url matches a different registered path), nested repo **clean**       | rebind in place (no re-clone; all local state kept) | same (no extra prompt)                             |
 | moved, nested repo **risky** (uncommitted+untracked, unpushed branches, stashes) | **skip** with "push/commit first" hint         | prompt `[P]roceed / [S]kip / [A]bort`                |
@@ -307,7 +307,7 @@ just the current node).
 
 `--force` effects, consolidated:
 
-- bypasses per-repo `my-git-submodules.ignore` markers (treat as fresh).
+- bypasses per-repo `my-git.ignore` markers (treat as fresh).
 - reuses a stale `.git/modules/<name>/` rather than erroring out.
 - skips the suspicious-URL guard.
 
@@ -435,7 +435,7 @@ house icon ⌂). The typical use is `my-git flatten go --zip --local-only` to
 archive only the unpublished sidecars, but it applies to
 `--sidecar`/`--merge` and bare `flatten` just the same.
 
-A nested repo carrying `.git/my-git-submodules.ignore` (the same marker
+A nested repo carrying `.git/my-git.ignore` (the same marker
 `sm`/`mc` already honor) is left entirely untouched by default — not
 listed, not offered under `-i`. `--force` includes it anyway.
 
@@ -670,7 +670,7 @@ such a repo, so the label is not a simple registered/unregistered binary:
 - `[raw-nested-git]` — nested git repo not registered as a submodule (not
   yet in `.gitmodules`). Run `my-git sm go` to register it as one.
 - `[registered-sm, ignored]` — registered submodule **also** carrying the
-  `my-git-submodules.ignore` marker. Conflict state; inspect with
+  `my-git.ignore` marker. Conflict state; inspect with
   `my-git sm --list-ignored`.
 - `[raw-nested-git, ignored]` — raw nested repo carrying the ignore
   marker; `sm go` skips it and `st` does not descend into its subtree.

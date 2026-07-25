@@ -926,7 +926,7 @@ _unzip_gitdir() {
 #   Print paths (relative to $repo) of DIRECT nested git repos that are NOT
 #   registered in $repo/.gitmodules — i.e. embedded/unregistered repos. Skips
 #   descendants of registered submodules (those are that sub's concern) and
-#   any repo marked with .git/my-git-submodules.ignore (see 'sm' subcommand).
+#   any repo marked with .git/my-git.ignore (see 'sm' subcommand).
 #   Also skips descendants of REALIZED directories (list_realized_dirs) —
 #   a realized dir has no .git of its own, so a further-nested .git inside
 #   it would otherwise surface here as a flat, mis-leveled path instead of
@@ -1029,7 +1029,7 @@ list_stale_submodules() {
 }
 
 # is_nested_ignored <repo> <sub>
-#   Return 0 if $repo/$sub has the my-git-submodules.ignore marker.
+#   Return 0 if $repo/$sub has the my-git.ignore marker.
 is_nested_ignored() {
   _ini_r=$1; _ini_sub=$2
   _ini_gd=$(_sm_resolve_gitdir "$_ini_r/$_ini_sub/.git" "$_ini_r/$_ini_sub")
@@ -1579,7 +1579,7 @@ cmd_status() {
   # per repo: C=clean, A=ahead, B=behind, V=diverged, D=dirty, E=error/skip).
   _stcounts_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stcounts.XXXXXX")
   # Parallel tallies for the flag column: publish state (L=local-only ⌂,
-  # R=has-remote ↑) and the my-git-submodules.ignore marker (I). Counted in
+  # R=has-remote ↑) and the my-git.ignore marker (I). Counted in
   # the Summary. Only the default tree path fills these (the -V per-node view
   # renders no flag column).
   _stflag_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stflag.XXXXXX")
@@ -1980,7 +1980,7 @@ commit_one() {
   _r=$1
   MC_N_TOTAL=$((MC_N_TOTAL + 1))
 
-  # Honor the 'my-git-submodules.ignore' marker: if a nested repo is
+  # Honor the 'my-git.ignore' marker: if a nested repo is
   # flagged as "leave alone" for sm, mc respects the same signal.
   # --force (MC_FORCE=1) overrides — matches 'sm --force' semantics.
   _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
@@ -2237,7 +2237,7 @@ cmd_masscommits() {
       -n|-T|--try|--dry|--dry-run) _mc_mode=analyze ;;
       -i|--interactive) INTERACTIVE=1; require_tty masscommits ;;
       -R|--recursive) RECURSIVE=1 ;;
-      --force)      MC_FORCE=1 ;;  # bypass per-repo my-git-submodules.ignore markers
+      --force)      MC_FORCE=1 ;;  # bypass per-repo my-git.ignore markers
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "masscommits: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
@@ -2264,7 +2264,7 @@ cmd_masscommits() {
   MC_N_PUSHED=0         # clean-ahead → pushed
   MC_N_COMMITTED=0      # dirty → mass-committed (go mode)
   MC_N_SKIPPED=0        # user said [S]kip under -i
-  MC_N_IGNORED=0        # carries my-git-submodules.ignore marker → silent skip
+  MC_N_IGNORED=0        # carries my-git.ignore marker → silent skip
   MC_N_ERROR=0          # per-repo error (non-fatal, continued)
   MC_N_WOULD_PUSH=0     # analyze: would push
   MC_N_WOULD_COMMIT=0   # analyze: would mass-commit
@@ -4477,7 +4477,7 @@ _FL_EMB_REALIZE_EOF
     fi
   done)
 
-  # Respect the 'my-git-submodules.ignore' marker (same as sm/mc): a
+  # Respect the 'my-git.ignore' marker (same as sm/mc): a
   # nested repo carrying it is left ENTIRELY untouched by default —
   # flatten previously had no awareness of this marker at all, unlike
   # sm/mc which have always honored it. --force includes them anyway,
@@ -4555,7 +4555,7 @@ _FL_IGNCHK_ORPH_EOF
         fatal "flatten: '$_fl_scope_path_raw' is SHADOWED — a deliberate content-mirror with a LIVE .git. Flattening it would have to undo the shadow first, which flatten won't do implicitly. Run 'my-git unshadow $_fl_scope_path' first, then flatten." 64
       fi
       if [ -n "$(printf '%s%s' "$_fl_ignored_nested" "$_fl_ignored_registered" | tr -d '\n')" ]; then
-        fatal "flatten: '$_fl_scope_path_raw' is marked my-git-submodules.ignore — pass --force to include it" 64
+        fatal "flatten: '$_fl_scope_path_raw' is marked my-git.ignore — pass --force to include it" 64
       fi
       fatal "flatten: '$_fl_scope_path_raw' is not a nested repo (embedded, registered, or orphan gitlink) under $_fl_top" 64
     fi
@@ -4608,7 +4608,7 @@ _FL_IGNCHK_ORPH_EOF
       printf '  %s>> --zip     :  0   archive a repo/sidecar       (none found here)%s\n' "$C_BLUE" "$C_RESET"
       [ "$_fl_n_shadowed" -gt 0 ] && printf '  %s>> (%s SHADOWED repo(s) skipped — content-mirror with a live .git; '\''unshadow <path>'\'' first to flatten/zip one)%s\n' \
         "$C_BLUE" "$_fl_n_shadowed" "$C_RESET"
-      [ "$_fl_ign_total" -gt 0 ] && printf '  %s>> (%s nested repo(s) marked my-git-submodules.ignore, left untouched — --force to include)%s\n' \
+      [ "$_fl_ign_total" -gt 0 ] && printf '  %s>> (%s nested repo(s) marked my-git.ignore, left untouched — --force to include)%s\n' \
         "$C_BLUE" "$_fl_ign_total" "$C_RESET"
       echo
       if [ "$_fl_n_shadowed" -gt 0 ] || [ "${_fl_hint_zip:-0}" -gt 0 ]; then
@@ -4623,7 +4623,7 @@ _FL_IGNCHK_ORPH_EOF
     if [ "${_fl_hint_sc:-0}" -eq 0 ] && [ "${_fl_hint_zip:-0}" -eq 0 ]; then
       # Truly nothing — no candidates for ANY mode.
       if [ "$_fl_ign_total" -gt 0 ]; then
-        log_major "$_fl_top: nothing to flatten ($_fl_ign_total marked my-git-submodules.ignore, left untouched — --force to include)"
+        log_major "$_fl_top: nothing to flatten ($_fl_ign_total marked my-git.ignore, left untouched — --force to include)"
       else
         log_major "$_fl_top: nothing to flatten (no nested live repos, no sidecars)"
       fi
@@ -4644,7 +4644,7 @@ _FL_IGNCHK_ORPH_EOF
         "$C_BLUE" "$(printf '%s' "$_fl_shadowed_skipped" | grep -c .)" "$C_RESET"
     fi
     if [ "$_fl_ign_total" -gt 0 ]; then
-      printf '  %s>> (%s nested repo(s) marked my-git-submodules.ignore, left untouched — --force to include)%s\n' \
+      printf '  %s>> (%s nested repo(s) marked my-git.ignore, left untouched — --force to include)%s\n' \
         "$C_BLUE" "$_fl_ign_total" "$C_RESET"
     fi
     if [ "${_fl_hint_zip:-0}" -gt 0 ]; then
@@ -4689,7 +4689,7 @@ _FL_IGNCHK_ORPH_EOF
   _fl_n_ign_nested=$(printf '%s' "$_fl_ignored_nested" | grep -c .)
   _fl_n_ign_reg=$(printf '%s' "$_fl_ignored_registered" | grep -c .)
   if [ "$((_fl_n_ign_nested + _fl_n_ign_reg))" -gt 0 ]; then
-    printf '  %s>> %s marked my-git-submodules.ignore — left untouched (--force to include):%s\n' \
+    printf '  %s>> %s marked my-git.ignore — left untouched (--force to include):%s\n' \
       "$C_BLUE" "$((_fl_n_ign_nested + _fl_n_ign_reg))" "$C_RESET"
     printf '%s\n' "$_fl_ignored_nested" | while IFS= read -r _n; do
       [ -n "$_n" ] && printf '       %s\n' "$(printf '%s' "$_n" | sed 's|/\.git$||')"
@@ -7076,9 +7076,9 @@ submodule) vs 'raw-nested-git' (a bare nested .git, not a submodule) — while
   [raw-nested-git]          — nested git repo NOT registered as a submodule
                               (run '$US sm go' to register it as one)
   [raw-nested-git, ignored] — raw nested repo carrying the GENERIC ignore
-                              marker ('.git/my-git-submodules.ignore', legacy
-                              name). NOT sm-specific: my-git leaves it alone
-                              everywhere — st does not descend, sm does not
+                              marker ('.git/my-git.ignore'). NOT sm-specific:
+                              my-git leaves it alone everywhere — st does not
+                              descend, sm does not
                               register it, mc/flatten skip it. Toggle with
                               'my-git ignore/unignore <path>'; list via
                               'sm --list-ignored'.
@@ -7215,7 +7215,7 @@ Commit-message template (auto-generated, no editor):
           (tunables: COMMIT_MSG_LAST_N, COMMIT_MSG_DIFF_MAX_FILES)
 
 Ignore marker (same signal as 'sm'):
-  A nested repo carrying '.git/my-git-submodules.ignore' is treated
+  A nested repo carrying '.git/my-git.ignore' is treated
   as "leave alone" — mc silently skips it (counted as ignored=N in
   the summary). Use --force to bypass all markers (matches 'sm --force').
 
@@ -7228,7 +7228,7 @@ Options:
                                       for commits; divergence log for pushes).
                                       Also governs destructive .claude migration
   -R, --recursive                    Walk the full submodule tree bottom-up
-  --force                            Bypass per-repo my-git-submodules.ignore
+  --force                            Bypass per-repo my-git.ignore
                                       markers (same as 'sm --force')
   -V, -VV, -D, -DD                   Verbosity / debug
   --help
@@ -7265,7 +7265,7 @@ Options:
   -i, --interactive    Prompt [Y]es / [s]kip / [a]bort before each ff-merge under -R walks.
   -R, --recursive      Walk full submodule tree TOP-DOWN (parents fetch
                        first so submodule refs resolve).
-  --force              Bypass per-repo my-git-submodules.ignore markers
+  --force              Bypass per-repo my-git.ignore markers
                        (same semantics as 'sm --force' / 'mc --force').
   -V, -VV, -D, -DD     Verbosity / debug.
   --help
@@ -7305,7 +7305,7 @@ Modes:
 
 Options:
   -R, --recursive   Walk the full submodule tree.
-  --force           Include repos carrying my-git-submodules.ignore (normally
+  --force           Include repos carrying my-git.ignore (normally
                     silently skipped).
   -V, -VV, -D, -DD  Verbosity / debug.
 
@@ -7394,7 +7394,7 @@ Modes:
                       writes of any kind.
   go                  APPLY — perform the flatten.
 
-A nested repo carrying '.git/my-git-submodules.ignore' (same marker
+A nested repo carrying '.git/my-git.ignore' (same marker
 'sm'/'mc' already honor) is left ENTIRELY untouched by default — not
 listed as a candidate, not offered in 'go -i'. --force includes it
 anyway, same convention as sm/mc's own --force.
@@ -7683,7 +7683,7 @@ Options (all forwarded to each phase verbatim):
   -R, --recursive    Walk full submodule tree (sm top-down, mc bottom-up,
                      pull top-down — each phase handles its own order).
   -i, --interactive  Prompt where applicable in each phase.
-  --force            Bypass per-repo my-git-submodules.ignore markers.
+  --force            Bypass per-repo my-git.ignore markers.
   -V, -VV, -D, -DD   Verbosity / debug.
   --help
 
@@ -7842,7 +7842,7 @@ is a bug. The table reflects CURRENT behavior, not aspirational design.
     own concern too, not this scope's)
   stale registration                        auto-remove                   prompt [Y]es / [S]kip / [A]bort
    (.gitmodules entry, no dir on disk)
-  carries my-git-submodules.ignore marker   silent skip (see summary)     silent skip (same)
+  carries my-git.ignore marker   silent skip (see summary)     silent skip (same)
                                             --force: treat as fresh       --force: treat as fresh
   marker + .gitmodules path mismatch        CONFLICT note, skip           prompt [U]pdate / [R]emove /
    (ignore here, registered elsewhere)                                      [S]kip / [A]bort
@@ -7884,7 +7884,7 @@ commit message is like 'my-git sm: registered=2 stale-removed=1'. Under
 -i, my-git prints the planned message + path list and prompts [Y]es /
 [S]kip / [A]bort before committing.
 
-Ignore marker:  writes '<nested>/.git/my-git-submodules.ignore' (delete to un-ignore).
+Ignore marker:  writes '<nested>/.git/my-git.ignore' (delete to un-ignore).
 
 Exclude-file sync: at the END of every 'sm go' run (even when nothing was
 registered), my-git reconciles \$SUPER/.git/info/exclude so every nested
@@ -8112,7 +8112,7 @@ show_help() {
 # Helpers prefixed _sm_ where they would clash with my-git-level names.
 # Everything else retains its original name.
 
-_sm_IGNORE_MARKER='my-git-submodules.ignore'
+_sm_IGNORE_MARKER='my-git.ignore'
 _sm_PREEXISTING_SUFFIX='.preexisting.'
 
 _sm_ask() {
@@ -8254,8 +8254,7 @@ _sm_unmark_ignored() {
 # not descend into it, 'sm' does not register it as a submodule, 'mc' does
 # not auto-commit it, 'flatten' does not touch it. It's the opt-out that
 # keeps a nested repo a deliberate raw-nested-git. (On-disk marker file:
-# '$_sm_IGNORE_MARKER' — legacy name kept for backward compatibility; the
-# concept is generic.) The marker lives inside the repo's own gitdir, so it
+# '$_sm_IGNORE_MARKER'.) The marker lives inside the repo's own gitdir, so it
 # is tracked by nothing — a pure filesystem flag, no commit needed.
 #
 # Echo the .git PATH (for the _sm_* helpers) of worktree $1 — its live '.git'
@@ -9753,7 +9752,7 @@ _CS_EOF
 
       if [ "$_sm_interactive" -ne 1 ]; then
         # Default: respect .gitignore silently. It IS the permanent marker
-        # (no need for a parallel my-git-submodules.ignore file).
+        # (no need for a parallel my-git.ignore file).
         if [ -n "$_ci_lhs" ]; then
           log_medium "respecting .gitignore for $_sp ($_ci_src:$_ci_lno pattern '$_ci_pat')"
         else
@@ -10683,7 +10682,7 @@ _RT_CONF_EOF
       git commit -q -m addsrc )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf_auto_emb "$_rt_conf_path"
     cd global || return 1
-    touch src/.git/my-git-submodules.ignore
+    touch src/.git/my-git.ignore
     _rt_my_git flatten go >"$_rt_out" 2>"$_rt_err"
     _rt_rc=$?
     [ "$_rt_rc" -eq 0 ] || { _rt_fail "expected exit 0 (graceful), got $_rt_rc"; return 1; }
@@ -10705,10 +10704,10 @@ _RT_CONF_EOF
       git commit -q -m addsrc )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf_auto_emb "$_rt_conf_path"
     cd global || return 1
-    touch src/.git/my-git-submodules.ignore
+    touch src/.git/my-git.ignore
     _rt_my_git flatten go >/dev/null 2>&1
-    rm -f src/.git/my-git-submodules.ignore 2>/dev/null
-    rm -f src/.git.real/my-git-submodules.ignore 2>/dev/null
+    rm -f src/.git/my-git.ignore 2>/dev/null
+    rm -f src/.git.real/my-git.ignore 2>/dev/null
     _rt_ok "follow-up flatten completes" _rt_my_git flatten go || return 1
     _rt_clean "clean after follow-up" || return 1
     _rt_gitlink_mode "myotr content now plain-tracked" src/myotr/x.txt 100644 || return 1
@@ -10756,11 +10755,11 @@ _RT_CONF_EOF
     _rt_repo_file sub-o x.txt
     _rt_repo parent
     ( cd parent && git clone -q ../sub-o keepout >/dev/null 2>&1
-      touch keepout/.git/my-git-submodules.ignore )
+      touch keepout/.git/my-git.ignore )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     cd parent || return 1
     _rt_ok "flatten plan (default)" _rt_my_git flatten || return 1
-    _rt_contains "ignored count mentioned" "$_rt_out" "my-git-submodules.ignore" || return 1
+    _rt_contains "ignored count mentioned" "$_rt_out" "my-git.ignore" || return 1
     _rt_not_contains "keepout not offered as a candidate" "$_rt_out" "keepout/.git" || return 1
     _rt_ok "flatten --force includes it" _rt_my_git flatten --force || return 1
     _rt_contains "keepout now offered with --force" "$_rt_out" "keepout/.git" || return 1
@@ -11046,8 +11045,8 @@ _RT_CONF_EOF
       git clone -q ../../normal-child-o normal-child >/dev/null 2>&1
       mkdir -p empty-child; git init -q empty-child >/dev/null 2>&1
       touch normal-child/.git/../.git 2>/dev/null || true
-      touch normal-child/.git/my-git-submodules.ignore
-      touch empty-child/.git/my-git-submodules.ignore
+      touch normal-child/.git/my-git.ignore
+      touch empty-child/.git/my-git.ignore
     )
     cd global || return 1
     _sha=$(git -C src rev-parse HEAD)
@@ -11099,12 +11098,12 @@ _RT_CONF_EOF
     # Ignore-mark the child so only 'src' gets auto-realized this round.
     _rze_gd=$(git -C "src/rust/,i3status-rust" rev-parse --absolute-git-dir 2>/dev/null)
     [ -n "$_rze_gd" ] && [ -d "$_rze_gd" ] || { _rt_fail "could not resolve child's git-dir for test setup"; return 1; }
-    touch "$_rze_gd/my-git-submodules.ignore"
+    touch "$_rze_gd/my-git.ignore"
     _rt_my_git flatten go >"$_rt_out" 2>"$_rt_err"
     _rt_isdir "src/.git.real created (run 1)" src/.git.real || return 1
     _rt_contains "broken-pointer warning shown for the untouched child" "$_rt_err" "no longer a functional git repo" || return 1
     # Run 2: no more ignore marker — realize the now-orphaned child.
-    rm -f "src/rust/,i3status-rust/.git/my-git-submodules.ignore" 2>/dev/null
+    rm -f "src/rust/,i3status-rust/.git/my-git.ignore" 2>/dev/null
     _rt_ok "run 2: realize the child via the GIT_SIDECAR_DIRNAME fallback" _rt_my_git flatten go || return 1
     _rt_isdir "child's .git.real created despite parent already realized" "src/rust/,i3status-rust/.git.real" || return 1
     _rt_ok "child's history intact via the fallback resolution" git --git-dir="src/rust/,i3status-rust/.git.real" log --oneline || return 1
@@ -11137,7 +11136,7 @@ _RT_CONF_EOF
     cd global || return 1
     _rt_sha_before=$(git ls-files -s src | awk '{print $2}')
     [ -n "$_rt_sha_before" ] || { _rt_fail "test setup: could not read src's initial gitlink sha"; return 1; }
-    touch src/.git/my-git-submodules.ignore
+    touch src/.git/my-git.ignore
     _rt_conf_path="$PWD/conf.ini"; _rt_conf_auto_emb "$_rt_conf_path"
     _rt_ok "flatten go: src is orphan + ignored + still live" _rt_my_git flatten go || return 1
     _rt_not_contains "plan must not list src as an orphan to remove" "$_rt_out" "Orphan gitlinks to remove" || return 1
@@ -11212,7 +11211,7 @@ _RT_CONF_EOF
     mkdir -p src/broken-child
     printf 'gitdir: ../../.git/modules/broken-child\n' > src/broken-child/.git
     echo content > src/broken-child/x.txt
-    touch src/.git/my-git-submodules.ignore
+    touch src/.git/my-git.ignore
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     _rt_ok "flatten (dry-run, no go)" _rt_my_git flatten || return 1
     _rt_contains "broken-child listed" "$_rt_out" "src/broken-child/.git" || return 1
@@ -11246,7 +11245,7 @@ _RT_CONF_EOF
     # (common: people often .gitignore exactly the directory names
     # they don't expect git to descend into directly). Once a path is
     # deliberately chosen for flatten/realize (via --force overriding
-    # its my-git-submodules.ignore marker, or any other route), plain
+    # its my-git.ignore marker, or any other route), plain
     # 'git add' respecting .gitignore would silently block the very
     # thing just decided — 'git add' must use -f here, since 'skip' is
     # the actual mechanism for genuine exclusion, not an incidental
@@ -11255,7 +11254,7 @@ _RT_CONF_EOF
     _rt_repo global
     ( cd global && echo myscript > .gitignore && git add .gitignore && git commit -q -m gi
       git clone -q ../sub-o myscript >/dev/null 2>&1
-      touch myscript/.git/my-git-submodules.ignore )
+      touch myscript/.git/my-git.ignore )
     cd global || return 1
     _rt_conf_path="$PWD/conf.ini"; _rt_conf_auto_emb "$_rt_conf_path"
     _rt_ok "flatten go --force: gitignored-but-deliberate target" _rt_my_git flatten go --force || return 1
@@ -11333,7 +11332,7 @@ _RT_CONF_EOF
     _rt_repo_file kid_b_o y.txt
     _rt_repo global
     ( cd global && git clone -q ../kid_a_o kida >/dev/null 2>&1 && git clone -q ../kid_b_o kidb >/dev/null 2>&1 )
-    touch global/kidb/.git/my-git-submodules.ignore
+    touch global/kidb/.git/my-git.ignore
     cd global || return 1
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     _rt_ok "flatten kida --merge (analyze)" _rt_my_git flatten kida --merge || return 1
@@ -11348,14 +11347,14 @@ _RT_CONF_EOF
     _rt_repo_file kid_o x.txt
     _rt_repo global
     ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
-    touch global/kid/.git/my-git-submodules.ignore
+    touch global/kid/.git/my-git.ignore
     cd global || return 1
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     if _rt_my_git flatten kid --merge >"$_rt_out" 2>"$_rt_err"; then
       _rt_fail "flatten on an ignore-marked path without --force should be refused"
       return 1
     fi
-    _rt_contains "specific ignore-marker error" "$_rt_err" "is marked my-git-submodules.ignore" || return 1
+    _rt_contains "specific ignore-marker error" "$_rt_err" "is marked my-git.ignore" || return 1
     _rt_ok "flatten kid --merge --force" _rt_my_git flatten kid --merge --force || return 1
     return 0
   }
@@ -12187,7 +12186,7 @@ _RT_STALE_CONF_EOF
     ( cd root && git clone -q ../origin_o published >/dev/null 2>&1
       git init -q localonly && ( cd localonly && echo l > l.txt && git add l.txt && git commit -q -m l )
       git init -q ign && ( cd ign && echo i > i.txt && git add i.txt && git commit -q -m i \
-        && touch .git/my-git-submodules.ignore ) )
+        && touch .git/my-git.ignore ) )
     cd root || return 1
     _rt_ok "st -R (default verbosity)" _rt_my_git -R st || return 1
     _rt_contains "summary carries a flags line" "$_rt_out" ">> flags:" || return 1
@@ -12214,9 +12213,9 @@ _RT_STALE_CONF_EOF
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd root && git clone -q ../kid_o kid >/dev/null 2>&1 )
     cd root || return 1
-    _rt_absent "not ignored yet" kid/.git/my-git-submodules.ignore || return 1
+    _rt_absent "not ignored yet" kid/.git/my-git.ignore || return 1
     _rt_ok "ignore kid" _rt_my_git ignore kid || return 1
-    _rt_exists "marker written" kid/.git/my-git-submodules.ignore || return 1
+    _rt_exists "marker written" kid/.git/my-git.ignore || return 1
     _rt_ok "st -R after ignore" _rt_my_git -R st || return 1
     grep 'kid' "$_rt_out" | grep -q ', ignored\]' \
       || { _rt_fail "kid should be tagged [.., ignored] after ignore"; return 1; }
@@ -12225,7 +12224,7 @@ _RT_STALE_CONF_EOF
     _rt_contains "reports already in state" "$_rt_out" "already in state" || return 1
     # unignore removes it.
     _rt_ok "unignore kid" _rt_my_git unignore kid || return 1
-    _rt_absent "marker removed" kid/.git/my-git-submodules.ignore || return 1
+    _rt_absent "marker removed" kid/.git/my-git.ignore || return 1
     _rt_ok "unignore again (noop)" _rt_my_git unignore kid || return 1
     # error path: not a repo.
     if _rt_my_git ignore no-such-dir >"$_rt_out" 2>"$_rt_err"; then
@@ -13360,7 +13359,7 @@ _my-git() {
           _arguments \
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Prompt per repo for the user-dirt phase]' \
-            '--force[Bypass my-git-submodules.ignore markers this run]' \
+            '--force[Bypass my-git.ignore markers this run]' \
             '1: :(go)' \
             '*: :_directories'
           ;;
@@ -13394,7 +13393,7 @@ _my-git() {
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Prompt per item]' \
             '--force[Bypass ignore markers / suspicious-URL guard this run]' \
-            '--list-ignored[List every my-git-submodules.ignore marker in the tree]' \
+            '--list-ignored[List every my-git.ignore marker in the tree]' \
             '--clean-stale[ONLY remove stale .gitmodules registrations]' \
             '--clean-leftovers[Remove stale .git/modules/<name>/ leftovers]' \
             '--sync-gitignore[Sync .gitignore negations for ignored submodules]' \
@@ -13412,7 +13411,7 @@ _my-git() {
             '(-k --keep)'{-k,--keep}'[--zip: keep the original git dir too (just create the .zip)]' \
             '(--local-only --house)'{--local-only,--house}'[Filter to repos with NO remote (the house-icon repos)]' \
             '--rm-git[Permanently delete each nested .git (types "yes" to confirm)]' \
-            '--force[Include my-git-submodules.ignore-marked repos too]' \
+            '--force[Include my-git.ignore-marked repos too]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
             '1: :(go)' \
             '*: :_directories'
