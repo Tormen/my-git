@@ -1746,9 +1746,12 @@ cmd_status() {
   done < "$_rtmp"
   rm -f "$_rtmp"
 
-  # ─── Legend (-V) ─────────────────────────────────────────────────────
-  # Explain the compact abbreviations/markers used in the tree above.
-  # Only at -V so the default view stays uncluttered.
+  # ─── Legend ──────────────────────────────────────────────────────────
+  # The FULL legend (states/dirty/tags/flags) prints only at -V, keeping the
+  # default view uncluttered. But the ⌂ flag column appears in the DEFAULT
+  # tree, so its one-line explanation is surfaced by default too — whenever a
+  # tree (>1 repo) was actually rendered (see the 'elif' below).
+  _st_total=$(grep -c . "$_stcounts_tmp" 2>/dev/null | head -1)
   if [ "$VRB" = 1 ]; then
     echo
     log_major "Legend"
@@ -1759,10 +1762,13 @@ cmd_status() {
       "$C_BLUE" "${GIT_SIDECAR_DIRNAME:-.git.real}" "$C_RESET"
     printf '  %s>> flags (column after the tag): %s⌂%s = local-only (no remote configured — nothing to publish to);  blank = has a remote (publishable)%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
+  elif [ "${_st_total:-0}" -gt 1 ]; then
+    # default view: the ⌂ appears in the tree above, so always explain it.
+    printf '  %s>> flags (column after the tag): %s⌂%s = local-only (no remote configured — nothing to publish to);  blank = has a remote (publishable)%s\n' \
+      "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
   fi
 
   # ─── Summary ─────────────────────────────────────────────────────────
-  _st_total=$(grep -c . "$_stcounts_tmp" 2>/dev/null | head -1)
   if [ "$_st_total" -gt 1 ]; then
     _n_clean=$(grep -c '^C$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_ahead=$(grep -c '^A$' "$_stcounts_tmp" 2>/dev/null | head -1)
@@ -5718,13 +5724,20 @@ cmd_unflatten() {
         _ufl_n_fail=$((_ufl_n_fail + 1)); log_dbg_med "unflatten apply: $_p FAILED (merge reconstruct)"
       fi
     elif [ "$_m" = zip ]; then
-      # Pure filesystem restore (like the reverse of flatten --zip): no
-      # parent index bookkeeping to commit here — the removed .git*.zip is
-      # a plain worktree change, settled by the next 'mc' (same as gz/gu,
-      # which never touch the parent). So NOT added to _ufl_commit_paths.
       if _unzip_gitdir "$_p" "$_ufl_keep"; then
         _ufl_n_ok=$((_ufl_n_ok + 1))
         log_ok "unflatten --zip: restored $_p$([ "$_ufl_keep" = 1 ] && printf ' (.zip kept)')"
+        # flatten --zip committed ONLY the .git.zip into the parent, so the
+        # .zip's removal here IS a parent-tracked change — unflatten must
+        # commit it itself, the same self-contained teardown sidecar/merge do,
+        # so the parent is never left dirty. Skipped under --keep (the .zip
+        # stays on disk as valid tracked content). --ignore-unmatch keeps this
+        # a no-op for a standalone 'gz' archive that was never committed.
+        if [ "$_ufl_keep" != 1 ]; then
+          run git rm -q --cached --ignore-unmatch -- \
+            "$_p/.git.zip" "$_p/${GIT_SIDECAR_DIRNAME:-.git.real}.zip" >/dev/null 2>&1 || true
+          _ufl_commit_paths="$_ufl_commit_paths $(shell_escape "$_p")"
+        fi
       else
         _ufl_n_fail=$((_ufl_n_fail + 1)); log_dbg_med "unflatten apply: $_p FAILED (zip restore)"
       fi
@@ -5746,7 +5759,7 @@ cmd_unflatten() {
     log_dbg_med "unflatten: committing index changes scoped to:$_ufl_commit_paths"
     _ufl_cmsg_sub="my-git unflatten: restored $_ufl_n_ok nested repo(s) to a live .git"
     [ "$_ufl_n_fail" -gt 0 ] && _ufl_cmsg_sub="$_ufl_cmsg_sub ($_ufl_n_fail failed)"
-    _ufl_cmsg_body="Renamed each $GIT_SIDECAR_DIRNAME -> .git (and/or reconstructed merged path(s)), then dropped the parent's now-obsolete tracking of the sidecar snapshot(s), the .status marker(s), and the .git.merged snapshot(s). Nested repo history is intact in the restored live .git. Committed by my-git so unflatten leaves the parent clean, mirroring how flatten/gz commit their own artifacts."
+    _ufl_cmsg_body="Restored each nested repo to a live .git (renamed $GIT_SIDECAR_DIRNAME -> .git, reconstructed merged path(s), and/or unzipped .git.zip archive(s)), then dropped the parent's now-obsolete tracking of the sidecar snapshot(s), the .status marker(s), the .git.merged snapshot(s), and the .git.zip archive(s). Nested repo history is intact in the restored live .git. Committed by my-git so unflatten leaves the parent clean, mirroring how flatten/gz commit their own artifacts."
     eval "run git commit -q -m \"\$_ufl_cmsg_sub\" -m \"\$_ufl_cmsg_body\" -- $_ufl_commit_paths" >/dev/null 2>&1 || \
       log_warn "unflatten: self-contained teardown commit failed — the removed $GIT_SIDECAR_DIRNAME/.status/.git.merged entries are left STAGED for manual commit"
   fi
@@ -12047,6 +12060,30 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_st_flags_legend_shown_by_default_with_tree() {
+    # The ⌂ flag appears in the DEFAULT tree, so its one-line legend must be
+    # shown by default too (not only under -V) whenever a tree (>1 repo) is
+    # rendered — and exactly once (no -V duplication). A bare single-repo st
+    # stays uncluttered (no legend).
+    _rt_repo_file origin_o x.txt
+    _rt_repo root
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd root && git clone -q ../origin_o published >/dev/null 2>&1
+      git init -q localonly && ( cd localonly && echo l > l.txt && git add l.txt && git commit -q -m l ) )
+    cd root || return 1
+    _rt_ok "st -R (default verbosity)" _rt_my_git -R st || return 1
+    _rt_contains "flags legend shown by default with a tree" "$_rt_out" "flags (column after the tag)" || return 1
+    _rt_contains "legend explains local-only" "$_rt_out" "local-only" || return 1
+    _rt_leg_n=$(grep -c 'flags (column after the tag)' "$_rt_out")
+    [ "$_rt_leg_n" -eq 1 ] || { _rt_fail "flags legend should appear exactly once in default view, got $_rt_leg_n"; return 1; }
+    # Bare single repo (no tree): legend must NOT appear.
+    _rt_repo solo
+    cd solo || return 1
+    _rt_ok "st on a single repo" _rt_my_git st || return 1
+    _rt_not_contains "no flags legend for a single-repo st" "$_rt_out" "flags (column after the tag)" || return 1
+    return 0
+  }
+
   test_st_broken_gitdir_not_masquerade_as_parent() {
     # A nested dir whose '.git' is a DIRECTORY with no HEAD (invalid gitdir —
     # e.g. history lost, only a config left) must NOT report the enclosing
@@ -12921,7 +12958,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flags_legend_shown_by_default_with_tree test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
