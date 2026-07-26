@@ -26,7 +26,9 @@ userland: BSD `sed`/`grep`/`stat`, `stat -f`, etc.).
    commands use the same idiom (below); messages are mode-accurate.
 5. **Loud over silent.** Never return an empty result where an error/permission
    problem occurred — warn.
-6. **Commit trailer:** `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+6. **NO AI co-author trailer, ever.** Commits, PRs and tags carry the human
+   author only — no `Co-Authored-By: Claude …`, no `🤖 Generated with …`
+   footer. The user authors; the assistant is a tool, not a contributor.
    Committing may need `git -c safe.directory='*'` when the repo owner ≠ you.
 
 ## The command idiom (shared by the mutating commands)
