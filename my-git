@@ -4643,11 +4643,30 @@ _FL_EMB_REALIZE_EOF
   # Say WHICH repo this run reads and writes, before doing anything.
   # flatten always acts on the toplevel of wherever you are standing --
   # never on a nested repo's own .git as the committer -- so name it.
+  # Build the mode line FIRST. A multi-line 'case' inside "$( ... )" is a
+  # runtime parse error even though 'sh -n' accepts the file, because the
+  # substitution body is only parsed when it is expanded.
+  _fl_modeline=""
+  case "$_fl_forced_mode" in
+    merge)   _fl_modeline="each nested history is transplanted INTO the parent git (refs pinned under $MERGED_REFS_ROOT/<path>/); a record is written to  <path>/.git.merged  naming the repo that now holds it" ;;
+    sidecar) _fl_modeline="each nested .git is relocated to  <path>/$GIT_SIDECAR_DIRNAME ; a record is written to  <path>/$GIT_SIDECAR_DIRNAME.status  naming the repo that tracks the content" ;;
+    zip)     _fl_modeline="each nested .git is archived to  <path>/.git.zip  and ONLY that archive is committed (no status file; nothing else about the parent changes)" ;;
+  esac
+  _fl_rmline=""
+  [ "$_fl_rmgit" = 1 ] && _fl_rmline="--rm-git: each nested .git is DELETED -- the parent git is then the only one left"
+  # --zip is the exception: it commits ONLY the archive and does NOT absorb
+  # the nested worktree files, so it must not claim otherwise.
+  if [ "$_fl_forced_mode" = zip ]; then
+    _fl_contentline="the nested worktree files are NOT absorbed -- only the .git.zip archive is committed"
+  else
+    _fl_contentline="the nested files become that parent git's own ordinary content"
+  fi
   log_repo_context flatten "$_fl_top" \
-    "this repo's .git receives the commit (the nested files become ITS content)" \
+    "the commit goes to the PARENT git shown above -- $_fl_top/.git" \
+    "$_fl_contentline" \
     "${_fl_scope_path:+scoped to: $_fl_scope_path (only this nested repo is touched)}" \
-    "$([ "$_fl_forced_mode" = merge ] && printf 'each nested history is transplanted INTO this repo (%s/<path>/)' "$MERGED_REFS_ROOT")" \
-    "$([ "$_fl_rmgit" = 1 ] && printf '%s' '--rm-git: each nested .git is DELETED -- this repo is the only one left')"
+    "$_fl_modeline" \
+    "$_fl_rmline"
 
   log_dbg_med "flatten: top=$_fl_top scope='${_fl_scope_path:-<whole repo>}' forced_mode='${_fl_forced_mode:-<none>}' mode=$_fl_mode interactive=$_fl_interactive rmgit=$_fl_rmgit force=$_fl_force keep=$_fl_keep sidecar_dirname=$GIT_SIDECAR_DIRNAME"
 
@@ -6560,8 +6579,10 @@ cmd_shadow() {
   # same files. Which one is the mirror is exactly what must not be
   # guessed at.
   log_repo_context shadow "$_sh_top" \
-    "this repo's .git receives the commit and MIRRORS the nested files" \
-    "each shadowed repo KEEPS its own live .git -- that .git stays the authoritative history" \
+    "the commit goes to the PARENT git shown above -- $_sh_top/.git" \
+    "that creates a MIRROR of the nested files inside the parent git (they become its ordinary content)" \
+    "each shadowed repo KEEPS its own live .git, which stays the authoritative history" \
+    "a marker is written to  <path>/.git.shadow.status  (inside the shadowed repo's own dir, tracked BY the parent) recording  shadowed-into-repo: $_sh_top" \
     "${_sh_scope:+scoped to: $_sh_scope}"
 
   if [ -n "$_sh_scope" ]; then
@@ -6675,8 +6696,10 @@ cmd_unshadow() {
   cd "$_ush_top" || fatal "unshadow: cannot cd to $_ush_top" 1
 
   log_repo_context unshadow "$_ush_top" \
-    "this repo STOPS tracking the mirrored files (git rm --cached); its .git receives the commit" \
-    "each nested repo's own live .git is NOT touched -- no history is affected" \
+    "the commit goes to the PARENT git shown above -- $_ush_top/.git" \
+    "that REMOVES the mirror: the parent stops tracking the nested files (git rm --cached)" \
+    "each nested repo's own live .git is NOT touched -- no history is affected, the files stay on disk" \
+    "the marker  <path>/.git.shadow.status  is removed too, so nothing claims a mirror that no longer exists" \
     "${_ush_scope:+scoped to: $_ush_scope}"
 
   # A SHADOWED repo = a nested LIVE repo carrying a '.git.shadow.status' marker
@@ -13378,6 +13401,34 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_banner_names_the_status_file_and_its_location() {
+    # The banner must answer "which git, and WHERE does the record land?".
+    # It also guards a trap 'sh -n' cannot catch: a multi-line case inside
+    # "$( ... )" parses fine but blows up at EXPANSION time, so only actually
+    # RUNNING each mode proves the banner works.
+    _rt_repo_file kid_o a.md
+    _rt_repo parent
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd parent && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd parent || return 1
+
+    _rt_ok "shadow analyze" _rt_my_git shadow kid || return 1
+    _rt_contains "shadow names the marker file" "$_rt_out" "<path>/.git.shadow.status" || return 1
+    _rt_contains "shadow says what the marker records" "$_rt_out" "shadowed-into-repo:" || return 1
+    _rt_contains "shadow says the commit goes to the parent git" "$_rt_out" "the commit goes to the PARENT git" || return 1
+
+    _rt_ok "flatten --sidecar analyze" _rt_my_git flatten kid --sidecar || return 1
+    _rt_contains "sidecar names its status file" "$_rt_out" ".git.real.status" || return 1
+    _rt_not_contains "no runtime parse error leaked into the output" "$_rt_out" "syntax error" || return 1
+
+    _rt_ok "flatten --merge analyze" _rt_my_git flatten kid --merge || return 1
+    _rt_contains "merge names its record file" "$_rt_out" "<path>/.git.merged" || return 1
+
+    _rt_ok "flatten --zip analyze" _rt_my_git flatten kid --zip || return 1
+    _rt_contains "zip is honest that files are NOT absorbed" "$_rt_out" "NOT absorbed" || return 1
+    return 0
+  }
+
   test_purge_analyze_is_read_only_and_names_the_repo() {
     _rt_purge_setup || return 1
     _rt_before=$(git rev-parse HEAD)
@@ -14949,7 +15000,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
