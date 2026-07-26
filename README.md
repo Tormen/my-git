@@ -169,6 +169,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip`/`--merge` all exact (merge restores the preserved history, branches and tags); falls back to best-effort `git subtree split` only for snapshots written before preservation existed; auto-detects the mode per path |
 | `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
 | `unshadow`      | `unsh`         | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
+| `purge`         | —              | single PATH | Remove a path's content **and its entire history** from a repo — the only command that rewrites history. Resolves the repo by searching enclosing repos' **history** (not their index), `--from` to disambiguate; refuses unless the path is a repo in its own right; backs up `.git`, then demands you type `I am sure` |
 | `audit`         |                | always    | Read-only health checks: `--claude` (`.claude/` symlink convention) and/or `--sidecar` (sidecar setup) |
 | `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |
@@ -203,6 +204,7 @@ repo that will receive the result:
 | `shadow` | the toplevel | the toplevel's `.git` (mirrors the files) | nothing — the nested `.git` stays live and authoritative |
 | `unshadow` | the toplevel | the toplevel's `.git` (`git rm --cached`) | nothing — no history is affected |
 | `ignore` / `unignore` | toplevel used **only** to resolve the path | **nothing is committed** | marker written inside the nested repo's **own** gitdir |
+| `purge` | the repo whose **history** contains the path (`--from` to disambiguate) | **rewrites every commit** in that repo | nothing — the path's own repo and files are left alone |
 | `gz` / `gu` | the named path | **nothing** — parent-neutral | that path's `.git` ⇄ `.git.zip` |
 
 The rule behind the table: **`sm`/`unsm` resolve *downward* to the immediate
@@ -236,7 +238,42 @@ git config --add remote.origin.fetch '+refs/my-git/merged/*:refs/my-git/merged/*
 git fetch origin
 ```
 
-`--rm-git` is the single destructive operation. It lists exactly what it will
+### `purge` — reclaiming space after content moved out
+
+`unshadow`/`unflatten` answer *"who tracks this path now?"*. `purge` answers
+*"who has ever tracked it?"* — and is the only command that rewrites history.
+
+The case it exists for: a nested repo was merged into its parent, then later
+given its own `.git` again. The parent still carries that repo's entire
+history as dead weight. In this tree, `src` accounted for **93 MB of global's
+96 MB** of reachable objects.
+
+```sh
+my-git purge src                        # analyze: commits rewritten, MB reclaimed
+my-git purge go src --from /syst/global # apply, behind the "I am sure" gate
+```
+
+It resolves the target repo by searching enclosing repos' **history**, not their
+index — after an `unshadow` no repo *tracks* the path any more, yet its objects
+still sit in the repo above, which is exactly when purge is wanted. If two repos
+qualify it refuses and makes you pick with `--from`.
+
+Safety: it refuses unless the path is a repo in its own right (so it relocates
+nothing and destroys nothing; `--force` overrides), copies `.git` to
+`.git.purge-backup-<timestamp>` first, and requires you to type `I am sure`.
+
+The rewrite runs on a **bare copy** of the gitdir, never the live repo — history
+is a property of the gitdir, so the worktree is never involved. That avoids
+filter-branch's clean-worktree requirement *and* its final checkout, which would
+otherwise delete the very files being purged. On failure nothing is changed at
+all. Afterwards the index is rebuilt with `reset --mixed`, leaving the path
+untracked-but-present.
+
+Like `--rm-git`, `purge` has **no inverse**. Every reversible operation in my-git
+comes as a pair (`shadow`/`unshadow`, `flatten`/`unflatten`, `sm`/`unsm`); the
+destructive ones stand alone. That asymmetry is the signal.
+
+`--rm-git` is the single destructive operation on a *nested repo's* history. It lists exactly what it will
 delete and requires you to type **`I am sure`** — nothing else proceeds. There
 is deliberately no "merge but discard the history" flag; typing one points you
 here.

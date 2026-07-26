@@ -3271,8 +3271,8 @@ _FL_ADD_EOF
       printf '# parent-tracked record of its live state -- quick reference without\n'
       printf '# --git-dir tricks, and what "unflatten --sidecar" needs to restore it.\n'
       printf '# Point-in-time except last-published-to-parent (bumped by the ga alias).\n\n'
-      printf 'sidecar-gitdir: %s/%s\n' "$_sst_path" "$GIT_SIDECAR_DIRNAME"
-      printf 'content-tracked-by-repo: %s\n' "$(tracking_repo_of "$_sst_path" || true)"
+      printf 'sidecar-gitdir: %s/%s/%s\n' "$_fl_top" "$_sst_path" "$GIT_SIDECAR_DIRNAME"
+      printf 'content-tracked-by-repo: %s\n' "$_fl_top"
       printf '#   ^ sidecar-gitdir holds this repo OWN history; content-tracked-by-repo\n'
       printf '#     is the OTHER repo whose index carries these files as plain content.\n\n'
       printf 'sidecar-since: %s\n' "$_sst_now"
@@ -6800,6 +6800,256 @@ _mg_remote_flag() {
   esac
 }
 
+# ════════════════════════════════════════════════════════════════════════
+# ═══ PURGE — remove a path's CONTENT AND HISTORY from a repo ═══════════
+# ════════════════════════════════════════════════════════════════════════
+# The counterpart to 'unshadow'/'unflatten', which answer "who tracks this
+# path NOW?". Purge answers "who has EVER tracked it?" — and is the only
+# command that rewrites history.
+#
+# It is deliberately its own verb rather than a flag on unshadow: burying
+# a history rewrite behind an option on a routine command is how it gets
+# run by accident. Like '--rm-git' it has NO inverse, and in my-git that
+# asymmetry is the signal — every reversible operation comes as a pair
+# (shadow/unshadow, flatten/unflatten, sm/unsm); the destructive ones
+# stand alone.
+
+# _purge_candidates <abs-path>
+#   Print every enclosing repo whose HISTORY contains <abs-path>, one per
+#   line, innermost first. Deliberately searches history, NOT the index:
+#   after an 'unshadow' no repo tracks the path any more, yet its objects
+#   still sit in the repo above — which is exactly when purge is wanted.
+#   A nested path can legitimately appear in TWO repos' histories, so this
+#   returns a list and the caller insists on --from when it is ambiguous.
+_purge_candidates() {
+  _pc_abs=$1
+  _pc_dir=$( cd "$_pc_abs/.." 2>/dev/null && pwd ) || return 0
+  while [ -n "$_pc_dir" ]; do
+    if [ -e "$_pc_dir/.git" ] || [ -d "$_pc_dir/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
+      _pc_top=$( cd "$_pc_dir" 2>/dev/null && git -c safe.directory='*' rev-parse --show-toplevel 2>/dev/null )
+      if [ -n "$_pc_top" ]; then
+        _pc_rel=${_pc_abs#"$_pc_dir"/}
+        if [ -n "$( cd "$_pc_dir" 2>/dev/null && git -c safe.directory='*' log --oneline --all -- "$_pc_rel" 2>/dev/null | head -n 1 )" ]; then
+          printf '%s\n' "$_pc_dir"
+        fi
+      fi
+    fi
+    [ "$_pc_dir" = "/" ] && break
+    _pc_dir=$( cd "$_pc_dir/.." 2>/dev/null && pwd ) || break
+  done
+  return 0
+}
+
+# _purge_survives_elsewhere <abs-path>
+#   0 when the path's content still exists as a repo in its own right, so
+#   purging the OUTER repo's copy loses nothing. This is the check that
+#   makes purge a space-reclaiming operation rather than a delete.
+_purge_survives_elsewhere() {
+  _pse=$1
+  [ -e "$_pse/.git" ] && return 0
+  [ -d "$_pse/${GIT_SIDECAR_DIRNAME:-.git.real}" ] && return 0
+  [ -f "$_pse/.git.zip" ] || [ -f "$_pse/${GIT_SIDECAR_DIRNAME:-.git.real}.zip" ] && return 0
+  return 1
+}
+
+cmd_purge() {
+  _pg_mode=analyze
+  _pg_force=0
+  _pg_from=""
+  _pg_path_raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help purge; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose) VERYVRB=1 ;;
+      -D|--debug) DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      go) _pg_mode=go ;;
+      -n|-T|--try|--dry|--dry-run) _pg_mode=analyze ;;
+      --force) _pg_force=1 ;;
+      --from) shift; [ $# -gt 0 ] || fatal "purge: --from needs a REPO path" 64
+              _pg_from=$1 ;;
+      --from=*) _pg_from=${1#--from=} ;;
+      -*) fatal "purge: unknown option: $1" 64 ;;
+      *)  [ -n "$_pg_path_raw" ] && fatal "purge: only one PATH is supported (got '$_pg_path_raw' and '$1')" 64
+          _pg_path_raw=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$_pg_path_raw" ] || fatal "purge: needs a <PATH> to purge. There is deliberately no bulk form — purging is a history rewrite, one deliberate path at a time.
+  Analyze first:  $US purge <PATH>" 64
+
+  _pg_abs=$(cd "$_pg_path_raw" 2>/dev/null && pwd) || \
+    fatal "purge: '$_pg_path_raw': no such directory" 1
+
+  # ── Which repo's history? ──────────────────────────────────────────
+  if [ -n "$_pg_from" ]; then
+    _pg_repo=$(cd "$_pg_from" 2>/dev/null && pwd) || fatal "purge: --from '$_pg_from': no such directory" 1
+    [ -e "$_pg_repo/.git" ] || [ -d "$_pg_repo/${GIT_SIDECAR_DIRNAME:-.git.real}" ] \
+      || fatal "purge: --from '$_pg_from' is not a git repo" 1
+  else
+    _pg_cands=$(_purge_candidates "$_pg_abs")
+    _pg_n=$(printf '%s' "$_pg_cands" | grep -c .)
+    if [ "$_pg_n" -eq 0 ]; then
+      log_major "purge: no repo's history contains '$_pg_path_raw' — nothing to purge"
+      exit 0
+    fi
+    if [ "$_pg_n" -gt 1 ]; then
+      log_error "purge: '$_pg_path_raw' appears in the history of MORE THAN ONE repo — say which one:"
+      printf '%s\n' "$_pg_cands" | while IFS= read -r _c; do
+        [ -n "$_c" ] && printf '      %s%s purge %s --from %s%s\n' "$C_BLUE" "$US" "$_pg_path_raw" "$_c" "$C_RESET"
+      done
+      exit 64
+    fi
+    _pg_repo=$_pg_cands
+  fi
+  _pg_rel=${_pg_abs#"$_pg_repo"/}
+  [ "$_pg_rel" != "$_pg_abs" ] || fatal "purge: '$_pg_path_raw' is not inside '$_pg_repo'" 64
+
+  log_repo_context purge "$_pg_repo" \
+    "this repo's HISTORY IS REWRITTEN — '$_pg_rel' is removed from every commit that ever contained it" \
+    "every commit SHA in this repo changes; a force-push is required afterwards" \
+    "the path's own repo (if any) and every OTHER repo are untouched"
+
+  # ── Facts before the gate ──────────────────────────────────────────
+  _pg_commits=$( cd "$_pg_repo" && git -c safe.directory='*' log --oneline --all -- "$_pg_rel" 2>/dev/null | grep -c . )
+  _pg_total=$( cd "$_pg_repo" && git -c safe.directory='*' rev-list --count --all 2>/dev/null )
+  _pg_objtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.purgeobj.XXXXXX")
+  ( cd "$_pg_repo" && git -c safe.directory='*' rev-list --objects --all -- "$_pg_rel" 2>/dev/null ) \
+    | awk '{print $1}' | sort -u > "$_pg_objtmp"
+  _pg_mb=$( cd "$_pg_repo" && git -c safe.directory='*' cat-file --batch-check='%(objectsize:disk)' < "$_pg_objtmp" 2>/dev/null \
+            | awk '{s+=$1} END {printf "%.0f", s/1048576}' )
+  rm -f "$_pg_objtmp"
+
+  log_major "$_pg_repo: purge plan for '$_pg_rel'"
+  printf '    > %s of %s commit(s) touch it and will be rewritten\n' "${_pg_commits:-0}" "${_pg_total:-?}"
+  printf '    > ~%s MB of objects become unreferenced (reclaimed after gc)\n' "${_pg_mb:-0}"
+  if _purge_survives_elsewhere "$_pg_abs"; then
+    printf '    > the content SURVIVES: %s is a repo in its own right\n' "$_pg_rel"
+  else
+    printf '  %s>> the content does NOT survive anywhere else — purging DESTROYS it%s\n' "$C_RED$C_BOLD" "$C_RESET"
+  fi
+
+  if [ "$_pg_mode" != go ]; then
+    echo
+    log_major "This was analyze-only — re-run with 'go' to apply:"
+    printf '  %s>>   %s purge go %s --from %s%s\n' "$C_BLUE" "$US" "$_pg_path_raw" "$_pg_repo" "$C_RESET"
+    exit 0
+  fi
+
+  # ── Safety: never purge content that exists nowhere else ───────────
+  if ! _purge_survives_elsewhere "$_pg_abs" && [ "$_pg_force" != 1 ]; then
+    fatal "purge: '$_pg_rel' is not a repo in its own right — its history exists ONLY inside $_pg_repo, so purging would DESTROY it, not relocate it.
+  purge is for reclaiming space after content has moved out. If you really mean to destroy it, re-run with --force." 1
+  fi
+
+  # ── The gate ───────────────────────────────────────────────────────
+  echo
+  printf '%s%s%s\n' "$C_RED$C_BOLD" "!!! purge REWRITES HISTORY in $_pg_repo. This is NOT revertible." "$C_RESET"
+  printf '    Every commit SHA in that repo changes (%s commit(s) total).\n' "${_pg_total:-?}"
+  printf '    You MUST force-push afterwards, and every OTHER clone of it must be\n'
+  printf '    re-cloned or hard-reset — their history no longer matches.\n'
+  printf '    A full backup of .git is taken first; its path is printed at the end.\n\n'
+  if [ ! -r /dev/tty ]; then
+    log_error "purge needs interactive confirmation but no TTY is available"
+    exit 1
+  fi
+  printf '%sType exactly '\''I am sure'\'' to proceed, anything else to abort:%s ' \
+    "$C_RED$C_BOLD" "$C_RESET" >/dev/tty
+  IFS= read -r _pg_confirm </dev/tty || _pg_confirm=''
+  if [ "$_pg_confirm" != "I am sure" ]; then
+    log_major "purge: aborted (expected literal 'I am sure', got: '$_pg_confirm') — nothing was changed"
+    exit 1
+  fi
+
+  # ── Backup, then rewrite ───────────────────────────────────────────
+  _pg_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  _pg_backup="$_pg_repo/.git.purge-backup-$_pg_stamp"
+  log_major "$_pg_repo: backing up .git -> $_pg_backup (before touching anything)"
+  cp -a "$_pg_repo/.git" "$_pg_backup" || fatal "purge: backup failed — refusing to rewrite without one" 1
+
+  _pg_before=$(du -sm "$_pg_repo/.git" 2>/dev/null | awk '{print $1}')
+
+  # Rewrite a BARE COPY of the gitdir, never the live repo.
+  #
+  # filter-branch run in place refuses to start unless the worktree is
+  # clean, and checks out the rewritten history when it finishes -- which
+  # DELETES the very files being purged, even though they belong to
+  # another repo now. Moving the path aside to dodge that just makes the
+  # worktree look dirty instead. Operating on a detached bare copy sizes
+  # the problem correctly: history is a property of the gitdir, so the
+  # worktree has no business being involved at all.
+  _pg_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.purge.XXXXXX") || fatal "purge: mktemp -d failed" 1
+  log_medium "copying the gitdir to $_pg_tmp/rw.git and rewriting THERE (the worktree is never touched)"
+  cp -a "$_pg_repo/.git" "$_pg_tmp/rw.git" || { rm -rf "$_pg_tmp"; fatal "purge: could not copy the gitdir" 1; }
+  # A bare gitdir has no worktree to check out or complain about.
+  git --git-dir="$_pg_tmp/rw.git" config core.bare true 2>/dev/null
+  git --git-dir="$_pg_tmp/rw.git" config --unset core.worktree 2>/dev/null
+  rm -f "$_pg_tmp/rw.git/index"
+
+  log_major "$_pg_repo: rewriting history (removing '$_pg_rel' from every commit)"
+  _pg_rc=0
+  if command -v git-filter-repo >/dev/null 2>&1; then
+    log_medium "using git-filter-repo"
+    ( cd "$_pg_tmp/rw.git" && run git filter-repo --force --invert-paths --path "$_pg_rel" ) || _pg_rc=1
+  else
+    log_medium "using git filter-branch (git-filter-repo not installed; slower)"
+    ( cd "$_pg_tmp/rw.git" \
+      && FILTER_BRANCH_SQUELCH_WARNING=1 run git filter-branch --force \
+           --index-filter "git rm -r --cached --ignore-unmatch -- $(shell_escape "$_pg_rel")" \
+           --prune-empty --tag-name-filter cat -- --all ) || _pg_rc=1
+    log_medium "dropping refs/original/ and expiring the reflog so the old objects become unreferenced"
+    # 'cd || exit' is load-bearing, not boilerplate: without it a failed cd
+    # would leave the following 'update-ref -d' running in the CURRENT
+    # repository and deleting ITS refs.
+    ( cd "$_pg_tmp/rw.git" || exit 1
+      git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while IFS= read -r _pg_r; do
+        [ -n "$_pg_r" ] && git update-ref -d "$_pg_r" 2>/dev/null
+      done
+      run git reflog expire --expire=now --all >/dev/null 2>&1 )
+  fi
+
+  # --prune-empty drops commits that become empty. If EVERY commit touched
+  # this path, that prunes the whole history and the branches disappear --
+  # meaning the path was not a subdirectory of this repo's history, it WAS
+  # that history. Refuse rather than install a hollow repo.
+  if [ -z "$(git --git-dir="$_pg_tmp/rw.git" for-each-ref --format='%(refname)' refs/heads 2>/dev/null | head -n 1)" ]; then
+    rm -rf "$_pg_tmp"
+    fatal "purge: removing '$_pg_rel' would empty EVERY commit — this repo's history is nothing BUT that path, so there would be no repo left. Nothing was changed (the live .git was never touched); the backup at $_pg_backup can be deleted." 1
+  fi
+  if [ "$_pg_rc" != 0 ]; then
+    rm -rf "$_pg_tmp"
+    fatal "purge: the history rewrite failed — NOTHING was changed (it ran on a copy). The live repo is intact; delete the backup at $_pg_backup if you like." 1
+  fi
+
+  # Install the rewritten gitdir. The worktree is left exactly as it is;
+  # 'reset --mixed' then rebuilds the index from the new HEAD, so the
+  # purged path simply becomes untracked-but-present -- which is correct,
+  # it is another repo's business now.
+  log_medium "installing the rewritten gitdir and rebuilding the index (worktree untouched)"
+  git --git-dir="$_pg_tmp/rw.git" config core.bare false 2>/dev/null
+  rm -rf "$_pg_repo/.git" || fatal "purge: could not replace the live gitdir — the original is at $_pg_backup" 1
+  mv "$_pg_tmp/rw.git" "$_pg_repo/.git" \
+    || fatal "purge: could not move the rewritten gitdir into place — the original is at $_pg_backup" 1
+  rm -rf "$_pg_tmp"
+  ( cd "$_pg_repo" && run git reset -q --mixed >/dev/null 2>&1 ) \
+    || log_warn "purge: index rebuild reported a problem — run 'git -C $_pg_repo reset' by hand"
+
+  log_medium "repacking to actually reclaim the space"
+  ( cd "$_pg_repo" && run git gc --prune=now --aggressive >/dev/null 2>&1 ) \
+    || log_warn "purge: gc reported a problem — the rewrite itself succeeded; re-run 'git gc --prune=now' by hand"
+
+  _pg_after=$(du -sm "$_pg_repo/.git" 2>/dev/null | awk '{print $1}')
+  echo
+  log_ok "purge: '$_pg_rel' removed from $_pg_repo's history — .git ${_pg_before:-?} MB -> ${_pg_after:-?} MB"
+  log_major "backup of the ORIGINAL .git: $_pg_backup"
+  printf '    > verify the repo, then delete the backup yourself: rm -rf %s\n' "$(shell_escape "$_pg_backup")"
+  printf '    > every SHA changed — publish with:  git -C %s push --force --all && git -C %s push --force --tags\n' \
+    "$(shell_escape "$_pg_repo")" "$(shell_escape "$_pg_repo")"
+  printf '    > any OTHER clone of this repo must be re-cloned or hard-reset\n'
+  return 0
+}
+
 remote_one() {
   _r=$1
   RM_N_TOTAL=$((RM_N_TOTAL + 1))
@@ -8250,6 +8500,62 @@ See also:      $US --help flatten
 EOF
 }
 
+show_help_purge() {
+  cat <<EOF
+my-git purge
+
+usage: $US [-V|-D] purge [go] <PATH> [--from <REPO>] [--force]
+
+WHICH REPO does this touch?
+  READS/WRITES   the repo whose HISTORY contains <PATH>. Resolved by
+                 searching enclosing repos' history, NOT their index -
+                 after an 'unshadow' no repo TRACKS the path any more,
+                 yet its objects still sit in the repo above, which is
+                 exactly when purge is wanted. If more than one repo
+                 qualifies, purge refuses and makes you pick with --from.
+  REWRITES       every commit in that repo that ever contained <PATH>.
+                 EVERY commit SHA changes. A force-push is required.
+  DOES NOT TOUCH <PATH>'s own repo, or any other repo.
+  A run prints ' >>> purge: TARGET REPO <path>' before doing anything.
+
+Removes a path's content AND its entire history from a repo. This is the
+counterpart to 'unshadow'/'unflatten', which only answer "who tracks this
+path NOW?" - purge answers "who has EVER tracked it?", and is the only
+my-git command that rewrites history.
+
+It is its own verb rather than a flag on unshadow on purpose: burying a
+history rewrite behind an option on a routine command is how it gets run
+by accident. Like '--rm-git' it has NO inverse - in my-git, every
+reversible operation comes as a pair (shadow/unshadow, flatten/unflatten,
+sm/unsm) and the destructive ones stand alone.
+
+The intended use is reclaiming space AFTER content has moved out: a
+nested repo that was merged into its parent, then given its own .git
+again, leaves its whole history behind in the parent. purge drops that
+dead weight.
+
+SAFETY
+  - Refuses unless <PATH> is a repo in its own right (live .git, sidecar
+    or zipped), so purge relocates nothing and destroys nothing. --force
+    overrides, for the genuine "this really was junk" case.
+  - Prints the blast radius first: commits rewritten, MB reclaimed, and
+    that every SHA changes.
+  - Requires typing 'I am sure' literally. Nothing else proceeds.
+  - Copies .git to .git.purge-backup-<timestamp> BEFORE touching anything
+    and prints the path at the end. Delete it yourself once satisfied.
+  - Uses 'git filter-repo' when installed, otherwise 'git filter-branch'.
+
+  Analyze first (default, read-only):   $US purge src
+  Apply:                                $US purge go src --from /syst/global
+
+AFTERWARDS
+  Every SHA changed, so publish with a force-push:
+     git -C <REPO> push --force --all
+     git -C <REPO> push --force --tags
+  Any OTHER clone of that repo must be re-cloned or hard-reset.
+EOF
+}
+
 show_help_unshadow() {
   cat <<EOF
 my-git unshadow   (alias: unsh)
@@ -8738,6 +9044,7 @@ show_help() {
     unflatten|unfl)      show_help_unflatten ;;
     shadow|sh)           show_help_shadow ;;
     unshadow|unsh)       show_help_unshadow ;;
+    purge)               show_help_purge ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     audit)               show_help_audit ;;
@@ -13052,6 +13359,161 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  _rt_purge_setup() {
+    # outer/ absorbed kid's files as plain content (as 'flatten --merge'
+    # leaves things), and kid later got its OWN .git back. outer is now
+    # carrying dead weight: kid's whole history, duplicated.
+    _rt_repo outer
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd outer || return 1
+    # outer needs commits of its OWN: purging a path that accounts for the
+    # WHOLE history would leave no repo at all (guarded separately).
+    echo own > outer-file.txt && git add -A && git commit -q -m "outer's own work"
+    mkdir -p kid && echo one > kid/a.txt
+    git add -A && git commit -q -m "absorb kid content"
+    echo two >> kid/a.txt
+    git add -A && git commit -q -m "edit kid content"
+    ( cd kid && git init -q . && git config user.email t@t.com && git config user.name t \
+        && git add -A && git commit -q -m "kid has its own history again" )
+    return 0
+  }
+
+  test_purge_analyze_is_read_only_and_names_the_repo() {
+    _rt_purge_setup || return 1
+    _rt_before=$(git rev-parse HEAD)
+    _rt_ok "purge analyze" _rt_my_git purge kid || return 1
+    _rt_contains "names the target repo" "$_rt_out" "purge: TARGET REPO" || return 1
+    _rt_contains "says the history is rewritten" "$_rt_out" "HISTORY IS REWRITTEN" || return 1
+    _rt_contains "counts the commits it would rewrite" "$_rt_out" "commit(s) touch it" || return 1
+    _rt_contains "notes the content survives" "$_rt_out" "SURVIVES" || return 1
+    _rt_contains "analyze-only" "$_rt_out" "analyze-only" || return 1
+    [ "$(git rev-parse HEAD)" = "$_rt_before" ] \
+      || { _rt_fail "analyze REWROTE history — it must change nothing"; return 1; }
+    return 0
+  }
+
+  test_purge_refuses_when_content_survives_nowhere() {
+    # purge reclaims space after content moved out. If the path is NOT a
+    # repo in its own right, purging would destroy the only copy.
+    _rt_repo outer
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd outer || return 1
+    mkdir -p lonely && echo only > lonely/a.txt
+    git add -A && git commit -q -m "lonely content, no repo of its own"
+    _rt_my_git purge go lonely >"$_rt_out" 2>"$_rt_err" \
+      && { _rt_fail "purge should refuse when the content exists nowhere else"; return 1; }
+    _rt_contains "explains it would DESTROY, not relocate" "$_rt_err" "would DESTROY it" || return 1
+    _rt_contains "points at --force" "$_rt_err" "--force" || return 1
+    return 0
+  }
+
+  test_purge_requires_from_when_two_repos_qualify() {
+    # A nested path can sit in TWO repos' histories. Guessing which one to
+    # rewrite is not acceptable, so purge lists them and insists.
+    _rt_repo outer
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd outer || return 1
+    # Order matters: outer must track mid/kid as CONTENT before mid becomes
+    # a repo. Once mid/.git exists, git stages mid as a gitlink instead of
+    # its files, and no genuine two-repo ambiguity is created.
+    mkdir -p mid/kid && echo x > mid/kid/a.txt
+    git add -A && git commit -q -m "outer tracks mid/kid as content"
+    ( cd mid && git init -q . && git config user.email t@t.com && git config user.name t \
+        && git add -A && git commit -q -m "mid ALSO tracks kid" )
+    ( cd mid/kid && git init -q . && git config user.email t@t.com && git config user.name t \
+        && git add -A && git commit -q -m "kid own history" )
+    _rt_my_git purge go mid/kid >"$_rt_out" 2>"$_rt_err" \
+      && { _rt_fail "purge should refuse an ambiguous target"; return 1; }
+    _rt_contains "says more than one repo qualifies" "$_rt_err" "MORE THAN ONE repo" || return 1
+    return 0
+  }
+
+  test_purge_go_rewrites_history_behind_the_gate() {
+    # End-to-end through the real 'I am sure' gate, driven over a pty.
+    command -v python3 >/dev/null 2>&1 || return 0
+    _rt_purge_setup || return 1
+    _rt_n_before=$(git log --oneline --all -- kid | grep -c .)
+    [ "$_rt_n_before" -ge 2 ] || { _rt_fail "setup: expected >=2 commits touching kid"; return 1; }
+    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.purgedrv.XXXXXX") || { _rt_fail "mktemp py failed"; return 1; }
+    cat > "$_rt_drv" <<'PYDRV'
+import os, pty, sys, time, select
+mygit, conf, phrase = sys.argv[1], sys.argv[2], sys.argv[3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["/bin/sh", mygit, "--config", conf, "purge", "go", "kid"])
+sent = False
+t0 = time.time(); buf = b""
+while time.time() - t0 < 120:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if fd in r:
+        try: d = os.read(fd, 4096)
+        except OSError: break
+        if not d: break
+        buf += d
+        if not sent and b"Type exactly" in buf:
+            os.write(fd, phrase.encode() + b"\n"); sent = True
+try: os.waitpid(pid, 0)
+except OSError: pass
+sys.stdout.write(buf.decode(errors="replace"))
+PYDRV
+    _rt_ok "drive purge go through the gate" \
+      sh -c "python3 '$_rt_drv' '$_rt_self' '$_rt_conf_path' 'I am sure' > '$_rt_out' 2>&1" \
+      || { rm -f "$_rt_drv"; return 1; }
+    _rt_contains "gate demanded the phrase" "$_rt_out" "Type exactly" || return 1
+    _rt_contains "took a backup first" "$_rt_out" "backing up .git" || return 1
+    _rt_n_after=$(git log --oneline --all -- kid 2>/dev/null | grep -c .)
+    [ "$_rt_n_after" = 0 ] \
+      || { rm -f "$_rt_drv"; _rt_fail "kid still appears in $_rt_n_after commit(s) after purge"; return 1; }
+    # The path's OWN repo and its files are untouched — purge removes the
+    # OUTER repo's copy of the history, never the content itself.
+    _rt_isdir "kid keeps its own .git" kid/.git || return 1
+    _rt_exists "kid's files still on disk" kid/a.txt || return 1
+    _rt_bk=""; for _rt_b in .git.purge-backup-*; do [ -e "$_rt_b" ] && _rt_bk=$_rt_b; done
+    [ -n "$_rt_bk" ] \
+      || { rm -f "$_rt_drv"; _rt_fail "no .git backup was left behind"; return 1; }
+    rm -f "$_rt_drv"
+    return 0
+  }
+
+  test_purge_aborts_on_anything_but_the_exact_phrase() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    _rt_purge_setup || return 1
+    _rt_head_before=$(git rev-parse HEAD)
+    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.purgedrv2.XXXXXX") || { _rt_fail "mktemp py failed"; return 1; }
+    cat > "$_rt_drv" <<'PYDRV'
+import os, pty, sys, time, select
+mygit, conf, phrase = sys.argv[1], sys.argv[2], sys.argv[3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["/bin/sh", mygit, "--config", conf, "purge", "go", "kid"])
+sent = False
+t0 = time.time(); buf = b""
+while time.time() - t0 < 60:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if fd in r:
+        try: d = os.read(fd, 4096)
+        except OSError: break
+        if not d: break
+        buf += d
+        if not sent and b"Type exactly" in buf:
+            os.write(fd, phrase.encode() + b"\n"); sent = True
+try: os.waitpid(pid, 0)
+except OSError: pass
+sys.stdout.write(buf.decode(errors="replace"))
+PYDRV
+    # 'yes' is exactly the reflexive answer the phrase exists to defeat.
+    sh -c "python3 '$_rt_drv' '$_rt_self' '$_rt_conf_path' 'yes' > '$_rt_out' 2>&1"
+    rm -f "$_rt_drv"
+    _rt_contains "aborted" "$_rt_out" "aborted" || return 1
+    _rt_contains "says nothing changed" "$_rt_out" "nothing was changed" || return 1
+    [ "$(git rev-parse HEAD)" = "$_rt_head_before" ] \
+      || { _rt_fail "history changed despite the wrong phrase"; return 1; }
+    _rt_bk=""; for _rt_b in .git.purge-backup-*; do [ -e "$_rt_b" ] && _rt_bk=$_rt_b; done
+    [ -z "$_rt_bk" ] \
+      || { _rt_fail "aborted run should not have made a backup"; return 1; }
+    return 0
+  }
+
   test_shadow_marker_records_which_repo_mirrors_it() {
     # A shadow is a relationship between TWO repos. The marker used to name
     # only the shadowed one, so once the mirroring repo stopped tracking the
@@ -13993,7 +14455,7 @@ _RT_STALE_CONF_EOF
     ( cd top && git init -q kid && cd kid && git config user.email t@t.com \
         && git config user.name t && echo hello > f.txt && git add f.txt && git commit -qm i )
     cd top || return 1
-    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.ptydrv.XXXXXX.py") || { _rt_fail "mktemp py failed"; return 1; }
+    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.ptydrv.XXXXXX") || { _rt_fail "mktemp py failed"; return 1; }
     cat > "$_rt_drv" <<'PYDRV'
 import os, pty, sys, time, select
 mygit, conf = sys.argv[1], sys.argv[2]
@@ -14056,7 +14518,7 @@ PYDRV
     cd top || return 1
     _rt_ok "shadow shad" _rt_my_git shadow go shad || return 1
     _rt_ok "zip zp" _rt_my_git flatten go zp --zip || return 1
-    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.ptydrv.XXXXXX.py") || { _rt_fail "mktemp py failed"; return 1; }
+    _rt_drv=$(mktemp "${TMPDIR:-/tmp}/${US}.ptydrv.XXXXXX") || { _rt_fail "mktemp py failed"; return 1; }
     cat > "$_rt_drv" <<'PYDRV'
 import os, pty, sys, select, time
 mygit, conf = sys.argv[1], sys.argv[2]
@@ -14487,7 +14949,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -14642,6 +15104,7 @@ main() {
     unflatten|unfl)             cmd_unflatten "$@" ;;
     shadow|sh)                  cmd_shadow "$@" ;;
     unshadow|unsh)              cmd_unshadow "$@" ;;
+    purge)                      cmd_purge "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     unsm|unsub|unsubmodules)    cmd_unsm "$@" ;;
     ignore)                     cmd_ignore "$@" ;;
