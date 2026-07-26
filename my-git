@@ -68,6 +68,28 @@ log_error()     { printf '%sERROR: %s%s\n' "$C_RED"    "$*" "$C_RESET" >&2; }
 log_ok()        { printf ' %sSUCCESS:%s %s\n' "$C_BOLD$C_GREEN" "$C_RESET" "$*"; }
 log_fail()      { printf ' %sFAIL:%s %s\n'    "$C_BOLD$C_RED"   "$C_RESET" "$*" >&2; }
 
+# log_repo_context <verb> <repo> <what-this-repo-gets> [<extra detail>...]
+#   Every mutating command announces, up front and in plain words, WHICH
+#   git repository it is about to read and write. my-git routinely acts on
+#   a repo OTHER than the one you are standing in — it walks up to a
+#   toplevel, or down to the repo that directly encloses a PATH — and the
+#   whole class of "wait, which .git did that just commit to?" confusion
+#   comes from that being implicit. So it is now never implicit.
+#
+#   <repo> is printed as the LOGICAL path (symlinks intact — /LINKS/...,
+#   not the resolved /Users/... form) because that is what was typed.
+#   Always at log_major level: this is not a -V detail, it is the single
+#   most important fact about the command that is about to run.
+log_repo_context() {
+  _lrc_verb=$1; _lrc_repo=$2; _lrc_gets=$3; shift 3
+  log_major "$_lrc_verb: TARGET REPO  $_lrc_repo"
+  printf '    > %s\n' "$_lrc_gets"
+  for _lrc_x in "$@"; do
+    [ -n "$_lrc_x" ] && printf '    > %s\n' "$_lrc_x"
+  done
+  return 0
+}
+
 # _prompt_ysa <question> — the ONE per-item interactive gate used everywhere
 # a repo-by-repo confirmation is needed (flatten's forced modes, unflatten,
 # --zip). FULLY annotated, re-asks on invalid input. Returns:
@@ -792,14 +814,175 @@ ensure_sidecar_exclude() {
   )
 }
 
+# ── merge history preservation ────────────────────────────────────────
+#   'flatten --merge' absorbs a nested repo's files into the parent as
+#   ordinary content. It used to DELETE that repo's .git outright, so its
+#   history was gone for good. It now TRANSPLANTS the whole object
+#   database into the PARENT's object DB first and pins every ref under
+#   $MERGED_REFS_ROOT/<path>/, which keeps the objects reachable (nothing
+#   for 'git gc' to prune) and lets 'unflatten --merge' hand the history
+#   back verbatim — original branch names, tags and all.
+#
+#   The deletion is GATED on this succeeding: preserve_merged_history
+#   verifies the tip is readable from the parent afterwards, and every
+#   caller must leave the nested .git alone when it returns non-zero.
+#   Merge therefore never destroys anything. The ONE deliberately
+#   destructive operation in my-git is 'flatten --rm-git', which deletes
+#   nested .git dirs outright behind a spelled-out confirmation.
+MERGED_REFS_ROOT=refs/my-git/merged
+
+# merged_ref_ns <path>  — ref namespace holding <path>'s preserved history.
+#   Git ref names forbid space ~ ^ : ? * [ \, a leading '.' in any
+#   component and the sequence '..'; tree paths may legally contain those,
+#   so they map to '-'. Deterministic, which is all unflatten needs to
+#   find the namespace again from the same path.
+merged_ref_ns() {
+  printf '%s/%s\n' "$MERGED_REFS_ROOT" "$(printf '%s' "$1" \
+    | sed -e 's/[^A-Za-z0-9._,+@=/-]/-/g' -e 's/\.\./-/g' -e 's|^\.|-|' -e 's|/\.|/-|g')"
+}
+
+# preserve_merged_history <parent-repo> <path> <gitdir>
+#   Copy <gitdir>'s ENTIRE object database into <parent-repo>'s and pin
+#   every ref under 'merged_ref_ns <path>'. Sets PRESERVED_NS,
+#   PRESERVED_TIP and PRESERVED_NREFS on success.
+#
+#   Returns non-zero if the history did NOT demonstrably arrive — callers
+#   MUST NOT delete <gitdir> in that case. Results come back in globals,
+#   never on stdout: this logs, and a $(...) capture would swallow the
+#   log lines into the data (the same trap documented on
+#   _fl_transfer_one_sub_submodule).
+preserve_merged_history() {
+  _pmh_parent=$1
+  _pmh_path=$2
+  _pmh_gitdir=$3
+  PRESERVED_NS=""
+  PRESERVED_TIP=""
+  PRESERVED_NREFS=0
+  if [ -z "$_pmh_gitdir" ] || [ ! -e "$_pmh_gitdir" ]; then
+    log_error "$_pmh_path: merge: no gitdir to preserve history from ('$_pmh_gitdir')"
+    return 1
+  fi
+  _pmh_ns=$(merged_ref_ns "$_pmh_path")
+  _pmh_tip=$(git --git-dir="$_pmh_gitdir" rev-parse -q --verify HEAD 2>/dev/null)
+  # A DETACHED head hangs off no ref at all, so the 'refs/*' refspec
+  # below would sail straight past it. Pin it inside the doomed gitdir
+  # first — this is the last moment that commit is reachable by name.
+  if [ -n "$_pmh_tip" ] && ! git --git-dir="$_pmh_gitdir" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    log_dbg_med "preserve: $_pmh_path — HEAD is DETACHED at $_pmh_tip; pinning it as refs/my-git/detached-HEAD so the fetch below sees it"
+    git --git-dir="$_pmh_gitdir" update-ref refs/my-git/detached-HEAD "$_pmh_tip" 2>/dev/null \
+      || log_warn "$_pmh_path: could not pin the detached HEAD $_pmh_tip — it may not survive the merge"
+  fi
+  # A fetch spawns 'upload-pack' INSIDE the source gitdir, and that
+  # chdir's to its core.worktree. Absorbed submodule gitdirs carry a
+  # relative core.worktree ('../../../<name>') that is only valid from
+  # where git normally invokes them, so upload-pack dies with "cannot
+  # chdir to ..." and the transplant fails — taking a real repo's
+  # history with it if the caller then deleted anyway. Unset it for the
+  # duration and put it back afterwards; --file is used deliberately
+  # (never 'git -C', which chdir's into that same broken path).
+  _pmh_cfg="$_pmh_gitdir/config"
+  _pmh_saved_wt=""
+  if [ -f "$_pmh_cfg" ]; then
+    _pmh_saved_wt=$(git config --file "$_pmh_cfg" --get core.worktree 2>/dev/null)
+    [ -n "$_pmh_saved_wt" ] && {
+      log_dbg_med "preserve: $_pmh_path — temporarily unsetting core.worktree='$_pmh_saved_wt' so upload-pack can run"
+      git config --file "$_pmh_cfg" --unset core.worktree 2>/dev/null
+    }
+  fi
+  log_dbg_med "preserve: $_pmh_path — transplanting '+refs/*:$_pmh_ns/*' from $_pmh_gitdir into $_pmh_parent"
+  # 'refs/*' (not just refs/heads + refs/tags) deliberately: branches,
+  # tags, remote-tracking refs, notes and any nested $MERGED_REFS_ROOT
+  # from an earlier merge all come across in one go. Refs are cheap;
+  # objects are shared, so the duplication costs nothing.
+  ( cd "$_pmh_parent" 2>/dev/null \
+    && run git fetch --no-tags -q "$_pmh_gitdir" "+refs/*:$_pmh_ns/*" )
+  _pmh_rc=$?
+  # Restore BEFORE reacting to the result: on failure the gitdir stays
+  # on disk and must still work as the submodule it was.
+  [ -n "$_pmh_saved_wt" ] && git config --file "$_pmh_cfg" core.worktree "$_pmh_saved_wt" 2>/dev/null
+  if [ "$_pmh_rc" != 0 ]; then
+    log_error "$_pmh_path: merge: could NOT transplant history into $_pmh_parent — leaving its .git in place (nothing deleted)"
+    return 1
+  fi
+  # Verify rather than assume. This check is what AUTHORISES the caller
+  # to delete the gitdir, so it reads the tip back out of the PARENT.
+  if [ -n "$_pmh_tip" ] \
+     && ! ( cd "$_pmh_parent" 2>/dev/null && git cat-file -e "$_pmh_tip^{commit}" 2>/dev/null ); then
+    log_error "$_pmh_path: merge: history transplant INCOMPLETE (tip $_pmh_tip is not readable from $_pmh_parent) — leaving its .git in place (nothing deleted)"
+    return 1
+  fi
+  PRESERVED_NS=$_pmh_ns
+  PRESERVED_TIP=$_pmh_tip
+  PRESERVED_NREFS=$( ( cd "$_pmh_parent" 2>/dev/null \
+                       && git for-each-ref --format='%(refname)' "$_pmh_ns" 2>/dev/null ) | grep -c . )
+  log_medium "$_pmh_path: history preserved — $PRESERVED_NREFS ref(s) pinned under $_pmh_ns (tip ${_pmh_tip:-<none>})"
+  return 0
+}
+
+# ensure_preserved_refspec <repo>
+#   Preserved history lives OUTSIDE refs/heads, so neither a default
+#   'git clone'/'git fetch' nor 'git push --all' touches it. Teach every
+#   remote to carry it, so the parent stays portable: once a merge has
+#   deleted a nested .git, $MERGED_REFS_ROOT is the ONLY copy of that
+#   history, and a push that silently skips it is data loss on the next
+#   machine. Idempotent; adds nothing until there is something to carry.
+ensure_preserved_refspec() {
+  _epr_repo=$1
+  _epr_spec="+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*"
+  ( cd "$_epr_repo" 2>/dev/null || exit 0
+    [ -n "$(git for-each-ref --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] || exit 0
+    for _epr_r in $(git remote 2>/dev/null); do
+      git config --get-all "remote.$_epr_r.fetch" 2>/dev/null | grep -qxF "$_epr_spec" \
+        || { log_dbg_med "ensure_preserved_refspec: $_epr_repo — adding fetch refspec '$_epr_spec' to remote '$_epr_r'"
+             git config --add "remote.$_epr_r.fetch" "$_epr_spec" 2>/dev/null; }
+      # Setting ANY push refspec replaces git's default 'push the current
+      # branch', so the heads spec has to be restated alongside ours.
+      if ! git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF "$_epr_spec"; then
+        log_dbg_med "ensure_preserved_refspec: $_epr_repo — adding push refspecs to remote '$_epr_r'"
+        git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF '+refs/heads/*:refs/heads/*' \
+          || git config --add "remote.$_epr_r.push" '+refs/heads/*:refs/heads/*' 2>/dev/null
+        git config --add "remote.$_epr_r.push" "$_epr_spec" 2>/dev/null
+      fi
+    done
+  )
+}
+
+# push_preserved_refs <repo>
+#   'git push --all' means refs/heads/* ONLY — it does not honour a
+#   configured push refspec and never carries $MERGED_REFS_ROOT. Every
+#   place my-git pushes calls this straight afterwards so preserved
+#   history reaches the remote too. No-op when there is none.
+push_preserved_refs() {
+  _ppr_repo=$1
+  [ -n "$(run_as_owner_capture "$_ppr_repo" git for-each-ref --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] || return 0
+  _ppr_remote=$(run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | grep -x origin || \
+                run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | head -n 1)
+  [ -n "$_ppr_remote" ] || return 0
+  run_as_owner "$_ppr_repo" git push -q "$_ppr_remote" "+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" || {
+    log_warn "$_ppr_repo: could not push $MERGED_REFS_ROOT/* to '$_ppr_remote' — merged history is still LOCAL-ONLY on this machine"
+    return 1
+  }
+  log_medium "$_ppr_repo: pushed preserved merge history ($MERGED_REFS_ROOT/*) to '$_ppr_remote'"
+  return 0
+}
+
 # list_merged_dirs <repo>
 #   Print paths (relative to $repo) of directories carrying a
 #   '.git.merged' file — a former submodule/embedded repo already
-#   merged via 'flatten'/'--merge' with its .git permanently DELETED
-#   (see _fl_write_merge_snapshot). Same shape as list_realized_dirs,
+#   merged via 'flatten'/'--merge'. Its history lives on inside the
+#   parent under $MERGED_REFS_ROOT (see preserve_merged_history); a
+#   snapshot written before preservation existed has nothing behind it.
+#   Same shape as list_realized_dirs,
 #   but '.git.merged' is a plain FILE sitting directly under the path,
 #   not a directory sibling — the only on-disk marker distinguishing
 #   "used to be a nested repo, now merged" from "always plain content".
+#
+#   A LIVE .git (or sidecar) at the same path WINS: the path is a working
+#   repo again and the .git.merged is a stale leftover — from an
+#   'unflatten' that could not remove it, or a repo restored by hand from
+#   a backup. Reporting such a path as [merged] is actively misleading:
+#   'st' would hide a live repo's real state, and flatten/unflatten would
+#   both try to act on it. Live artifact beats stale marker, always.
 list_merged_dirs() {
   _lmd_r=$1
   [ -d "$_lmd_r" ] || return 0
@@ -813,7 +996,15 @@ list_merged_dirs() {
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.merged' -prune -print 2>/dev/null"
   ) | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' \
-    | grep -v '^$'
+    | grep -v '^$' \
+    | while IFS= read -r _lmd_p; do
+        [ -n "$_lmd_p" ] || continue
+        if [ -e "$_lmd_r/$_lmd_p/.git" ] || [ -e "$_lmd_r/$_lmd_p/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
+          log_dbg_med "list_merged_dirs: $_lmd_p has a LIVE .git/sidecar — treating its .git.merged as a stale leftover, not reporting it as merged"
+          continue
+        fi
+        printf '%s\n' "$_lmd_p"
+      done
 }
 
 # list_zipped_dirs <repo>
@@ -1759,7 +1950,7 @@ cmd_status() {
           stale)    _sum="[no directory on disk — run 'sm --clean-stale' to clean]" ;;
           realized) _sum="(plain content — history preserved in ./${GIT_SIDECAR_DIRNAME:-.git.real})"
                     if repo_is_local_only "$_abs"; then _flag='⌂'; else _flag='↑'; fi ;;
-          merged)   _sum="(plain content — .git deleted; see ./.git.merged, or 'my-git unflatten --merge')"
+          merged)   _sum="(plain content — history preserved in this repo; restore: 'my-git unflatten --merge')"
                     if repo_is_local_only "$_abs"; then _flag='⌂'; else _flag='↑'; fi ;;
           zipped)   if [ -f "$_abs/.git.real.zip" ]; then _zname=.git.real.zip; else _zname=.git.zip; fi
                     _sum="(git dir archived in ./$_zname — restore: '$US unflatten --zip')" ;;
@@ -1806,7 +1997,7 @@ cmd_status() {
     printf '  %s>> state:   %sCLEAN :))%s  CLEAN, ahead/behind N  DIVERGED (ahead X, behind Y)  DIRTY (N) [...]  CLEAN (remote for "OTHER" but not for current branch "NAME")%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
     printf '  %s>> dirty:   M=modified  A=added  D=deleted  R=renamed  ??=untracked  ?=other  (counts inside [ ])%s\n' "$C_BLUE" "$C_RESET"
-    printf '  %s>> tags:    [registered-sm]=nested git registered as a submodule in .gitmodules  [raw-nested-git]=nested git NOT registered as a submodule  [sidecar]=self-contained history relocated to ./%s  [merged]=.git deleted, see ./.git.merged  [zipped]=git dir archived by gz (./.git.zip / ./.git.real.zip), restore with gu  [shadowed]=live .git KEPT + files also mirrored into the parent (see ./.git.shadow.status; undo: unshadow)  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
+    printf '  %s>> tags:    [registered-sm]=nested git registered as a submodule in .gitmodules  [raw-nested-git]=nested git NOT registered as a submodule  [sidecar]=self-contained history relocated to ./%s  [merged]=absorbed into the parent, history preserved there (see ./.git.merged; restore: unflatten --merge)  [zipped]=git dir archived by gz (./.git.zip / ./.git.real.zip), restore with gu  [shadowed]=live .git KEPT + files also mirrored into the parent (see ./.git.shadow.status; undo: unshadow)  [STALE REGISTRATION]=.gitmodules entry, no dir%s\n' \
       "$C_BLUE" "${GIT_SIDECAR_DIRNAME:-.git.real}" "$C_RESET"
     printf '  %s>> flags (column after the tag): %s⌂%s = local-only (no remote configured — nothing to publish to);  %s↑%s = has a remote (publishable);  blank = n/a (zipped/stale)%s\n' \
       "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET" "$C_BLUE" "$C_RESET"
@@ -2008,6 +2199,7 @@ _mc_auto_commit_my_git_changes() {
     if [ -n "$_ac_remotes" ]; then
       run_as_owner "$_ac_r" git push -q --all 2>/dev/null \
         || log_warn "$_ac_r: auto-commit push failed (commit kept locally)"
+      push_preserved_refs "$_ac_r"
     fi
   fi
   return 0
@@ -2192,6 +2384,7 @@ commit_one() {
       run_as_owner "$_r" git push -q --all || {
         log_error "$_r: git push failed"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1;
       }
+      push_preserved_refs "$_r"
       log_major "$_r: DONE :)) (pushed)"
       MC_N_PUSHED=$((MC_N_PUSHED + 1))
       return 0
@@ -2250,6 +2443,7 @@ _MC_EOF
     run_as_owner "$_r" git push -q --all || {
       log_error "$_r: git push failed"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1;
     }
+    push_preserved_refs "$_r"
     log_major "$_r: DONE :)) (mass-committed, pushed)"
   else
     log_major "$_r: DONE :)) (mass-committed — no push: $_nopush_reason)"
@@ -2306,6 +2500,14 @@ cmd_masscommits() {
   MC_N_ERROR=0          # per-repo error (non-fatal, continued)
   MC_N_WOULD_PUSH=0     # analyze: would push
   MC_N_WOULD_COMMIT=0   # analyze: would mass-commit
+
+  # mc is the one command that writes to MANY repos: each repo commits to
+  # ITS OWN .git (and pushes to ITS OWN remote). Name the roots and the
+  # walk mode, so "which git did that commit go to" is answered up front.
+  log_repo_context mc "$(printf '%s' "$_roots" | tr '\n' ' ')" \
+    "EACH repo below commits to its OWN .git and pushes to its OWN remote -- no shared repo receives anything" \
+    "$([ "$RECURSIVE" = 1 ] && printf -- '-R: walking every nested repo bottom-up (deepest committed first, so parent gitlinks can bump)' || printf 'single level: only the repo(s) named above, NOT their nested repos')" \
+    "$([ "$_mc_mode" != go ] && printf 'analyze only -- nothing is written')"
 
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
@@ -3145,13 +3347,25 @@ _FL_ADD_EOF
     [ -n "$_msn_branch" ] || _msn_branch="(detached) $_msn_commit"
     _msn_subject=$(run git --git-dir="$_msn_gitdir" log -1 --pretty=%s 2>/dev/null)
     _msn_remote=$(run git --git-dir="$_msn_gitdir" config --get remote.origin.url 2>/dev/null)
+
+    # Transplant the object database into the PARENT before anything is
+    # deleted. On failure this returns 1 WITHOUT writing the snapshot:
+    # no .git.merged means the caller leaves the live .git alone, so a
+    # failed preserve degrades to "nothing happened", never to data loss.
+    PRESERVED_NS=""; PRESERVED_TIP=""; PRESERVED_NREFS=0
+    if ! preserve_merged_history "." "$_msn_path" "$_msn_gitdir"; then
+      log_error "$_msn_path: merge ABORTED for this path — its history could not be preserved, so nothing was deleted. To absorb the files and DISCARD the history on purpose, use: $US flatten go --rm-git $_msn_path"
+      return 1
+    fi
+
     {
       printf '# my-git merge snapshot for %s -- written by "flatten --merge"\n' "$_msn_path"
       printf '# (or the embedded/registered "delete" choice) just before its .git\n'
-      printf '# was permanently deleted. Unlike a sidecar'"'"'s GIT_SIDECAR_DIRNAME,\n'
-      printf '# there is NO preserved object database behind this file -- point-in-\n'
-      printf '# time record only, for "unflatten --merge" (git subtree split from\n'
-      printf '# this repo'"'"'s own commits) and so "my-git st" can show this was merged.\n\n'
+      printf '# was removed from this path. The history is NOT lost: this repo'"'"'s\n'
+      printf '# entire object database was transplanted into the PARENT repo and\n'
+      printf '# every ref pinned under the namespace named below, so nothing can\n'
+      printf '# be garbage-collected. "unflatten --merge" hands it straight back;\n'
+      printf '# "my-git st" reads this file to tag the path as merged.\n\n'
       printf 'merged-at: %s\n\n' "$_msn_now"
       printf 'branch: %s\n' "$_msn_branch"
       printf 'commit: %s\n' "$_msn_commit"
@@ -3163,6 +3377,19 @@ _FL_ADD_EOF
         printf 'submodule-url: %s\n\n' "$_msn_sub_url"
       else
         printf 'was-submodule: no\n\n'
+      fi
+      if [ -n "$PRESERVED_NS" ]; then
+        printf 'history-preserved: yes\n'
+        printf 'preserved-refs: %s/\n' "$PRESERVED_NS"
+        printf 'preserved-ref-count: %s\n' "$PRESERVED_NREFS"
+        printf 'preserved-tip: %s\n\n' "$PRESERVED_TIP"
+        printf -- '--- restoring this path ---\n'
+        printf -- 'my-git unflatten --merge %s\n' "$_msn_path"
+        printf -- 'Those refs live in the PARENT repo. A default clone/fetch does\n'
+        printf -- 'NOT carry %s/* -- my-git adds the fetch+push\n' "$MERGED_REFS_ROOT"
+        printf -- 'refspecs to every remote so its own push/pull do. To pick them up\n'
+        printf -- 'in a fresh clone made by hand:\n'
+        printf -- '  git config --add remote.origin.fetch "+%s/*:%s/*" && git fetch origin\n\n' "$MERGED_REFS_ROOT" "$MERGED_REFS_ROOT"
       fi
       if [ -n "$_msn_transferred" ]; then
         printf -- '--- sub-submodule(s) transferred to their own sidecar (would otherwise have lost their history along with this .git) ---\n'
@@ -3182,6 +3409,9 @@ _FL_ADD_EOF
       # exists here) is gone, not just worked around.
       _fl_capture_and_remove_gitfiles "$_msn_path"
     } > "$_msn_file" 2>/dev/null || log_warn "$_msn_path: could not write $_msn_file (cosmetic only, not fatal)"
+    # Reached only when the history is safe (preserved, or deliberately
+    # trashed) — this return is what authorises the caller to delete.
+    return 0
   }
 
   # _fl_merge_sidecar_path <path>
@@ -3215,7 +3445,12 @@ _FL_ADD_EOF
       log_dbg_med "direct sidecar->merge: $_fms_path has no $GIT_SIDECAR_DIRNAME.status — provenance (was-submodule/name/url) will be recorded as unknown"
     fi
     log_dbg_med "direct sidecar->merge: $_fms_path (was_sub=$_fms_was_sub name='$_fms_sub_name' url='$_fms_sub_url'); writing .git.merged from $_fms_gitreal, then removing it"
-    _fl_write_merge_snapshot "$_fms_path" "$_fms_gitreal" "$_fms_was_sub" "$_fms_sub_name" "$_fms_sub_url"
+    # No snapshot (history not preserved) => no removal. The sidecar is
+    # left exactly as it was, so the path stays a working sidecar repo.
+    _fl_write_merge_snapshot "$_fms_path" "$_fms_gitreal" "$_fms_was_sub" "$_fms_sub_name" "$_fms_sub_url" || {
+      log_warn "$_fms_path: left as a sidecar ($GIT_SIDECAR_DIRNAME kept) — nothing was deleted"
+      return 1
+    }
     run rm -rf -- "$_fms_gitreal" || { log_error "$_fms_path: rm -rf $_fms_gitreal failed"; return 1; }
     [ -f "$_fms_status" ] && { run git rm -q -- "$_fms_status" >/dev/null 2>&1 || run rm -f -- "$_fms_status"; }
     return 0
@@ -3692,7 +3927,7 @@ _FL_REG_EOF
         continue
       fi
       printf "  'S' sidecar  — absorb files into the parent, RELOCATE history into %s/%s (self-contained, no live .git left)    [-i EXCLUSIVE CHOICE]\n" "$_p" "$GIT_SIDECAR_DIRNAME" >/dev/tty
-      printf "  'M' merge    — absorb files into the parent, DELETE the nested .git (a .git.merged snapshot is written first, so 'unflatten --merge' can reconstruct)\n" >/dev/tty
+      printf "  'M' merge    — absorb files into the parent AND move this repo's history into it (objects transplanted, refs pinned under %s/; the nested .git then goes away, restore it with 'unflatten --merge')\n" "$MERGED_REFS_ROOT" >/dev/tty
       printf "  'Z' zip      — ARCHIVE the nested .git into %s/.git.zip and commit ONLY that archive (history kept, compressed; worktree files left as-is; restore with 'unflatten --zip')    [-i EXCLUSIVE CHOICE]\n" "$_p" >/dev/tty
       printf "  'i' ignore   — leave this repo alone    [-i EXCLUSIVE CHOICE]\n" >/dev/tty
       printf "  'a' abort    — cancel the whole flatten\n" >/dev/tty
@@ -3888,7 +4123,7 @@ _FL_ORP_EOF
     fi
     if [ "$_fl_interactive" = 1 ]; then
       _FBC_I=$((${_FBC_I:-0} + 1))
-      _prompt_ysa "[$_FBC_I of $_FBC_TOTAL] \"$1\" [--$3] flatten ?"
+      _prompt_ysa "[$_FBC_I of $_FBC_TOTAL] \"$1\" [--$3] flatten  ->  into $_fl_top ?"
       case $? in
         1) _FBC_CHOICE=skip; log_medium "skip  $1" ;;
         2) return 2 ;;
@@ -4011,16 +4246,21 @@ $_p"
             # .git DIRECTORY at the path itself instead. Try both so a
             # .git.merged marker is always written (else 'st' can't tag
             # it [merged] and bulk 'unflatten --merge' can't find it).
+            # A snapshot that FAILS means the history could not be moved
+            # into the parent — downgrade this item to plain 'flatten'
+            # (files absorbed, .git left LIVE) rather than delete it.
             _fl_del_url=$(_sm_safe_git . config -f .gitmodules --get "submodule.$_name.url" 2>/dev/null)
             if [ -d ".git/modules/$_name" ]; then
               log_dbg_med "registered delete: $_p — snapshotting from absorbed gitdir .git/modules/$_name"
-              _fl_write_merge_snapshot "$_p" ".git/modules/$_name" 1 "$_name" "$_fl_del_url"
+              _fl_write_merge_snapshot "$_p" ".git/modules/$_name" 1 "$_name" "$_fl_del_url" || _c=flatten
             elif [ -d "$_p/.git" ]; then
               log_dbg_med "registered delete: $_p — snapshotting from old-style real .git dir at $_p/.git (no .git/modules/$_name present)"
-              _fl_write_merge_snapshot "$_p" "$_p/.git" 1 "$_name" "$_fl_del_url"
+              _fl_write_merge_snapshot "$_p" "$_p/.git" 1 "$_name" "$_fl_del_url" || _c=flatten
             else
               log_warn "$_p: registered submodule 'delete' — no gitdir found (neither .git/modules/$_name nor $_p/.git); no .git.merged snapshot written, so 'st' won't tag it [merged] and bulk 'unflatten --merge' can't discover it"
             fi
+            [ "$_c" = flatten ] && \
+              log_warn "$_p: kept as a live nested repo (files still absorbed as parent content) — nothing was deleted"
           fi
           _sm_safe_git . config -f .gitmodules --remove-section "submodule.$_name" >/dev/null 2>&1 || true
           run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
@@ -4061,17 +4301,25 @@ $_p"
           _fl_nested=$(printf '%s\n' "$_fl_nested" | grep -Fxv "$_p/.git")
           ;;
         delete)
+          # A snapshot that FAILS means the history could not be moved
+          # into the parent — keep the live .git (its files are still
+          # absorbed as parent content) instead of deleting it anyway.
+          _fl_del_ok=1
           if [ -d "$_p/.git" ]; then
             log_dbg_med "embedded delete: $_p — snapshotting from real .git dir at $_p/.git"
-            _fl_write_merge_snapshot "$_p" "$_p/.git" 0
+            _fl_write_merge_snapshot "$_p" "$_p/.git" 0 || _fl_del_ok=0
           elif _fl_resolve_gitfile_pointer "$_p"; then
             log_dbg_med "embedded delete: $_p — snapshotting from gitfile-pointer target $_fl_resolved_gitdir (via_fallback=$_fl_resolved_via_fallback)"
-            _fl_write_merge_snapshot "$_p" "$_fl_resolved_gitdir" 1
+            _fl_write_merge_snapshot "$_p" "$_fl_resolved_gitdir" 1 || _fl_del_ok=0
           else
             log_warn "$_p: embedded 'delete' — no resolvable gitdir (.git is neither a dir nor a working pointer); no .git.merged snapshot written"
           fi
-          _fl_nested_delete="$_fl_nested_delete
-$_p/.git" ;;
+          if [ "$_fl_del_ok" = 1 ]; then
+            _fl_nested_delete="$_fl_nested_delete
+$_p/.git"
+          else
+            log_warn "$_p: kept as a live nested repo (files still absorbed as parent content) — nothing was deleted"
+          fi ;;
         zip)
           # archive the live .git into <path>/.git.zip (history kept, compressed).
           # No merge snapshot — the .zip IS the preserved history. ZIP does NOT
@@ -4201,6 +4449,14 @@ _FL_EMB_REALIZE_EOF
           fatal "flatten: --zip is mutually exclusive with --sidecar/--merge" 64
         _fl_forced_mode=zip ;;
       -k|--keep)    _fl_keep=1 ;;
+      # There is deliberately NO "merge but throw the history away"
+      # flag: that is exactly what --rm-git does, and one destructive
+      # operation with one confirmation beats two doing the same thing.
+      --trash-history|--no-history|--drop-history)
+        fatal "flatten: there is no $1 — '--merge' always keeps the history (it moves into this repo).
+  To absorb the files and DISCARD each nested history instead, use the one destructive mode:
+     $US flatten go --rm-git
+  It lists exactly what it will delete and requires you to type 'I am sure'." 64 ;;
       # --local-only: restrict to repos with NO remote configured — the ones
       # 'st' marks with the house icon (⌂). Works with any mode; the common
       # use is 'flatten --zip --local-only' to archive only the unpublished
@@ -4264,6 +4520,15 @@ _FL_EMB_REALIZE_EOF
 
   cd "$_fl_top" || fatal "flatten: cannot cd to $_fl_top" 1
 
+  # Say WHICH repo this run reads and writes, before doing anything.
+  # flatten always acts on the toplevel of wherever you are standing --
+  # never on a nested repo's own .git as the committer -- so name it.
+  log_repo_context flatten "$_fl_top" \
+    "this repo's .git receives the commit (the nested files become ITS content)" \
+    "${_fl_scope_path:+scoped to: $_fl_scope_path (only this nested repo is touched)}" \
+    "$([ "$_fl_forced_mode" = merge ] && printf 'each nested history is transplanted INTO this repo (%s/<path>/)' "$MERGED_REFS_ROOT")" \
+    "$([ "$_fl_rmgit" = 1 ] && printf '%s' '--rm-git: each nested .git is DELETED -- this repo is the only one left')"
+
   log_dbg_med "flatten: top=$_fl_top scope='${_fl_scope_path:-<whole repo>}' forced_mode='${_fl_forced_mode:-<none>}' mode=$_fl_mode interactive=$_fl_interactive rmgit=$_fl_rmgit force=$_fl_force keep=$_fl_keep sidecar_dirname=$GIT_SIDECAR_DIRNAME"
 
   # flatten needs a MODE. 'go' with no --sidecar/--merge/--zip and no -i is
@@ -4276,7 +4541,8 @@ _FL_EMB_REALIZE_EOF
      && [ "${AUTO_SIDECAR_EMBEDDED:-0}" != 1 ] && [ "${AUTO_SIDECAR_SUBMODULES:-0}" != 1 ]; then
     fatal "flatten go needs a mode — flattening disposes of each nested .git:
    --sidecar   relocate it into a self-contained $GIT_SIDECAR_DIRNAME (history kept)
-   --merge     delete it (history NOT preserved; .git.merged snapshot written)
+   --merge     absorb it into THIS repo (history kept — objects move into this
+               repo's object DB, refs pinned under $MERGED_REFS_ROOT/<path>/)
    --zip       archive it into a .zip (history kept, compressed)
   or choose per repo:   $US flatten go -i
   (bare 'flatten go' no longer just mirrors files while keeping .git live.)" 64
@@ -4356,7 +4622,7 @@ _FL_EMB_REALIZE_EOF
       _fl_zip_i=$((_fl_zip_i + 1))
       # -i: ask per repo (one by one), FULLY annotated.
       if [ "$_fl_interactive" = 1 ]; then
-        _prompt_ysa "[$_fl_zip_i of $_fl_zip_total] \"$_fl_zt\" [zip] archive .git ?"
+        _prompt_ysa "[$_fl_zip_i of $_fl_zip_total] \"$_fl_zt\" [zip] archive .git in place (no repo is committed to) ?"
         case $? in
           1) _fl_zip_skip=$((_fl_zip_skip + 1)); log_medium "skip  $_fl_zt"; continue ;;
           2) log_major "aborted (${_fl_zip_ok} already archived)"; return 77 ;;
@@ -4771,7 +5037,7 @@ _FL_IGNCHK_ORPH_EOF
       # ".git kept" when --merge/--zip/--sidecar will actually dispose of it.
       case "$_fl_forced_mode" in
         sidecar) printf '  %s>> --sidecar: each .git is RELOCATED to ./%s (history kept; restore with %s unflatten --sidecar). cd + git keep working via the sidecar.%s\n' "$C_BLUE" "$GIT_SIDECAR_DIRNAME" "$US" "$C_RESET" ;;
-        merge)   printf '  %s>> --merge: each live .git is DELETED (a ./.git.merged snapshot is written first so %s unflatten --merge can reconstruct; pre-merge history is NOT kept). cd + git STOP working in these dirs.%s\n' "$C_BLUE" "$US" "$C_RESET" ;;
+        merge)   printf '  %s>> --merge: each nested .git is absorbed into THIS repo — its objects are transplanted here and its refs pinned under %s/<path>/, so the history is KEPT (restore any of them with %s unflatten --merge). cd + git STOP working in those dirs until you do. To absorb the files and DISCARD the history instead, use --rm-git.%s\n' "$C_BLUE" "$MERGED_REFS_ROOT" "$US" "$C_RESET" ;;
         zip)     printf '  %s>> --zip: each .git is ARCHIVED to ./.git.zip (restore with %s unflatten --zip). cd + git will not work until restored.%s\n' "$C_BLUE" "$US" "$C_RESET" ;;
         *)       printf '  %s>> the live .git is untouched for now — but '\''go'\'' needs a mode, and each disposes of the .git differently: --sidecar keeps history (./%s), --merge DELETES it, --zip archives it (or -i to choose per repo; AUTO_SIDECAR_EMBEDDED=1 sidecars all).%s\n' "$C_BLUE" "$GIT_SIDECAR_DIRNAME" "$C_RESET" ;;
       esac
@@ -4997,6 +5263,10 @@ _FL_AUTO_EMB_EOF
   # ensure_sidecar_exclude's own internal check (list_realized_dirs)
   # makes this a no-op on runs that truly created nothing to exclude.
   ensure_sidecar_exclude "$_fl_top"
+  # Likewise for the refspecs that carry preserved merge history to a
+  # remote — a no-op until a merge has actually pinned something under
+  # $MERGED_REFS_ROOT. Without it, that history stays on this disk only.
+  ensure_preserved_refspec "$_fl_top"
 
   # Compute path list + argv ONCE, up-front — needed both for commit
   # and for the trap's 'git restore --staged -- <paths>' rollback if we
@@ -5221,11 +5491,18 @@ _FL_ZIP_EOF
   fi
 
   if [ "$_fl_rmgit" = 1 ] && [ -n "$_fl_nested" ]; then
-    # Destructive path: explicit 'yes' confirmation required.
+    # THE destructive escape hatch. Everything else in my-git is
+    # revertible — '--merge' now transplants history into the parent
+    # rather than destroying it, 'sidecar'/'zip' relocate it, 'shadow'
+    # keeps the .git live. --rm-git exists precisely to throw history
+    # away, so it asks for a full spelled-out sentence rather than a
+    # reflexive 'yes': three characters are too easy to type on autopilot
+    # for an action with no undo.
+    #
     # Only reachable when something is actually LEFT in $_fl_nested —
     # e.g. AUTO_SIDECAR_EMBEDDED (or -i's per-item 'realize') may have
     # already realized everything, leaving nothing for --rm-git to
-    # touch. Without this guard, --rm-git would demand a typed 'yes'
+    # touch. Without this guard, --rm-git would demand a confirmation
     # to "permanently delete" an empty list — confusing and pointless.
     echo
     printf '%s%s%s\n' "$C_RED$C_BOLD" \
@@ -5235,16 +5512,18 @@ _FL_ZIP_EOF
       printf '      %s%s/%s%s\n' "$C_YELLOW" "$_fl_top" "$_n" "$C_RESET"
     done
     printf '    Each nested repo'\''s HISTORY WILL BE LOST (unrecoverable unless backed up).\n'
-    printf '    Default flatten (without --rm-git) keeps histories; use that if unsure.\n\n'
+    printf '    This is NOT revertible — every other my-git operation is.\n'
+    printf '    To keep the history instead:  %s flatten go --merge   (absorbs it into this repo)\n' "$US"
+    printf '                             or:  %s flatten go --sidecar | --zip\n\n' "$US"
     if [ ! -r /dev/tty ]; then
       log_error "--rm-git needs interactive confirmation but no TTY is available"
       exit 1
     fi
-    printf '%sType exactly '\''yes'\'' to proceed, anything else to abort:%s ' \
+    printf '%sType exactly '\''I am sure'\'' to proceed, anything else to abort:%s ' \
       "$C_RED$C_BOLD" "$C_RESET" >/dev/tty
     IFS= read -r _fl_confirm </dev/tty || _fl_confirm=''
-    if [ "$_fl_confirm" != "yes" ]; then
-      log_major "--rm-git: aborted (expected literal 'yes', got: '$_fl_confirm')"
+    if [ "$_fl_confirm" != "I am sure" ]; then
+      log_major "--rm-git: aborted (expected literal 'I am sure', got: '$_fl_confirm') — nothing was deleted"
       exit 1
     fi
     while IFS= read -r _n; do
@@ -5429,7 +5708,7 @@ _FL_EOF
   _fl_n_zipped=$(printf '%s' "${_fl_nested_zip:-}" | grep -c .)
   _fl_done_parts="flattened"
   [ "$_fl_n_realized" -gt 0 ] && _fl_done_parts="$_fl_done_parts; $_fl_n_realized repo(s) sidecared into $GIT_SIDECAR_DIRNAME"
-  [ "$_fl_n_deleted" -gt 0 ] && _fl_done_parts="$_fl_done_parts; $_fl_n_deleted repo(s) merged with .git deleted (.git.merged snapshot written)"
+  [ "$_fl_n_deleted" -gt 0 ] && _fl_done_parts="$_fl_done_parts; $_fl_n_deleted repo(s) merged into this repo (history preserved under $MERGED_REFS_ROOT/)"
   [ "$_fl_n_zipped" -gt 0 ] && _fl_done_parts="$_fl_done_parts; $_fl_n_zipped repo(s) archived to .git.zip"
   if [ "$_fl_n_realized" -eq 0 ] && [ "$_fl_n_deleted" -eq 0 ] && [ "$_fl_n_zipped" -eq 0 ]; then
     _fl_done_parts="$_fl_done_parts; child .git dirs kept as-is"
@@ -5537,15 +5816,136 @@ _unfl_restore_sidecar() {
   return 0
 }
 
+# _urm_restore_gitignore <path>
+# Restore .gitignore from the merge snapshot (merge's own
+# _fl_write_merge_snapshot removed the original after capturing it — see
+# there for why) and remove the now-superseded .git.merged marker, staged
+# like any other parent-tracked content change. Shared by BOTH restore
+# routes (preserved-history and subtree-split fallback).
+#
+# Extract ONLY the '.gitignore' capture block: everything between its
+# own '--- .gitignore content at this time ---' header and the NEXT
+# such '--- ... content at this time ---' header (or EOF). A plain
+# 'sed /marker/,$ p' would run to EOF and swallow every LATER capture
+# section too — _fl_capture_and_remove_gitfiles emits one block per
+# '.git*' file in glob (alphabetical) order, so a path with both
+# '.gitignore' and, say, '.gitmodules' would otherwise get the
+# '.gitmodules' block wrongly appended to the restored .gitignore
+# (a real bug found in review). Command substitution strips the single
+# trailing blank line the capture writes after each block.
+_urm_restore_gitignore() {
+  _urg_path=$1
+  _urg_snapshot="$_urg_path/.git.merged"
+  [ -f "$_urg_snapshot" ] || return 0
+  _urg_gitignore=$(awk '
+    /^--- \.gitignore content at this time ---$/ { grab=1; next }
+    grab && /^--- .* content at this time ---$/  { grab=0 }
+    grab { print }
+  ' "$_urg_snapshot")
+  if [ -n "$_urg_gitignore" ]; then
+    printf '%s\n' "$_urg_gitignore" > "$_urg_path/.gitignore"
+    log_medium "$_urg_path: restored .gitignore from the merge snapshot ($(printf '%s\n' "$_urg_gitignore" | grep -c .) non-blank line(s))"
+  else
+    log_dbg_med "$_urg_path: no .gitignore block in $_urg_snapshot to restore (none was captured at merge time)"
+  fi
+  run git rm -q -- "$_urg_snapshot" >/dev/null 2>&1 || run rm -f -- "$_urg_snapshot"
+  return 0
+}
+
+# _unfl_restore_preserved <path> <ns> <tip> <branch>
+# Hands back a merge that PRESERVED its history: every ref under <ns> in
+# this repo is fetched into a fresh .git at <path>, restoring the original
+# branch names, tags and remote-tracking refs verbatim.
+#
+# The worktree is deliberately NOT touched. Its files are the CURRENT
+# (post-merge) content, which is usually AHEAD of <tip> — the parent has
+# been committing to them ever since. So HEAD is pointed at the restored
+# branch and the index reset to match it, which leaves exactly the
+# post-merge drift showing as ordinary uncommitted changes for the user
+# to commit. A 'reset --hard' here would silently destroy that drift.
+# Returns 0 on success, 1 if the history is not actually available.
+_unfl_restore_preserved() {
+  _urp_path=$1
+  _urp_ns=$2
+  _urp_tip=$3
+  _urp_branch=$4
+  _urp_parent_gitdir=$(run git rev-parse --absolute-git-dir) || return 1
+  if [ -z "$(git for-each-ref --format='%(refname)' "$_urp_ns" 2>/dev/null)" ]; then
+    log_warn "unflatten: $_urp_path: .git.merged points at '$_urp_ns' but this repo has no such refs — the preserved history is missing here (a plain clone does NOT fetch $MERGED_REFS_ROOT/*; try: git config --add remote.origin.fetch '+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*' && git fetch origin)"
+    return 1
+  fi
+  log_medium "unflatten  $_urp_path  (restoring the preserved history from $_urp_ns — full pre-merge history, branches and tags)"
+  run git init -q "$_urp_path" || { log_error "unflatten: $_urp_path: git init failed"; return 1; }
+  # 'git init' leaves HEAD on a branch (main/master), and git flatly
+  # REFUSES to fetch into whatever branch is checked out — which is
+  # exactly the branch a restore usually needs to write. Park HEAD on a
+  # placeholder name nothing can collide with; the real branch is
+  # selected below, once every ref has landed.
+  if ! ( cd "$_urp_path" \
+         && run git symbolic-ref HEAD "refs/heads/my-git-unflatten-placeholder-$$" \
+         && run git fetch -q "$_urp_parent_gitdir" "+$_urp_ns/*:refs/*" ); then
+    log_error "unflatten: $_urp_path: could not fetch the preserved refs back out of the parent"
+    run rm -rf -- "$_urp_path/.git"
+    return 1
+  fi
+  # Point HEAD at the original branch WITHOUT touching the worktree.
+  # 'symbolic-ref' + 'reset --mixed' is the only combination that moves
+  # HEAD and syncs the index while leaving files alone; 'checkout' would
+  # overwrite the post-merge content.
+  if [ -n "$_urp_branch" ] && git -C "$_urp_path" rev-parse -q --verify "refs/heads/$_urp_branch" >/dev/null 2>&1; then
+    run git -C "$_urp_path" symbolic-ref HEAD "refs/heads/$_urp_branch" \
+      || log_warn "unflatten: $_urp_path: could not point HEAD at '$_urp_branch'"
+  elif [ -n "$_urp_tip" ]; then
+    log_warn "unflatten: $_urp_path: recorded branch '$_urp_branch' not among the restored refs — leaving HEAD detached at $_urp_tip"
+    run git -C "$_urp_path" update-ref --no-deref HEAD "$_urp_tip" 2>/dev/null || true
+  fi
+  run git -C "$_urp_path" reset -q --mixed >/dev/null 2>&1 \
+    || log_warn "unflatten: $_urp_path: index reset failed — 'git status' there may look odd until you run 'git reset'"
+  _urp_n=$(git -C "$_urp_path" rev-list --count HEAD 2>/dev/null)
+  log_major "$_urp_path: history RESTORED — ${_urp_n:-?} commit(s), full pre-merge history intact (post-merge changes to these files are left as uncommitted changes for you to commit)"
+  # The parent no longer needs to carry this history: it now lives in the
+  # restored repo. Dropping the refs is what lets the parent's next 'gc'
+  # actually reclaim the space, and mirrors unflatten's teardown of the
+  # sidecar/.status/.git.merged artifacts it supersedes.
+  git for-each-ref --format='%(refname)' "$_urp_ns" 2>/dev/null | while IFS= read -r _urp_r; do
+    [ -n "$_urp_r" ] || continue
+    run git update-ref -d "$_urp_r" 2>/dev/null || log_warn "unflatten: could not drop preserved ref $_urp_r from the parent"
+  done
+  log_medium "$_urp_path: dropped the parent's now-redundant $_urp_ns/* refs (the history lives in $_urp_path/.git now)"
+  return 0
+}
+
 # _unfl_reconstruct_merge <path>
-# Best-effort: extracts <path>'s own history from THIS repo's commits via
-# 'git subtree split', then materializes it as a fresh, live .git at
-# <path>. See the RECONSTRUCTION note in the section banner above — this
-# can only recover history from the merge-day commit forward.
+# Restores a merged path to a live repo. Two routes:
+#   1. The merge PRESERVED its history (the normal case): hand the whole
+#      object DB back verbatim via _unfl_restore_preserved.
+#   2. The snapshot predates preservation (or its refs are gone): fall
+#      back to a best-effort 'git subtree split' from
+#      THIS repo's own commits, which recovers nothing from before the
+#      merge. See the RECONSTRUCTION note in the section banner above.
 _unfl_reconstruct_merge() {
   _urm_path=$1
   [ -e "$_urm_path/.git" ] && { log_error "unflatten: $_urm_path/.git already exists — nothing to reconstruct"; return 1; }
   [ -e "$_urm_path/$GIT_SIDECAR_DIRNAME" ] && { log_error "unflatten: $_urm_path/$GIT_SIDECAR_DIRNAME exists — this is a sidecar, not a merged path; use --sidecar"; return 1; }
+
+  # Route 1: preserved history, if the snapshot recorded a namespace.
+  _urm_snap="$_urm_path/.git.merged"
+  _urm_ns=""
+  if [ -f "$_urm_snap" ]; then
+    _urm_ns=$(sed -n 's|^preserved-refs: ||p' "$_urm_snap" | head -n 1 | sed -e 's|/$||')
+  fi
+  if [ -n "$_urm_ns" ]; then
+    _urm_ptip=$(sed -n 's|^preserved-tip: ||p' "$_urm_snap" | head -n 1)
+    _urm_pbr=$(sed -n 's|^branch: ||p' "$_urm_snap" | head -n 1)
+    case "$_urm_pbr" in "(detached)"*) _urm_pbr="" ;; esac
+    if _unfl_restore_preserved "$_urm_path" "$_urm_ns" "$_urm_ptip" "$_urm_pbr"; then
+      _urm_restore_gitignore "$_urm_path"
+      return 0
+    fi
+    log_warn "unflatten: $_urm_path: preserved-history restore failed — falling back to the best-effort subtree split (pre-merge history will NOT be recovered)"
+  else
+    log_dbg_med "unflatten: $_urm_path: .git.merged records no preserved-refs (written before preservation existed) — using the subtree-split fallback"
+  fi
 
   _urm_branch="my-git-unflatten-tmp-$$"
   log_medium "unflatten  $_urm_path  (reconstructing from this repo's own commit history via git subtree split — history before the original merge is NOT recoverable)"
@@ -5580,36 +5980,7 @@ _unfl_reconstruct_merge() {
   log_dbg_med "reconstruct $_urm_path: materialized live .git, HEAD=$(git -C "$_urm_path" rev-parse --short HEAD 2>/dev/null), $_urm_n_commits commit(s)"
   log_major "$_urm_path: reconstructed — $_urm_n_commits commit(s) recovered, starting from when this path was first merged in"
 
-  # Restore .gitignore from the snapshot (merge's own _fl_write_merge_snapshot
-  # removed the original after capturing it — see there for why) and
-  # remove the now-superseded .git.merged marker, staged like any other
-  # parent-tracked content change.
-  #
-  # Extract ONLY the '.gitignore' capture block: everything between its
-  # own '--- .gitignore content at this time ---' header and the NEXT
-  # such '--- ... content at this time ---' header (or EOF). A plain
-  # 'sed /marker/,$ p' would run to EOF and swallow every LATER capture
-  # section too — _fl_capture_and_remove_gitfiles emits one block per
-  # '.git*' file in glob (alphabetical) order, so a path with both
-  # '.gitignore' and, say, '.gitmodules' would otherwise get the
-  # '.gitmodules' block wrongly appended to the restored .gitignore
-  # (a real bug found in review). Command substitution strips the single
-  # trailing blank line the capture writes after each block.
-  _urm_snapshot="$_urm_path/.git.merged"
-  if [ -f "$_urm_snapshot" ]; then
-    _urm_gitignore=$(awk '
-      /^--- \.gitignore content at this time ---$/ { grab=1; next }
-      grab && /^--- .* content at this time ---$/  { grab=0 }
-      grab { print }
-    ' "$_urm_snapshot")
-    if [ -n "$_urm_gitignore" ]; then
-      printf '%s\n' "$_urm_gitignore" > "$_urm_path/.gitignore"
-      log_medium "$_urm_path: restored .gitignore from the merge snapshot ($(printf '%s\n' "$_urm_gitignore" | grep -c .) non-blank line(s))"
-    else
-      log_dbg_med "$_urm_path: no .gitignore block in $_urm_snapshot to restore (none was captured at merge time)"
-    fi
-    run git rm -q -- "$_urm_snapshot" >/dev/null 2>&1 || run rm -f -- "$_urm_snapshot"
-  fi
+  _urm_restore_gitignore "$_urm_path"
   return 0
 }
 
@@ -5675,6 +6046,11 @@ cmd_unflatten() {
   fi
 
   cd "$_ufl_top" || fatal "unflatten: cannot cd to $_ufl_top" 1
+
+  log_repo_context unflatten "$_ufl_top" \
+    "this repo's .git receives the teardown commit; each restored path gets its OWN live .git back" \
+    "${_ufl_scope_path:+scoped to: $_ufl_scope_path}" \
+    "merged paths are restored from history preserved in THIS repo ($MERGED_REFS_ROOT/<path>/)"
 
   # Build the candidate list: <path>\t<mode> lines.
   _ufl_cand=$(mktemp "${TMPDIR:-/tmp}/${US}.uflcand.XXXXXX") || fatal "unflatten: mktemp failed" 1
@@ -5773,7 +6149,7 @@ cmd_unflatten() {
     [ -n "$_p" ] || continue
     _ufl_i=$((_ufl_i + 1))
     if [ "$_ufl_interactive" = 1 ]; then
-      _prompt_ysa "[$_ufl_i of $_ufl_n] \"$_p\" [$_m] restore .git ?"
+      _prompt_ysa "[$_ufl_i of $_ufl_n] \"$_p\" [$_m] restore its own .git  (teardown commit goes to $_ufl_top) ?"
       case $? in
         1) log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; rm -f "$_ufl_cand"; exit 77 ;;
@@ -6050,6 +6426,15 @@ cmd_shadow() {
   fi
   cd "$_sh_top" || fatal "shadow: cannot cd to $_sh_top" 1
 
+  # shadow mirrors files into the ENCLOSING toplevel while each nested
+  # repo keeps its own live .git -- i.e. two repos end up tracking the
+  # same files. Which one is the mirror is exactly what must not be
+  # guessed at.
+  log_repo_context shadow "$_sh_top" \
+    "this repo's .git receives the commit and MIRRORS the nested files" \
+    "each shadowed repo KEEPS its own live .git -- that .git stays the authoritative history" \
+    "${_sh_scope:+scoped to: $_sh_scope}"
+
   if [ -n "$_sh_scope" ]; then
     [ -e "$_sh_scope/.git" ] || fatal "shadow: '$_sh_scope' is not a nested LIVE repo (no live .git). shadow keeps a live .git — for a sidecar/merged/zipped path use flatten/unflatten." 1
     _sh_list=$_sh_scope
@@ -6091,7 +6476,7 @@ cmd_shadow() {
     [ -n "$_p" ] || continue
     _sh_i=$((_sh_i + 1))
     if [ "$_sh_interactive" = 1 ]; then
-      _prompt_ysa "[$_sh_i of $_sh_total] \"$_p\" shadow (keep .git live, copy files to parent) ?"
+      _prompt_ysa "[$_sh_i of $_sh_total] \"$_p\" shadow: keep its own .git live, ALSO mirror its files into $_sh_top ?"
       case $? in
         1) _sh_skip=$((_sh_skip + 1)); log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; break ;;
@@ -6160,6 +6545,11 @@ cmd_unshadow() {
   fi
   cd "$_ush_top" || fatal "unshadow: cannot cd to $_ush_top" 1
 
+  log_repo_context unshadow "$_ush_top" \
+    "this repo STOPS tracking the mirrored files (git rm --cached); its .git receives the commit" \
+    "each nested repo's own live .git is NOT touched -- no history is affected" \
+    "${_ush_scope:+scoped to: $_ush_scope}"
+
   # A SHADOWED repo = a nested LIVE repo carrying a '.git.shadow.status' marker
   # (list_shadowed_dirs). For an explicit path we also accept the older signal
   # "live .git + parent tracks its files" so a repo shadowed before the marker
@@ -6208,7 +6598,7 @@ cmd_unshadow() {
     [ -n "$_p" ] || continue
     _ush_i=$((_ush_i + 1))
     if [ "$_ush_interactive" = 1 ]; then
-      _prompt_ysa "[$_ush_i of $_ush_total] \"$_p\" unshadow (stop parent tracking; keep .git live) ?"
+      _prompt_ysa "[$_ush_i of $_ush_total] \"$_p\" unshadow: stop $_ush_top tracking it (its own .git stays live) ?"
       case $? in
         1) _ush_skip=$((_ush_skip + 1)); log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; break ;;
@@ -7104,6 +7494,12 @@ my-git status  (aliases: st, s)
 
 usage: $US [-V|-D] status [paths...]
 
+WHICH REPO does this touch?
+  READS          the toplevel of the repo you are standing in, and every
+                 nested repo below it (each one's own .git is read for its
+                 status, branch and remote).
+  WRITES         NOTHING. 'st' is strictly read-only.
+
 Recursively lists git status of the scoped repos and all their submodules.
 Uses  git status --porcelain --ignore-submodules  at each level (submodules
 are traversed manually so we can show nested structure).
@@ -7194,6 +7590,16 @@ show_help_masscommits() {
 my-git masscommits  (aliases: mc, c)
 
 usage: $US [-V|-D] mc [go] [-i|--interactive] [-R|--recursive] [paths...]
+
+WHICH REPO does this touch?
+  READS/WRITES   EVERY repo in scope — this is the one command that writes to
+                 many repos in a single run.
+  COMMITS TO     each repo's OWN .git, and pushes to each repo's OWN remote.
+                 No shared or parent repo receives anything on their behalf.
+  SCOPE          single level by default (the named repo(s) only); -R walks
+                 every nested repo bottom-up, so a parent's gitlink can bump
+                 to a child that was just committed.
+  A run prints ' >>> mc: TARGET REPO <paths>' before doing anything.
 
 Modes (two-phase, same pattern as 'sm'):
   default (no 'go')   ANALYZE — one concise line per repo showing current
@@ -7371,6 +7777,15 @@ show_help_flatten() {
 my-git flatten  (alias: fl)
 
 usage: $US [-V|-D] flatten [go] [-i] [--local-only] [--rm-git] [--force] [--sidecar|--merge|--zip [-k]] [path]
+
+WHICH REPO does this touch?
+  READS/WRITES   the toplevel of the repo you are standing in (it auto-jumps
+                 there from a subdir, and says so). Never a nested repo.
+  COMMITS TO     that toplevel's .git — the nested files become ITS content.
+  ALSO TOUCHES   each nested repo's own .git: --sidecar relocates it,
+                 --merge moves its history INTO the toplevel, --zip archives
+                 it in place, --rm-git DELETES it.
+  A run prints ' >>> flatten: TARGET REPO <path>' before doing anything.
 
 Merge every nested git repo under the CURRENT super-repo into the
 super's history as regular tracked content. Callable from anywhere
@@ -7557,6 +7972,15 @@ my-git unflatten  (alias: unfl)
 
 usage: $US [-V|-D] unflatten [go] [-i] [--sidecar|--merge|--zip [-k]] [path]
 
+WHICH REPO does this touch?
+  READS/WRITES   the toplevel of the repo you are standing in.
+  COMMITS TO     that toplevel's .git (the teardown commit that drops the
+                 now-obsolete sidecar/marker/snapshot artifacts).
+  ALSO TOUCHES   each restored path, which gets its OWN live .git back. For a
+                 merged path the history comes out of the TOPLEVEL's object
+                 database, where 'flatten --merge' put it.
+  A run prints ' >>> unflatten: TARGET REPO <path>' before doing anything.
+
 Reverse of 'flatten' — rebuilds a live '.git' at a nested path. Three
 modes, matching flatten's three:
 
@@ -7570,12 +7994,20 @@ modes, matching flatten's three:
               yourself with 'my-git sm go' if you want it back in
               .gitmodules (unflatten does not do this automatically).
 
-  --merge     BEST-EFFORT RECONSTRUCTION, not exact. Used for a path
-              that was merged in with its original .git deleted
-              ('flatten --merge' choosing 'delete', or --rm-git) — there
-              is no git artifact left there at all, so the only
-              recoverable history is whatever THIS repo's own commits
-              did to that path, extracted via
+  --merge     EXACT restore for a path merged in normally: 'flatten
+              --merge' transplanted that repo's whole object database
+              into this one and pinned its refs, so unflatten fetches
+              them straight back — full pre-merge history, original
+              branch names and tags. The worktree is left alone (its
+              files are usually AHEAD of the merge point), so any
+              post-merge drift shows up as ordinary uncommitted changes
+              for you to commit.
+
+              BEST-EFFORT RECONSTRUCTION only when there is no preserved
+              history to restore — a .git.merged written before
+              preservation existed, or whose refs are gone. Then
+              the only recoverable history is whatever THIS repo's own
+              commits did to that path, extracted via
               'git subtree split --prefix=<path>'. This starts from the
               day it was first merged in, forward — anything before
               that was permanently discarded when the original .git was
@@ -7623,6 +8055,14 @@ show_help_shadow() {
 my-git shadow   (alias: sh)
 
 usage: $US [-V|-D] shadow [go] [-i] [path]
+
+WHICH REPO does this touch?
+  READS/WRITES   the toplevel of the repo you are standing in.
+  COMMITS TO     that toplevel's .git — it MIRRORS the nested files into it.
+  ALSO TOUCHES   nothing in the nested repo's history: its own .git stays LIVE
+                 and remains the authoritative history. Shadowing means TWO
+                 repos track the same files; the nested one is the real owner.
+  A run prints ' >>> shadow: TARGET REPO <path>' before doing anything.
 
 The OPPOSITE trade-off from 'flatten'. flatten gets RID of a nested repo's
 live '.git'; shadow KEEPS it live — so your IDE/editor git integration
@@ -7686,6 +8126,13 @@ show_help_unshadow() {
 my-git unshadow   (alias: unsh)
 
 usage: $US [-V|-D] unshadow [go] [-i] [path]
+
+WHICH REPO does this touch?
+  READS/WRITES   the toplevel of the repo you are standing in.
+  COMMITS TO     that toplevel's .git ('git rm --cached' of the mirrored files).
+  ALSO TOUCHES   nothing else — the nested repo's own .git is never touched and
+                 no history is affected.
+  A run prints ' >>> unshadow: TARGET REPO <path>' before doing anything.
 
 Reverse of 'shadow'. A shadowed repo has a LIVE '.git', a '.git.shadow.status'
 marker, AND its files tracked by the parent; unshadow makes the parent STOP
@@ -7854,6 +8301,17 @@ usage: $US sm [opts] [PATH]              (analyze; compact one-line output)
        $US sm --sync-gitignore           (write ignored paths to .git/info/exclude)
        $US sm --emit-gitignore           (print ignore patterns to stdout)
        $US sm --unstage-embedded         (remove mis-staged embedded repos)
+
+WHICH REPO does this touch?
+  READS/WRITES   the repo that DIRECTLY ENCLOSES the given PATH — which for a
+                 deep path is usually NOT the toplevel you ran from, and NOT
+                 the outermost/root repo. With no PATH: the current toplevel.
+  COMMITS TO     that same enclosing repo (.gitmodules + index + its .git).
+  ALSO TOUCHES   the nested repo's gitdir, which git ABSORBS into the enclosing
+                 repo's .git/modules/<name>/. History is moved, never deleted.
+  'unsm <path>' de-registers from that same enclosing repo, undoing exactly
+  what 'sm <path> go' did.
+  A run prints ' >>> sm: TARGET REPO <path>' before doing anything.
 
 Merged from the standalone my-git-submodules.sh tool. Run from the top of a
 super-repo to register nested .git trees as proper submodules.
@@ -8391,6 +8849,14 @@ _ignore_apply() {
   fi
   cd "$_ia_top" || fatal "$_ia_mode: cannot cd to $_ia_top" 1
 
+  # Unusual among the mutating commands: NOTHING is committed, and the
+  # toplevel is only used to resolve the path. The marker is written into
+  # the NESTED repo's own gitdir, which no repo tracks.
+  log_repo_context "$_ia_mode" "$_ia_top" \
+    "used ONLY to resolve the path -- this repo is NOT modified and NOTHING is committed" \
+    "${_ia_scope:+target: $_ia_scope}" \
+    "the marker is written inside the nested repo's own gitdir ($_sm_IGNORE_MARKER) -- untracked by every repo"
+
   # Build the target list.
   if [ -n "$_ia_scope" ]; then
     _ign_gitpath_of "$_ia_scope" >/dev/null 2>&1 \
@@ -8438,7 +8904,7 @@ _ignore_apply() {
     [ -n "$_p" ] || continue
     _ia_n=$((_ia_n + 1))
     if [ "$_ia_i" = 1 ]; then
-      _prompt_ysa "[$_ia_n of $_ia_total] \"$_p\" $_ia_mode ?"
+      _prompt_ysa "[$_ia_n of $_ia_total] \"$_p\" $_ia_mode (marker in its OWN gitdir; no repo is committed to) ?"
       case $? in
         1) _ia_skip=$((_ia_skip + 1)); log_medium "skip  $_p"; continue ;;
         2) log_major "aborted"; break ;;
@@ -9100,6 +9566,12 @@ cmd_unsm() {
   fi
   sort -o "$_un_tmp" "$_un_tmp"
 
+  log_repo_context unsm "$_un_where" \
+    "this repo's .gitmodules + index lose the registration; its .git receives the commit" \
+    "${_un_scope_raw:+de-registering: $_un_scope_raw}" \
+    "$([ -n "$_un_scope_raw" ] && printf 'chosen as the repo DIRECTLY enclosing the path -- the same one "sm <path> go" registered into' || printf 'whole-tree sweep: every registered submodule found below here')" \
+    "each de-registered path keeps its history -- its gitdir is moved back to <path>/.git, never deleted"
+
   _un_n=$(grep -c . "$_un_tmp")
   if [ "$_un_n" -eq 0 ]; then
     rm -f "$_un_tmp"
@@ -9131,7 +9603,7 @@ cmd_unsm() {
       _un_cur_changed=0
     fi
     if [ "$_un_i" = 1 ]; then
-      _prompt_ysa "\"$_p/$_s\" unsm (de-register, keep the repo live) ?"
+      _prompt_ysa "\"$_p/$_s\" unsm: de-register from $_p (keep the repo live, history intact) ?"
       case $? in
         1) _un_skip=$((_un_skip + 1)); log_medium "skip  $_s"; continue ;;
         2) _unsm_flush_parent; log_major "aborted"; rm -f "$_un_tmp"; exit 77 ;;
@@ -9218,6 +9690,10 @@ _sm_run_here() {
   if [ -n "$_sm_scope_path_raw" ]; then
     _sm_scope_abs0=$(cd "$_sm_scope_path_raw" 2>/dev/null && pwd -P) || \
       fatal "sm: '$_sm_scope_path_raw': no such directory" 1
+    # Capture the LOGICAL (symlink-preserving) form NOW — the retarget
+    # below overwrites _sm_scope_path_raw with the resolved path, and
+    # from then on there is no way back to what the person actually typed.
+    _sm_scope_log=$(cd "$_sm_scope_path_raw" 2>/dev/null && pwd)
     _sm_encl=$( cd "$_sm_scope_abs0/.." 2>/dev/null && git -c safe.directory='*' rev-parse --show-toplevel 2>/dev/null )
     if [ -n "$_sm_encl" ] && [ "$_sm_encl" != "$(pwd -P)" ]; then
       log_medium "sm: '$_sm_scope_path_raw' belongs to $_sm_encl — registering there (its immediate enclosing repo)"
@@ -9225,6 +9701,30 @@ _sm_run_here() {
       _sm_scope_path_raw=$_sm_scope_abs0   # absolute, so scope resolution below is CWD-independent
     fi
   fi
+
+  # State plainly WHICH repo the registration lands in. "Is sm registering
+  # into the parent or the root repo?" is the question this answers: it is
+  # always the repo that DIRECTLY encloses the path, which for a deep path
+  # is usually NOT the toplevel you invoked from.
+  # Report the LOGICAL path (symlinks intact — /LINKS/... or /syst/...),
+  # not the resolved one: that is what was typed and what the person is
+  # looking at. git's --show-toplevel always resolves, so derive the
+  # logical form by stripping the same trailing components from the
+  # logical scope path that separate it from the resolved enclosing repo.
+  _sm_disp=$(pwd -P)
+  _sm_disp_scope=${_sm_scope_path_raw:-}
+  if [ -n "${_sm_scope_log:-}" ]; then
+    _sm_disp_scope=$_sm_scope_log
+    _sm_sfx=${_sm_scope_abs0#"$(pwd -P)"}
+    case "$_sm_scope_log" in
+      *"$_sm_sfx") _sm_disp=${_sm_scope_log%"$_sm_sfx"} ;;
+    esac
+  fi
+  log_repo_context sm "$_sm_disp" \
+    "this repo's .gitmodules + index receive the registration, and its .git the commit" \
+    "${_sm_disp_scope:+registering: $_sm_disp_scope}" \
+    "chosen as the repo DIRECTLY enclosing the path -- not necessarily the toplevel you ran from" \
+    "undo with: $US unsm ${_sm_disp_scope:-<path>}  (acts on this same repo)"
 
   # ─── Sidecar-awareness ───
   # If THIS scope's repo is a sidecar (GIT_SIDECAR_DIRNAME present, no
@@ -11807,10 +12307,12 @@ _RT_CONF_EOF
   }
 
   test_unflatten_merge_reconstructs_history() {
-    # --merge now deletes .git outright (writing .git.merged first — see
-    # test_flatten_merge_writes_and_cleans_snapshot for that half); this
-    # test focuses on the RECONSTRUCTION side: commits made through the
-    # parent AFTER the delete must be picked up by the subtree-split too.
+    # The FALLBACK route: a .git.merged written before merge preserved
+    # history (or whose refs are gone) has no object DB to hand back, so
+    # unflatten reconstructs what it can via 'git subtree split'. Still
+    # live because old snapshots on disk predate preservation. Simulated
+    # here by dropping the preserved refs after the merge, which is
+    # exactly the state such a snapshot leaves behind.
     _rt_repo_file kid_o x.txt
     _rt_repo global
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
@@ -11820,6 +12322,10 @@ _RT_CONF_EOF
     _rt_ok "flatten go kid --merge (deletes .git, writes .git.merged)" _rt_my_git flatten go kid --merge || return 1
     _rt_absent "kid/.git is gone" kid/.git || return 1
     _rt_exists "kid/.git.merged written" kid/.git.merged || return 1
+    # Drop the preserved history so only the subtree-split route remains.
+    for _r in $(git for-each-ref --format='%(refname)' refs/my-git/merged/kid); do
+      git update-ref -d "$_r"
+    done
     echo more >> kid/x.txt
     git add -A && git commit -q -m "edit kid via parent after merge"
     _rt_ok "unflatten go kid --merge" _rt_my_git unflatten go kid --merge || return 1
@@ -12280,6 +12786,183 @@ _RT_STALE_CONF_EOF
       || { _rt_fail "subsub's history should be readable via its new sidecar, but is not"; return 1; }
     _rt_contains "transfer recorded in .git.merged" kid/.git.merged "subsub" || return 1
     _rt_clean "parent ends up clean" || return 1
+    return 0
+  }
+
+  test_flatten_merge_preserves_history_in_parent() {
+    # THE point of merge preservation: after 'flatten --merge' the nested
+    # repo's .git is gone from the path, but every one of its commits,
+    # branches and tags must be READABLE FROM THE PARENT under
+    # refs/my-git/merged/<path>/. Before this, merge deleted the object
+    # database outright and the history was gone for good.
+    _rt_repo_file kid_o a.md
+    ( cd kid_o && echo b > b.md && git add b.md && git commit -q -m second \
+        && git tag v1 && git branch sidebranch )
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    # A clone lands non-default branches under refs/remotes/origin/, so
+    # make a genuine LOCAL branch to prove refs/heads/* is carried too.
+    git --git-dir=global/kid/.git branch sidebranch HEAD
+    cd global || return 1
+    _kid_tip=$(git --git-dir=kid/.git rev-parse HEAD)
+    _kid_n=$(git --git-dir=kid/.git rev-list --count HEAD)
+
+    _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
+    _rt_absent "kid/.git no longer at the path" kid/.git || return 1
+
+    # The tip must be a real, readable object in the PARENT now.
+    git cat-file -e "$_kid_tip^{commit}" 2>/dev/null \
+      || { _rt_fail "kid's tip $_kid_tip is NOT in the parent object DB — history was lost"; return 1; }
+    [ "$(git rev-list --count "$_kid_tip")" = "$_kid_n" ] \
+      || { _rt_fail "expected $_kid_n commit(s) reachable from the preserved tip"; return 1; }
+    git rev-parse -q --verify refs/my-git/merged/kid/heads/sidebranch >/dev/null \
+      || { _rt_fail "branch 'sidebranch' not pinned under refs/my-git/merged/kid/"; return 1; }
+    git rev-parse -q --verify refs/my-git/merged/kid/tags/v1 >/dev/null \
+      || { _rt_fail "tag 'v1' not pinned under refs/my-git/merged/kid/"; return 1; }
+    _rt_contains "snapshot records the preserved namespace" kid/.git.merged "preserved-refs: refs/my-git/merged/kid/" || return 1
+    _rt_contains "snapshot says history-preserved: yes" kid/.git.merged "history-preserved: yes" || return 1
+    _rt_clean "parent ends up clean" || return 1
+    return 0
+  }
+
+  test_unflatten_merge_restores_full_preserved_history() {
+    # Round trip: everything merge preserved must come back — the FULL
+    # pre-merge commit count (not just merge-day-forward, which is all
+    # the old subtree-split fallback could manage), plus branches, tags,
+    # and the original branch checked out. The worktree must NOT be
+    # reset: post-merge edits survive as uncommitted changes.
+    _rt_repo_file kid_o a.md
+    ( cd kid_o && echo b > b.md && git add b.md && git commit -q -m second \
+        && git tag v1 && git branch sidebranch )
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    git --git-dir=global/kid/.git branch sidebranch HEAD
+    cd global || return 1
+    _kid_n=$(git --git-dir=kid/.git rev-list --count HEAD)
+    _kid_branch=$(git --git-dir=kid/.git symbolic-ref --short HEAD)
+    _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
+    # Post-merge drift, committed by the PARENT — must survive unflatten.
+    echo "after the merge" >> kid/a.md
+    git add kid/a.md && git commit -q -m "parent edits kid/a.md after the merge"
+
+    _rt_ok "unflatten go kid --merge" _rt_my_git unflatten go kid --merge || return 1
+    _rt_isdir "kid/.git is live again" kid/.git || return 1
+    [ "$(git -C kid rev-list --count HEAD)" = "$_kid_n" ] \
+      || { _rt_fail "expected the full $_kid_n-commit pre-merge history back, got $(git -C kid rev-list --count HEAD)"; return 1; }
+    [ "$(git -C kid symbolic-ref --short HEAD)" = "$_kid_branch" ] \
+      || { _rt_fail "HEAD should be back on '$_kid_branch'"; return 1; }
+    git -C kid rev-parse -q --verify refs/tags/v1 >/dev/null \
+      || { _rt_fail "tag v1 did not come back"; return 1; }
+    git -C kid rev-parse -q --verify refs/heads/sidebranch >/dev/null \
+      || { _rt_fail "branch sidebranch did not come back"; return 1; }
+    # The post-merge edit is still on disk, as an uncommitted change.
+    grep -q "after the merge" kid/a.md \
+      || { _rt_fail "unflatten DESTROYED the post-merge worktree content"; return 1; }
+    # And the parent no longer carries the now-redundant preserved refs.
+    [ -z "$(git for-each-ref --format='%(refname)' refs/my-git/merged/kid)" ] \
+      || { _rt_fail "parent should have dropped refs/my-git/merged/kid/* after restoring"; return 1; }
+    return 0
+  }
+
+  test_flatten_merge_never_deletes_when_preserve_fails() {
+    # The gate that matters: if the history CANNOT be transplanted, the
+    # nested .git must survive untouched. A read-only object store makes
+    # the fetch fail for real rather than by stubbing anything out.
+    _rt_repo_file kid_o a.md
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd global || return 1
+    # Corrupt the SOURCE so upload-pack cannot serve its objects.
+    mv kid/.git/objects kid/.git/objects.hidden
+    _rt_my_git flatten go kid --merge >/dev/null 2>&1
+    _rt_isdir "kid/.git SURVIVES a failed preserve" kid/.git || return 1
+    _rt_absent "no .git.merged written when the history could not be preserved" kid/.git.merged || return 1
+    mv kid/.git/objects.hidden kid/.git/objects
+    git --git-dir=kid/.git log --oneline >/dev/null 2>&1 \
+      || { _rt_fail "kid's history should still be intact after the aborted merge"; return 1; }
+    return 0
+  }
+
+  test_flatten_trash_history_flag_points_at_rm_git() {
+    # --merge always keeps history; the one destructive mode is --rm-git.
+    # Anyone reaching for a "merge but discard" flag gets sent there.
+    _rt_repo_file kid_o a.md
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd global || return 1
+    _rt_my_git flatten go kid --merge --trash-history >"$_rt_out" 2>"$_rt_err" \
+      && { _rt_fail "--trash-history should be refused, not accepted"; return 1; }
+    _rt_contains "the refusal names --rm-git" "$_rt_err" "--rm-git" || return 1
+    _rt_isdir "nothing happened to kid/.git" kid/.git || return 1
+    return 0
+  }
+
+  test_flatten_merge_adds_preserved_refspecs_to_remote() {
+    # Preserved history lives outside refs/heads, so a default clone,
+    # fetch or 'push --all' would silently skip it. After a merge, every
+    # remote must carry the refspecs that keep the parent portable.
+    _rt_repo_file kid_o a.md
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git init -q --bare "$PWD/globalremote.git"
+    ( cd global && git remote add origin "$PWD/../globalremote.git" \
+        && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd global || return 1
+    _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
+    git config --get-all remote.origin.fetch | grep -qxF '+refs/my-git/merged/*:refs/my-git/merged/*' \
+      || { _rt_fail "remote.origin.fetch is missing the preserved-history refspec"; return 1; }
+    git config --get-all remote.origin.push | grep -qxF '+refs/my-git/merged/*:refs/my-git/merged/*' \
+      || { _rt_fail "remote.origin.push is missing the preserved-history refspec"; return 1; }
+    # Setting a push refspec replaces git's default, so heads must be restated.
+    git config --get-all remote.origin.push | grep -qxF '+refs/heads/*:refs/heads/*' \
+      || { _rt_fail "remote.origin.push must still carry refs/heads/* alongside"; return 1; }
+    return 0
+  }
+
+  test_target_repo_banner_names_the_receiving_repo() {
+    # Transparency: a mutating command must say WHICH repo it writes to
+    # before it does anything. The confusable case is sm, which retargets
+    # to the repo DIRECTLY enclosing the path — not the toplevel you ran
+    # from — so a deep path must name the middle repo, not the outer one.
+    _rt_repo_file kid_o a.md
+    _rt_repo outer
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd outer && mkdir -p mid && cd mid && git init -q . \
+        && echo m > m.txt && git add m.txt \
+        && git -c user.email=t@t -c user.name=t commit -q -m mid \
+        && git clone -q ../../kid_o kid >/dev/null 2>&1 )
+    cd outer || return 1
+    # flatten resolves UPWARD: the toplevel we are standing in.
+    _rt_ok "flatten analyze" _rt_my_git flatten || return 1
+    _rt_contains "flatten names its target repo" "$_rt_out" "flatten: TARGET REPO" || return 1
+    # sm resolves DOWNWARD: the repo directly enclosing the path.
+    _rt_ok "sm analyze on a deep path" _rt_my_git sm mid/kid || return 1
+    _rt_contains "sm names a target repo" "$_rt_out" "sm: TARGET REPO" || return 1
+    _rt_contains "sm targets the ENCLOSING repo (mid), not the outer one" "$_rt_out" "/mid" || return 1
+    return 0
+  }
+
+  test_st_live_git_beats_stale_git_merged_marker() {
+    # A path can end up with BOTH a live .git and a leftover .git.merged
+    # — an unflatten that could not remove the marker, or a repo restored
+    # from a backup by hand. The live repo is the truth; reporting it as
+    # [merged] hides its real state and invites flatten/unflatten to act
+    # on something that is not merged at all.
+    _rt_repo_file kid_o a.md
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 )
+    cd global || return 1
+    # Stale marker sitting next to a perfectly live .git.
+    printf 'merged-at: 2020-01-01T00:00:00Z\n' > kid/.git.merged
+    _rt_isdir "kid/.git is live" kid/.git || return 1
+    _rt_ok "st -R" _rt_my_git -R st || return 1
+    _rt_contains "kid reported as a live nested repo" "$_rt_out" "[raw-nested-git]" || return 1
+    _rt_not_contains "kid NOT reported as [merged]" "$_rt_out" "[merged]" || return 1
     return 0
   }
 
@@ -13622,7 +14305,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""

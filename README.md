@@ -165,8 +165,8 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `ignore` / `unignore` | —        | whole-tree (`unignore`); PATH (`ignore`) | Toggle the **generic** `.git/my-git.ignore` marker — honoured by every subcommand (`st` won't descend, `sm` won't register, `mc` won't commit, `flatten` won't touch) |
 | `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`. Settles the whole tree in one command.         |
 | `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
-| `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir: `--merge` (kept live/deleted), `--sidecar` (`.git.real`, history preserved), `--zip` (archived to `.git.zip`/`.git.real.zip`); `-i`/PATH for per-item or forced-mode control |
-| `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip` exact, `--merge` best-effort (`git subtree split`); auto-detects the mode per path |
+| `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir, all history-preserving: `--merge` (history moves into the parent, `refs/my-git/merged/<path>/`), `--sidecar` (`.git.real`), `--zip` (`.git.zip`/`.git.real.zip`); `--rm-git` is the one destructive option and demands typing `I am sure`; `-i`/PATH for per-item or forced-mode control |
+| `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip`/`--merge` all exact (merge restores the preserved history, branches and tags); falls back to best-effort `git subtree split` only for snapshots written before preservation existed; auto-detects the mode per path |
 | `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
 | `unshadow`      | `unsh`         | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
 | `audit`         |                | always    | Read-only health checks: `--claude` (`.claude/` symlink convention) and/or `--sidecar` (sidecar setup) |
@@ -175,6 +175,71 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
 
 Run `my-git --help <subcommand>` (or `my-git <sub> --help`) for details.
+
+### Which repo does each command touch?
+
+my-git routinely acts on a repo **other than the one you are standing in** — it
+walks up to a toplevel, or down to the repo that directly encloses a PATH. That
+used to be implicit; it no longer is. **Every mutating command prints a
+`TARGET REPO` banner before doing anything**, and every `-i` prompt names the
+repo that will receive the result:
+
+```
+ >>> flatten: TARGET REPO  /syst/global
+    > this repo's .git receives the commit (the nested files become ITS content)
+    > scoped to: src/sh/my-power (only this nested repo is touched)
+    > each nested history is transplanted INTO this repo (refs/my-git/merged/<path>/)
+```
+
+| Command | Acts on | Commits to | Also touches |
+|---|---|---|---|
+| `st` | toplevel + every nested repo | **nothing — read-only** | — |
+| `mc` | **every repo in scope** | each repo's **own** `.git`, pushes to its **own** remote | — |
+| `pull` / `fetch` | every repo in scope | each repo's own `.git` | — |
+| `sm` | the repo **directly enclosing** the PATH — *not* the toplevel you ran from, *not* the root repo | that same enclosing repo | nested gitdir is **absorbed** into `<enclosing>/.git/modules/<name>/` |
+| `unsm` | same enclosing repo `sm` used | that same enclosing repo | gitdir **de-absorbed** back to `<path>/.git` |
+| `flatten` | the toplevel (auto-jumps there from a subdir) | the toplevel's `.git` | each nested `.git`: relocated (`--sidecar`), moved into the toplevel (`--merge`), archived (`--zip`), or **deleted** (`--rm-git`) |
+| `unflatten` | the toplevel | the toplevel's `.git` (teardown) | each restored path gets its **own** live `.git` back |
+| `shadow` | the toplevel | the toplevel's `.git` (mirrors the files) | nothing — the nested `.git` stays live and authoritative |
+| `unshadow` | the toplevel | the toplevel's `.git` (`git rm --cached`) | nothing — no history is affected |
+| `ignore` / `unignore` | toplevel used **only** to resolve the path | **nothing is committed** | marker written inside the nested repo's **own** gitdir |
+| `gz` / `gu` | the named path | **nothing** — parent-neutral | that path's `.git` ⇄ `.git.zip` |
+
+The rule behind the table: **`sm`/`unsm` resolve *downward* to the immediate
+enclosing repo; everything else resolves *upward* to the toplevel.** When those
+two differ, the banner tells you which one won.
+
+### Nothing is destroyed except by `--rm-git`
+
+Every mode keeps history somewhere:
+
+| | files → parent | history |
+|---|---|---|
+| `flatten --sidecar` | yes | → `.git.real` beside the worktree |
+| `flatten --merge` | yes | → **into the parent's object DB**, refs pinned under `refs/my-git/merged/<path>/` |
+| `flatten --zip` | no | → `.git.zip` in place |
+| `flatten --rm-git` | yes | **DESTROYED** |
+
+`--merge` transplants the nested repo's *entire* object database into the parent
+and verifies the tip is readable there **before** anything is deleted; if that
+fails, nothing is deleted at all. `unflatten --merge` hands it back verbatim —
+original branches and tags — leaving post-merge worktree changes as ordinary
+uncommitted changes.
+
+Because preserved history lives outside `refs/heads/*`, a default clone/fetch
+and `git push --all` would skip it, so my-git adds the fetch **and** push
+refspecs to every remote and pushes `refs/my-git/merged/*` explicitly. To pick
+it up in a clone made by hand:
+
+```sh
+git config --add remote.origin.fetch '+refs/my-git/merged/*:refs/my-git/merged/*'
+git fetch origin
+```
+
+`--rm-git` is the single destructive operation. It lists exactly what it will
+delete and requires you to type **`I am sure`** — nothing else proceeds. There
+is deliberately no "merge but discard the history" flag; typing one points you
+here.
 
 ### Why recursion is opt-in for `mc` and `sm`
 
