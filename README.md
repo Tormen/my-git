@@ -21,18 +21,27 @@ by multiple users and nested several levels deep.
   submodules. **Single level by default**; pass `-R` to walk top-down
   through every registered submodule.
 - **`flatten`** — fold nested git repos into the outer repo's history as
-  plain tracked content. **Three equal modes**, one per nested repo,
-  differing only in what happens to its git dir: **`--merge`** (stays live
-  in place, or is deleted), **`--sidecar`** (relocated into a
+  plain tracked content. **Three modes**, one per nested repo, differing only
+  in what happens to its git dir: **`--merge`** (the `.git` is **DELETED** —
+  ⚠️ history NOT kept, irreversible), **`--sidecar`** (relocated into a
   self-contained `.git.real` capsule — portable, full history preserved,
   but no longer live/IDE-usable), or **`--zip`** (archived into a compact
-  `.git.zip`/`.git.real.zip` and removed). Any mode can be forced in bulk
-  or on a single path; see [`flatten`](#flatten--merge-nested-repos-into-the-outer-repo-as-content) below.
+  `.git.zip`/`.git.real.zip` and removed). A bare `go` with no mode is refused.
+  See [`flatten`](#flatten--merge-nested-repos-into-the-outer-repo-as-content) below.
 - **`unflatten`** — the reverse: rebuild a live `.git` at a nested path.
   `--sidecar` and `--zip` are exact, lossless restores; `--merge` is a
   best-effort reconstruction from this repo's own commit history (via `git
   subtree split`) for a path whose original `.git` was deleted. Auto-detects
   the mode per path. See [`unflatten`](#unflatten--rebuild-a-live-git) below.
+- **`shadow` / `unshadow`** — content-mirror: keep a nested repo's **live
+  `.git`** (so the IDE works) *and* have the parent track its files too;
+  `unshadow` reverses it.
+- **`unsm`** — the reverse of `sm`: de-register a submodule back to a plain
+  `raw-nested-git` (de-absorbing its gitdir; the repo stays live, history
+  intact). `sm <path>` and `unsm <path>` both act on the path's **immediate
+  enclosing repo**.
+- **`ignore` / `unignore`** — toggle a generic "leave this nested repo alone"
+  marker (`.git/my-git.ignore`) honoured by every subcommand.
 
 The split between "always recursive" (`st`) and "opt-in recursive"
 (`mc` / `sm`) mirrors git itself: a super-repo's index only records its
@@ -151,7 +160,9 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
 | `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push; `-R` = bottom-up walk               |
 | `pull`          | `pl`, `fetch`  | opt-in `-R` | Fetch origin + fast-forward clean+behind repos; `fetch` = `pull --fetch-only`   |
-| `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos; `-R` = top-down walk                      |
+| `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos as submodules; `-R` = top-down walk. A PATH registers into the repo that **directly encloses** it (its immediate parent), not the toplevel you run from |
+| `unsm`          | `unsub`        | whole-tree | Reverse of `sm`: de-register a submodule back to a `raw-nested-git` — drops `.gitmodules`+gitlink, **de-absorbs** its gitdir (`.git/modules/<name>` → `<path>/.git`); the repo stays live, history intact |
+| `ignore` / `unignore` | —        | whole-tree (`unignore`); PATH (`ignore`) | Toggle the **generic** `.git/my-git.ignore` marker — honoured by every subcommand (`st` won't descend, `sm` won't register, `mc` won't commit, `flatten` won't touch) |
 | `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`. Settles the whole tree in one command.         |
 | `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
 | `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir: `--merge` (kept live/deleted), `--sidecar` (`.git.real`, history preserved), `--zip` (archived to `.git.zip`/`.git.real.zip`); `-i`/PATH for per-item or forced-mode control |
@@ -217,12 +228,27 @@ Without `-i`, `mc go` runs straight through without any prompts —
 commit message is the auto-generated template, and every actionable
 repo is processed.
 
-### Ignore marker (respected by both `sm` and `mc`)
+### Ignore marker (generic — honoured by every subcommand)
 
-A nested repo that carries `.git/my-git.ignore` is treated
-as **leave alone** by both subcommands. `mc` silently skips such repos
-(counted as `ignored=N` in the summary). Pass `--force` to override the
-markers for a single run — identical semantics to `sm --force`.
+A nested repo that carries `.git/my-git.ignore` is treated as **leave this
+repo alone** across all of my-git — it's **not** an `sm`-only thing:
+
+- `st` does **not descend** into its subtree,
+- `sm` does **not register** it as a submodule,
+- `mc` silently **skips** it (counted as `ignored=N` in the summary),
+- `flatten` does **not touch** it.
+
+Manage it with the top-level verbs — no hand-editing `.git/`:
+
+```sh
+my-git ignore   <path>       # analyze; add 'go' to write the marker
+my-git unignore              # whole-tree: remove markers everywhere (analyze/go)
+my-git sm --list-ignored     # audit which repos carry it
+```
+
+Pass `--force` to `sm`/`mc`/`flatten` to override the markers for a single run.
+(The on-disk file was historically `my-git-submodules.ignore`; it was renamed to
+`my-git.ignore` — a clean break, no dual-name lookup.)
 
 ### End-of-run summary
 
@@ -380,13 +406,17 @@ my-git flatten go <path> --sidecar   # scope to just ONE repo/sidecar (also --me
 nested repo's files become tracked content in the parent — and differ
 only in what happens to its git dir:
 
-- **`--merge`** — the `.git` is DELETED (a `.git.merged` snapshot is
-  written first — branch, commit, remote, full config, and any `.git*`
-  convention files like `.gitignore`/`.gitattributes`/`.gitmodules`,
-  captured then removed, since they'd otherwise silently govern a git
-  identity that no longer exists here) — or, under bare `go` for an
-  embedded repo, left live in place. my-git does **not** preserve the
-  pre-merge history (only what the parent's own commits captured survives).
+- **`--merge`** — ⚠️ **the `.git` is permanently DELETED and its history is
+  NOT preserved.** A `.git.merged` *text* snapshot is written first (branch,
+  commit, remote, full config, and any `.git*` convention files like
+  `.gitignore`/`.gitattributes`/`.gitmodules`, captured then removed) — but there
+  is **no object database** behind it. `unflatten --merge` can only *partly*
+  rebuild history via `git subtree split` (forward from the merge, out of the
+  parent's own commits) — it cannot resurrect pre-merge history, and for some
+  repos it reconstructs nothing. If the repo has a remote its history still lives
+  on origin; otherwise **`--merge` is destructive and irreversible**. Prefer
+  `--sidecar` (keeps full history) or `--zip` unless you truly want the history
+  gone.
 - **`--sidecar`** — the `.git` is RELOCATED (not deleted) into a
   self-contained `.git.real` capsule that keeps its FULL history, plus a
   `.git.real.status` snapshot so `unflatten --sidecar` restores the exact
@@ -399,9 +429,10 @@ only in what happens to its git dir:
   dir too. Same operation as the `gz` shell helper, ported into my-git so
   it needs no shell function.
 
-Each reverses with its `unflatten` counterpart. Bare `go` (no forced mode)
-decides `--sidecar` vs `--merge` per item for the nested live repos it
-finds — never `--zip`, which stays opt-in.
+Each reverses with its `unflatten` counterpart. A bare `go` with **no mode is
+refused** — flatten always disposes of each `.git`, so you must state how
+(`--sidecar` / `--merge` / `--zip`, or `-i` to choose per repo). `--zip` also
+stays out of the `-i` "sidecar vs merge" default; it's opt-in only.
 
 A path that's **already a sidecar** can be converted directly —
 `flatten <path> --merge` merges it, `flatten <path> --zip` archives it —
@@ -646,12 +677,17 @@ Default is a one-line-per-repo ascii-art tree. Each line renders the repo's
 branch position in the tree followed by its state summary:
 
 ```text
-/LINKS/global                            CLEAN :))
-├── src [registered-sm]                  DIRTY (18)  [M:1 ??:17]
-│   ├── py/my-plex [registered-sm]       CLEAN :))
-│   └── sh/my-git [raw-nested-git]       DIRTY (2)  [M:2]
-└── etc [registered-sm]                  CLEAN, ahead 1
+/LINKS/global                          ↑  CLEAN :))
+├── src [registered-sm]                ↑  DIRTY (18)  [M:1 ??:17]
+│   ├── py/my-plex [registered-sm]     ↑  CLEAN :))
+│   └── sh/my-git [raw-nested-git]     ⌂  DIRTY (2)  [M:2]
+└── etc [registered-sm]                ↑  CLEAN, ahead 1
 ```
+
+The column between the `[tag]` and the state is the **flag**: `⌂` = local-only
+(no remote configured — nothing to publish to), `↑` = has a remote (publishable),
+blank = n/a (a `[zipped]`/stale entry). The end-of-run **Summary** tallies them,
+e.g. `⌂ local-only(no remote)=15  ↑ has-remote(publishable)=44  ignored(...)=9`.
 
 States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
 `DIVERGED (ahead X, behind Y)`, `CLEAN (no remote for B)`,
@@ -711,6 +747,56 @@ registration: DIRTY just means uncommitted file changes, handled by
 
 `my-git -V st` falls back to the per-node porcelain listing (legacy form).
 
+## Git concepts & caveats my-git works around
+
+These are the git behaviours that shape my-git's design — worth knowing before
+you touch the internals:
+
+- **Embedded repos become gitlinks.** `git add` on a path that contains a nested
+  `.git` records a **gitlink** (mode `160000`) — a single commit SHA, *not* the
+  files — and prints its `adding embedded git repository … hint:` advice. There is
+  no `git add` flag to stage a nested repo's *files* as plain content. my-git's
+  content-adding steps pass `-c advice.addEmbeddedRepo=false` to silence the hint
+  (the nesting is deliberate), and `flatten` is the operation that actually
+  disposes of the nested `.git` so its files *can* be tracked.
+
+- **Submodules belong to the repo that DIRECTLY encloses them.** A gitlink lives
+  in the index of the nearest enclosing repo, and its history is normally
+  *absorbed* into that parent's `.git/modules/<name>/`, with the worktree `.git`
+  reduced to a `gitdir: …` **pointer file**. `sm`/`unsm` therefore both operate on
+  a path's immediate enclosing repo (not a distant ancestor). `unsm` **de-absorbs**
+  — moves `.git/modules/<name>` back to `<path>/.git` and clears the stale
+  `core.worktree` — turning it back into a standalone repo.
+
+- **A real `.git` DIR at the worktree wins.** If `<path>/.git` is a directory (not
+  a pointer file), git uses it — `git rev-parse --absolute-git-dir` resolves there,
+  regardless of any leftover `.git/modules/<name>` copy. So `unsm` needn't fear an
+  "ambiguous" both-exist state (unlike `flatten`, which *relocates* a gitdir).
+
+- **`git commit -- <path>` uses `--only` semantics** — it commits the *worktree*
+  state of that path. For a path that is now a **live nested repo**, that would
+  **re-add it as a gitlink**, undoing a `git rm --cached`. So teardown steps
+  (`unshadow`, `unsm`) commit the **index as-is** (no pathspec), after guarding
+  that no unrelated changes were pre-staged.
+
+- **`flatten --merge` deletes history.** The `.git.merged` file is a *text*
+  snapshot, not an object database. Only `--sidecar`/`--zip` are lossless.
+
+- **Editing a broken repo's config:** use `git config --file <gitdir>/config …`,
+  **never** `git -C <path> config …` — the latter tries to `chdir` into a stale
+  `core.worktree` first and fails (`cannot chdir to '../../…'`).
+
+- **Ownership / dubious-ownership.** git run by user A on a repo owned by B refuses
+  (`detected dubious ownership`) or can't read tracked files owned by C
+  (`Permission denied`). my-git runs each repo's git **as that repo's `.git`
+  owner** (`run_as_owner_capture`); if a *tracked* file has a different owner the
+  read silently returned empty → it **under-reported** (real `[registered-sm]`
+  repos shown as `[raw-nested-git]`). That now emits a loud
+  `WARN: mixed ownership …`. **Keep each repo internally single-owner.**
+
+- **`safe.directory`.** Reading a differently-owned repo one-off:
+  `git -c safe.directory='*' -C <repo> …`.
+
 ## Examples
 
 ```sh
@@ -744,10 +830,10 @@ my-git -DD st /LINKS/global/src
 # Preview what flatten would merge in (no writes):
 my-git flatten
 
-# Merge in embedded nested repos, keeping each one's .git usable in place:
-my-git flatten go
+# NOTE: a bare 'flatten go' is refused — you must pick a mode below, because
+# flatten always disposes of each nested .git.
 
-# Convert every registered submodule to a self-contained .git.real, one at a time:
+# Choose sidecar / merge / zip per nested repo, one at a time:
 my-git flatten go -i
 
 # Sidecar every nested repo in bulk, submodules included, no prompting:
@@ -764,6 +850,15 @@ my-git unflatten go py/my-plex --sidecar
 
 # Reconstruct a merged (git-deleted) path's history from this repo's own commits:
 my-git unflatten go some/old/kid --merge
+
+# De-register a submodule back to a raw-nested-git (keeps it LIVE, history intact):
+my-git unsm go src/py/my-nimbie/,archive/nimbiestatemachine
+
+# Leave a nested repo alone — st won't descend, sm won't register, mc/flatten skip it:
+my-git ignore go some/vendored/repo
+
+# Un-ignore every marked repo in the tree:
+my-git unignore go
 ```
 
 ## Scope resolution (st / mc / audit)
