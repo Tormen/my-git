@@ -15209,6 +15209,7 @@ _my-git() {
     'unflatten:Reverse of flatten — rebuild a live .git (alias: unfl)'
     'shadow:Keep nested .git LIVE and also track its files in the parent; content-mirror (alias: sh)'
     'unshadow:Reverse of shadow — parent stops tracking; .git stays live (alias: unsh)'
+    'purge:Remove a path'\''s content AND history from a repo — REWRITES HISTORY'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
     'audit:Read-only health checks (--claude and/or --sidecar)'
     'repair:Fix sidecar setup problems (--sidecar; go to apply)'
@@ -15316,7 +15317,7 @@ _my-git() {
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
             '(--sidecar --merge --zip)--sidecar[Exact, lossless restore from a GIT_SIDECAR_DIRNAME sidecar]' \
-            '(--sidecar --merge --zip)--merge[Best-effort reconstruction via git subtree split, for a merged (git-deleted) path]' \
+            '(--sidecar --merge --zip)--merge[Restore a merged path from the history preserved in this repo]' \
             '(--sidecar --merge --zip)--zip[Restore a git dir archived by flatten --zip (.git.zip / GIT_SIDECAR_DIRNAME.zip)]' \
             '(-k --keep)'{-k,--keep}'[--zip: keep the .zip after restoring]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
@@ -15335,6 +15336,15 @@ _my-git() {
           _arguments \
             $global_opts \
             '(-i --interactive)'{-i,--interactive}'[Per repo: [Y]es/[s]kip/[a]bort/[g]o]' \
+            '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
+            '1: :(go)' \
+            '*: :_directories'
+          ;;
+        purge)
+          _arguments \
+            $global_opts \
+            '--from[Repo whose history to rewrite (required when several qualify)]:repo:_directories' \
+            '--force[Purge even when the content exists nowhere else — DESTROYS it]' \
             '(-n -T --try --dry --dry-run)'{-n,-T,--try,--dry,--dry-run}'[Analyze only, no writes]' \
             '1: :(go)' \
             '*: :_directories'
