@@ -6785,7 +6785,16 @@ cmd_unshadow() {
     # is not that someone, 'git rm --cached' matches nothing and reports a
     # bare failure that explains none of it -- which is precisely what a
     # tree looks like after the mirroring repo stopped tracking the path.
-    if [ -z "$(git ls-files -- "$_p" 2>/dev/null | head -n 1)" ]; then
+    # A 160000 entry here is a SUBMODULE REGISTRATION, never a mirror.
+    # 'git rm --cached' on it would drop the gitlink and leave .gitmodules
+    # pointing at nothing -- deregistering a submodule under a command that
+    # promises "no history is affected". unshadow untracks CONTENT only.
+    if [ "$(git ls-files -s -- "$_p" 2>/dev/null | awk '{print $1; exit}')" = 160000 ]; then
+      _ush_fail=$((_ush_fail + 1))
+      log_fail "unshadow: $_p — $_ush_top registers it as a SUBMODULE (gitlink), it is not mirroring its files. Refusing: untracking that would deregister the submodule. Remove the stale marker by hand, or de-register with:  $US unsm $_p"
+      continue
+    fi
+    if [ -z "$(git ls-files -s -- "$_p" 2>/dev/null | awk '$1 != 160000 { print; exit }')" ]; then
       _ush_owner=$(tracking_repo_of "$_ush_top/$_p")
       if [ -n "$_ush_owner" ]; then
         _ush_fail=$((_ush_fail + 1))
@@ -9496,6 +9505,17 @@ _sm_is_tracked_in_index() {
   git ls-files --error-unmatch -- "$1" >/dev/null 2>&1
 }
 
+# _sm_is_gitlink_in_index <path>
+#   0 when the index holds <path> as a 160000 GITLINK -- the entry a real
+#   submodule has. A .gitmodules entry alone proves nothing: 'shadow' and
+#   'flatten' stage a nested repo's FILES with 'git add -f', which replaces
+#   the gitlink with ordinary content while .gitmodules keeps its entry.
+#   The result looks registered to anything that only reads .gitmodules,
+#   but git no longer treats it as a submodule at all.
+_sm_is_gitlink_in_index() {
+  [ "$(git ls-files -s -- "$1" 2>/dev/null | awk 'BEGIN{FS=" "} {print $1; exit}')" = 160000 ]
+}
+
 _sm_enclosing_submodule() {
   # Returns the longest path P (if any) such that $1 lives under P AND
   # P itself is a nested-repo boundary — checked two ways:
@@ -10564,6 +10584,7 @@ _CS_EOF
   _sm_total=$(wc -l < "$_sm_tmpfile" | tr -d ' ')
 
   _sm_c_registered=0; _sm_c_ready=0; _sm_c_need_untrack=0; _sm_c_no_url=0; _sm_c_dirty=0
+  _sm_c_broken_link=0   # .gitmodules entry whose index entry is NOT a gitlink
   _sm_c_prompt=0; _sm_c_nested=0; _sm_c_ignored=0; _sm_c_moved=0; _sm_c_ignored_mismatch=0
   _sm_c_stale=0
 
@@ -10671,7 +10692,19 @@ _CS_EOF
     status_kw=unknown
     plan_action=''
 
-    if [ "$registered" -eq 1 ]; then
+    # A .gitmodules entry whose index entry is NOT a gitlink is a BROKEN
+    # registration: git sees plain content there, so the submodule is not
+    # functioning as one. Report it instead of counting it as healthy.
+    if [ "$registered" -eq 1 ] && ! _sm_is_gitlink_in_index "$submod_path" \
+       && _sm_is_tracked_in_index "$submod_path"; then
+      status_kw='registered-not-gitlink'
+      _sm_c_broken_link=$((_sm_c_broken_link + 1))
+      # Repaired by exactly the route a never-registered path takes:
+      # untrack the content, then add it back as a gitlink. The
+      # .gitmodules entry is already correct, so only the index is wrong.
+      plan_action=add-with-untrack
+      printf '%s\t%s\t%s\n' "$plan_action" "$submod_path" "$url" >> "$_sm_plan"
+    elif [ "$registered" -eq 1 ]; then
       status_kw=registered
       _sm_c_registered=$((_sm_c_registered + 1))
     elif [ -n "$enc" ]; then
@@ -10739,6 +10772,8 @@ _CS_EOF
 
     case "$status_kw" in
       registered)       _status_short='OK';       _info='registered' ;;
+      registered-not-gitlink)
+                        _status_short='BROKEN';   _info='in .gitmodules but staged as CONTENT, not a gitlink' ;;
       nested)           _status_short='NESTED';   _info="parent=$enc" ;;
       ignored)          _status_short='IGNORED';  _info='marker' ;;
       ignored-mismatch) _status_short='CONFLICT'; _info="marker here, registered as $_ig_regpath" ;;
@@ -10782,6 +10817,9 @@ _CS_EOF
                        printf '    status       : CONFLICT — ignored here but registered at "%s"\n' "$_ig_regpath"
                        printf '    action       : sm go -i will prompt [U]pdate path / [R]emove marker\n' ;;
         ready)         printf '    status       : READY (will add)\n' ;;
+        registered-not-gitlink)
+                       printf '    index        : BROKEN registration -- .gitmodules lists it, but the index holds its FILES as content, not a 160000 gitlink. git does not treat it as a submodule.\n'
+                       printf '                   fix: %s sm go %s   (untrack the content, restore the gitlink)\n' "$US" "$submod_path" ;;
         ready-untrack) printf '    index        : TRACKED as plain files — needs untrack\n'
                        printf '    status       : READY (will untrack, then add)\n' ;;
         will-prompt)   printf '    status       : WILL PROMPT for URL (interactive)\n' ;;
@@ -10800,7 +10838,7 @@ _CS_EOF
   done < "$_sm_tmpfile"
 
   # ─── Summary ───
-  _sm_to_do=$((_sm_c_ready + _sm_c_need_untrack + _sm_c_prompt + _sm_c_moved + _sm_c_ignored_mismatch + _sm_c_stale))
+  _sm_to_do=$((_sm_c_ready + _sm_c_need_untrack + _sm_c_prompt + _sm_c_moved + _sm_c_ignored_mismatch + _sm_c_stale + _sm_c_broken_link))
 
   if [ "$_sm_verbose" -eq 1 ] || [ "$_sm_mode" != go ]; then
     echo
@@ -10808,6 +10846,8 @@ _CS_EOF
     echo "Summary"
     echo "============================================================"
     printf '  already registered       : %s\n' "$_sm_c_registered"
+    [ "$_sm_c_broken_link" -gt 0 ] && \
+      printf '  %sBROKEN registration      : %s   (.gitmodules entry, but content in the index instead of a gitlink)%s\n' "$C_RED$C_BOLD" "$_sm_c_broken_link" "$C_RESET"
     printf '  ready to add             : %s\n' "$_sm_c_ready"
     printf '  ready (needs untrack)    : %s\n' "$_sm_c_need_untrack"
     printf '  missing origin URL       : %s\n' "$_sm_c_no_url"
@@ -13443,6 +13483,67 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_sm_detects_and_repairs_a_registration_without_a_gitlink() {
+    # Found on the real tree: py/my-plex was listed in .gitmodules AND had
+    # 57 of its files staged as CONTENT, with no 160000 gitlink anywhere.
+    # 'shadow'/'flatten' produce that -- they stage a nested repo's files
+    # over the gitlink -- and both st and sm read only .gitmodules, so both
+    # called it healthy while git no longer treated it as a submodule.
+    _rt_repo_file kid_o a.md
+    _rt_repo par
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd par || return 1
+    git -c protocol.file.allow=always submodule add -q ../kid_o kid >/dev/null 2>&1
+    git commit -q -m "kid as a submodule"
+    # Damage it exactly the way shadow does: .git aside, stage files, restore.
+    _rt_hold="$PWD/../kidgit.hold"
+    mv kid/.git "$_rt_hold"
+    git rm --cached -q kid >/dev/null 2>&1
+    git add -f kid >/dev/null 2>&1
+    mv "$_rt_hold" kid/.git
+    git commit -q -m "damaged: content staged over the gitlink"
+    [ -z "$(git ls-files -s -- kid | awk '$1 == 160000 { print }')" ] \
+      || { _rt_fail "setup: kid should NOT be a gitlink any more"; return 1; }
+
+    _rt_ok "sm analyze" _rt_my_git sm kid || return 1
+    _rt_contains "reports the broken registration" "$_rt_out" "BROKEN" || return 1
+    _rt_not_contains "does NOT call it healthy" "$_rt_out" "OK       " || return 1
+
+    _rt_ok "sm go repairs it" _rt_my_git sm go kid || return 1
+    [ "$(git ls-files -s -- kid | awk '{print $1}')" = 160000 ] \
+      || { _rt_fail "the gitlink was not restored"; return 1; }
+    [ "$(git ls-files -- kid | wc -l | tr -d ' ')" = 1 ] \
+      || { _rt_fail "content entries were left behind alongside the gitlink"; return 1; }
+    _rt_exists "the worktree files are untouched" kid/a.md || return 1
+    [ -n "$(git config -f .gitmodules --get submodule.kid.url)" ] \
+      || { _rt_fail ".gitmodules entry was lost"; return 1; }
+    return 0
+  }
+
+  test_unshadow_refuses_to_deregister_a_submodule() {
+    # DESTRUCTIVE-PATH GUARD. Run from INSIDE the repo holding the gitlink,
+    # unshadow used to 'git rm --cached' it: the gitlink vanished from the
+    # index while .gitmodules kept the entry, silently turning a working
+    # submodule into a stale registration -- under a command whose own
+    # banner promises "no history is affected". unshadow untracks CONTENT.
+    _rt_repo_file kid_o a.md
+    _rt_repo mid
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd mid || return 1
+    git -c protocol.file.allow=always submodule add -q ../kid_o kid >/dev/null 2>&1
+    git commit -q -m "kid as a submodule"
+    [ "$(git ls-files -s -- kid | awk '{print $1}')" = 160000 ] \
+      || { _rt_fail "setup: kid should be a gitlink"; return 1; }
+    printf 'shadowed-into-repo: /somewhere\n' > kid/.git.shadow.status
+    _rt_my_git unshadow go >"$_rt_out" 2>"$_rt_err"
+    # log_fail writes to stderr, so assert there.
+    _rt_contains "refuses, naming the submodule" "$_rt_err" "registers it as a SUBMODULE" || return 1
+    _rt_contains "points at unsm" "$_rt_err" "unsm" || return 1
+    [ "$(git ls-files -s -- kid | awk '{print $1}')" = 160000 ] \
+      || { _rt_fail "the submodule was DEREGISTERED — the exact damage this guards"; return 1; }
+    return 0
+  }
+
   test_a_gitlink_is_not_a_content_mirror() {
     # A 160000 gitlink is a POINTER to another repo -- the parent stores one
     # commit id and none of the files. Treating it as "this repo tracks the
@@ -15095,7 +15196,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
