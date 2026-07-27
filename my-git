@@ -6436,7 +6436,13 @@ _shadow_hook_block() {
 # Managed by 'my-git shadow'. For each shadowed repo (a dir with a live .git
 # and a .git.shadow.status marker) that THIS commit stages content into, bump
 # 'last-shadowed' to now and re-stage the marker so it rides in this commit.
-_mgs_top=$(git rev-parse --show-toplevel 2>/dev/null)
+# my-git's OWN shadow commit just wrote these markers with a current
+# timestamp, so bumping them again is redundant -- and actively harmful:
+# that commit uses a pathspec, so anything this hook stages survives it and
+# leaves the index permanently dirty, which then blocks 'flatten' and any
+# other command that insists on a clean index.
+_mgs_top=""
+[ -z "${MY_GIT_SHADOW_SELF_COMMIT:-}" ] && _mgs_top=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -n "$_mgs_top" ]; then
   _mgs_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   find "$_mgs_top" -type f -name .git.shadow.status 2>/dev/null | while IFS= read -r _mgs_f; do
@@ -6649,8 +6655,10 @@ cmd_shadow() {
     fi
   done
   if [ -n "$_sh_commit" ] && ! eval "run git diff --cached --quiet -- $_sh_commit" 2>/dev/null; then
+    MY_GIT_SHADOW_SELF_COMMIT=1 \
     eval "run git commit -q -m \"my-git shadow: content-mirror into the parent (live .git kept)\" -- $_sh_commit" >/dev/null 2>&1 \
       || log_warn "shadow: commit failed — staged content left for manual commit"
+    unset MY_GIT_SHADOW_SELF_COMMIT
   fi
   # Install the parent pre-commit hook that keeps 'last-shadowed' current at
   # commit time (idempotent; never clobbers a foreign hook).
@@ -9232,7 +9240,12 @@ _sm_resolve_gitdir() {
   if [ -d "$_gp" ]; then
     printf '%s' "$_gp"
   else
-    _gd=$(sed -n 's/^gitdir: //p' "$_gp")
+    # A registered submodule can sit on disk with NO .git at all -- never
+    # initialised, or its gitdir removed. That is a legitimate state, not an
+    # error, but reading the gitfile blind made sed print
+    # "No such file or directory" to stderr on every single run.
+    [ -f "$_gp" ] || return 1
+    _gd=$(sed -n 's/^gitdir: //p' "$_gp" 2>/dev/null)
     case "$_gd" in
       /*) printf '%s' "$_gd" ;;
       *)  printf '%s/%s' "$_sp" "$_gd" ;;
