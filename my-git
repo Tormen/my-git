@@ -7817,9 +7817,17 @@ cmd_claude_check() {
             fi
             [ "$_cc_cl" = 'REAL-DIR' ] && _cc_note="$_cc_note; not a symlink into the central repo"
           elif grep -Eq '^/?\.claude/?$' "$_node/.gitignore" 2>/dev/null; then
-            # The exact damage this tool used to cause: an ignore line in a
-            # repo that has no .claude at all, often someone else's repo.
-            _cc_note='.gitignore ignores .claude/ but there is NONE here'
+            # An ignore line with no .claude beside it is USUALLY the damage
+            # this tool once caused -- but '.claude/' in a .gitignore matches
+            # at ANY depth, and a parent that mirrors nested repos (shadow)
+            # relies on it to keep THEIR .claude dirs out of its index. src
+            # has no .claude at its root yet shields six nested ones; calling
+            # that line removable nearly got a load-bearing line deleted.
+            if [ -n "$(find "$_node" -name .claude -not -path '*/.git/*' -not -path '*/.git.real/*' -print 2>/dev/null | head -n 1)" ]; then
+              _cc_note='ok (no .claude at the root, but the line shields NESTED .claude dirs)'
+            else
+              _cc_note='.gitignore ignores .claude/ but there is NONE here (root or nested)'
+            fi
           fi
           printf '%-46s %-9s %-11s %s\n' "$_cc_rel" "$_cc_cl" "$_cc_pub" "$_cc_note"
           # NOTHING is changed here. An audit reports; it does not enforce.
@@ -13882,6 +13890,13 @@ _RT_STALE_CONF_EOF
     _rt_contains "has a header" "$_rt_out" ".claude" || return 1
     _rt_contains "names the PUBLISHED column" "$_rt_out" "PUBLISHED" || return 1
     _rt_contains "reports the nested repo, not just the root" "$_rt_out" "pub" || return 1
+    # A parent with NO root .claude whose ignore line shields a NESTED
+    # .claude (src's exact shape) must not be advised to remove the line.
+    printf '.claude/\n' > .gitignore
+    _rt_ok "claude-check with a shielding parent line" _rt_my_git claude-check || return 1
+    _rt_contains "recognises the shield" "$_rt_out" "shields NESTED" || return 1
+    _rt_not_contains "must not call the parent line removable" "$_rt_out" "NONE here (root or nested)" || return 1
+    rm -f .gitignore
     # An audit must not change anything -- not even the thing it is auditing.
     _rt_before=$(git -C pub rev-parse HEAD)
     [ -f pub/.gitignore ] && _rt_gi_before=$(cat pub/.gitignore) || _rt_gi_before=''
