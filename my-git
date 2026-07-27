@@ -7579,10 +7579,24 @@ ensure_claude_setup() {
       return 0 ;;
   esac
 
-  # Always ensure .gitignore entry.
-  ensure_claude_gitignore "$_r" || { log_error "$_r: could not update .gitignore"; return 1; }
-
   _cl=$_r/.claude
+
+  # Only a repo that ACTUALLY HAS a .claude gets the ignore line.
+  #
+  # This used to run unconditionally, and 'mc' runs these checks before every
+  # commit -- so a single 'mc -R' wrote '.claude/' into the .gitignore of
+  # every repo in the tree and committed it, including third-party clones
+  # that have no .claude and are not ours to change. Eleven repos sat one
+  # unpushable commit ahead of their upstreams for months because of it.
+  #
+  # The existence of .claude is also the ownership test in practice: nobody
+  # sets one up in a repo they do not work in.
+  if [ -e "$_cl" ]; then
+    ensure_claude_gitignore "$_r" || { log_error "$_r: could not update .gitignore"; return 1; }
+  else
+    log_dbg_med "claude-check: $_r has no .claude — not touching its .gitignore"
+    return 0
+  fi
   if [ -L "$_cl" ]; then
     _tgt=$(readlink "$_cl")
     # Resolve target to real absolute path (follows symlinks + resolves '..').
@@ -7699,25 +7713,63 @@ cmd_claude_check() {
   # shellcheck disable=SC2086
   eval "set -- $_args"
 
-  # Audit-only: force DRY_RUN by default. To actually apply, masscommits does it.
-  # claude-check is READ-ONLY unless user passes -i or explicit --apply.
-  _applied=0
-  for _a in "$@"; do
-    case "$_a" in --apply) _applied=1 ;; esac
-  done
-  [ "$_applied" = 1 ] || DRY_RUN=1
+  # READ-ONLY, unconditionally. This is an audit: it answers "what is the
+  # state of the tree", never "make it so". Enforcement belongs to 'mc',
+  # which is already writing to the repo it checks.
+  DRY_RUN=1
 
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to audit"; exit 1; }
 
+  # An audit that prints nothing when all is well tells you nothing: this
+  # was silent on a whole tree, so 'audit --claude' looked broken. Report a
+  # line per repo with the two facts that decide what should happen to it --
+  # does it HAVE a .claude, and is it PUBLISHED (does it have a remote).
+  printf '%-46s %-9s %-11s %s\n' 'REPO' '.claude' 'PUBLISHED' 'NOTE'
   printf '%s\n' "$_roots" | while IFS= read -r _root; do
     [ -n "$_root" ] || continue
-    _nodes=$(walk_submodules "$_root")
+    # walk_submodules only sees REGISTERED submodules. Once a tree uses
+    # shadowing (live .git kept, files mirrored) there are none, and this
+    # audit reported a single line for a tree of 20+ repos. Every nested
+    # repo has a .claude question to answer, registered or not.
+    _nodes=$(printf '%s\n%s\n' "$_root" "$(list_unregistered_nested "$_root" 2>/dev/null | while IFS= read -r _n; do
+               [ -n "$_n" ] && printf '%s/%s\n' "$_root" "$_n"; done)" \
+             | grep -v '^$' | sort -u)
     # Top-down reading order.
     printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
       | while IFS= read -r _node; do
           [ -n "$_node" ] || continue
-          ensure_claude_setup "$_node" || true
+          _cc_rel=${_node#"$_root"/}; [ "$_cc_rel" = "$_node" ] && _cc_rel=$(basename "$_node")
+          # .claude: symlink into the central repo is the convention; a real
+          # directory is the thing claude-check exists to migrate.
+          if [ -L "$_node/.claude" ]; then _cc_cl='symlink'
+          elif [ -d "$_node/.claude" ]; then _cc_cl='REAL-DIR'
+          elif [ -e "$_node/.claude" ]; then _cc_cl='file?'
+          else _cc_cl='-'; fi
+          _cc_url=$(run_as_owner_capture "$_node" git config --get remote.origin.url 2>/dev/null)
+          if [ -n "$_cc_url" ]; then
+            _cc_pub=$(basename "$_cc_url" .git)
+          else
+            _cc_pub='- (local)'
+          fi
+          # The ignore line belongs here IFF there is a .claude to ignore.
+          _cc_note=''
+          if [ "$_cc_cl" != '-' ]; then
+            if grep -Eq '^/?\.claude/?$' "$_node/.gitignore" 2>/dev/null; then
+              _cc_note='ok'
+            else
+              _cc_note='.gitignore MISSING .claude/'
+            fi
+            [ "$_cc_cl" = 'REAL-DIR' ] && _cc_note="$_cc_note; not a symlink into the central repo"
+          elif grep -Eq '^/?\.claude/?$' "$_node/.gitignore" 2>/dev/null; then
+            # The exact damage this tool used to cause: an ignore line in a
+            # repo that has no .claude at all, often someone else's repo.
+            _cc_note='.gitignore ignores .claude/ but there is NONE here'
+          fi
+          printf '%-46s %-9s %-11s %s\n' "$_cc_rel" "$_cc_cl" "$_cc_pub" "$_cc_note"
+          # NOTHING is changed here. An audit reports; it does not enforce.
+          # Enforcement lives in 'mc', which runs ensure_claude_setup before
+          # committing a repo it is already writing to.
         done
   done
 }
@@ -8838,19 +8890,27 @@ my-git claude-check
 usage: $US claude-check [--apply] [-i] [paths...]
 
 Audits each repo in scope to enforce the .claude-symlink convention:
-  1. .gitignore must contain '.claude/'               (auto-added on --apply)
+  1. .gitignore should contain '.claude/'   -- but ONLY for a repo that
+     actually HAS a .claude (see the note below)
   2. <repo>/.claude must be a symlink into \$CLAUDE_PROJECT_DIR_CENTRAL_REPO
   3. If it is a real dir:
      - settings.json present → HARD ERROR (manual split required)
      - no settings.json      → auto-migrate:
                                mv files → central, rmdir, create symlink
 
-Default is read-only (shows what WOULD happen). Pass --apply to commit
-changes. 'my-git mc' applies these same checks before each commit.
+This command is READ-ONLY. It reports one line per repo -- whether it has
+a .claude, whether it is published, and anything inconsistent -- and
+changes nothing. Enforcement happens in 'my-git mc', which runs the same
+checks on a repo it is already committing to.
+
+A repo only ever gets '.claude/' added to its .gitignore if it actually
+HAS a .claude. This check used to run unconditionally, so a single
+'mc -R' wrote that line into every repo in the tree -- including
+third-party clones with no .claude -- and committed it, leaving eleven
+repos one unpushable commit ahead of their upstreams.
 
 Options:
-  --apply            Actually make the changes (default: dry)
-  -i, --interactive  Prompt before each migration
+  -i, --interactive  Prompt before each migration (in 'mc')
   -V, -VV, -D, -DD   Verbosity / debug
   --help
 
@@ -13683,6 +13743,70 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_claude_check_leaves_repos_without_a_claude_alone() {
+    # ROOT CAUSE of eleven repos sitting one unpushable commit ahead of their
+    # upstreams for months: ensure_claude_setup ALWAYS appended '.claude/' to
+    # .gitignore, and 'mc' runs these checks before every commit -- so one
+    # 'mc -R' wrote that line into every repo in the tree, including
+    # third-party clones with no .claude, and committed it.
+    # A repo only gets the line if it actually HAS a .claude. That test also
+    # serves as the ownership test: nobody sets one up in a stranger's repo.
+    _rt_repo_file kid_o a.md
+    _rt_repo par
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd par && git clone -q ../kid_o stranger >/dev/null 2>&1
+      git clone -q ../kid_o mine     >/dev/null 2>&1 )
+    cd par || return 1
+    mkdir -p mine/.claude && echo '{}' > mine/.claude/settings.local.json
+    # The harness config disables the .claude audit so tests never touch the
+    # real setup; this test is ABOUT that audit, so switch it on and point it
+    # at a scratch central repo.
+    mkdir -p "$PWD/central"
+    printf 'CHECK_CLAUDE_SETUP=1\nCLAUDE_PROJECT_DIR_CENTRAL_REPO=%s\n' "$PWD/central" >> "$_rt_conf_path"
+
+    # Enforcement lives in 'mc' now -- 'claude-check' is a pure audit. Run it
+    # inside each repo: even 'mc -R' walks only REGISTERED submodules, so it
+    # never descends into a shadowed or plain nested repo.
+    ( cd stranger && _rt_my_git mc go >/dev/null 2>&1 )
+    ( cd mine     && _rt_my_git mc go >/dev/null 2>&1 )
+
+    # The stranger's repo must be untouched.
+    if [ -f stranger/.gitignore ] && grep -Eq '^/?\.claude/?$' stranger/.gitignore; then
+      _rt_fail "wrote .claude/ into a repo that has no .claude"; return 1
+    fi
+    # ...while a repo that HAS one still gets it.
+    grep -Eq '^/?\.claude/?$' mine/.gitignore 2>/dev/null \
+      || { _rt_fail "a repo WITH a .claude did not get the ignore line"; return 1; }
+    return 0
+  }
+
+  test_claude_audit_reports_claude_and_published_state() {
+    # An audit that prints nothing when all is well tells you nothing -- this
+    # one was silent over a whole tree, so 'audit --claude' looked broken.
+    # And it walked only REGISTERED submodules, so a shadowed tree reported a
+    # single line for 20+ repos.
+    _rt_repo_file kid_o a.md
+    _rt_repo par
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd par && git clone -q ../kid_o pub >/dev/null 2>&1 )
+    cd par || return 1
+    mkdir -p pub/.claude
+    _rt_ok "claude-check (read-only)" _rt_my_git claude-check || return 1
+    _rt_contains "has a header" "$_rt_out" ".claude" || return 1
+    _rt_contains "names the PUBLISHED column" "$_rt_out" "PUBLISHED" || return 1
+    _rt_contains "reports the nested repo, not just the root" "$_rt_out" "pub" || return 1
+    # An audit must not change anything -- not even the thing it is auditing.
+    _rt_before=$(git -C pub rev-parse HEAD)
+    [ -f pub/.gitignore ] && _rt_gi_before=$(cat pub/.gitignore) || _rt_gi_before=''
+    _rt_ok "claude-check again" _rt_my_git claude-check || return 1
+    [ "$(git -C pub rev-parse HEAD)" = "$_rt_before" ] \
+      || { _rt_fail "the audit COMMITTED something"; return 1; }
+    [ -f pub/.gitignore ] && _rt_gi_after=$(cat pub/.gitignore) || _rt_gi_after=''
+    [ "$_rt_gi_after" = "$_rt_gi_before" ] \
+      || { _rt_fail "the audit modified .gitignore — it must be read-only"; return 1; }
+    return 0
+  }
+
   test_st_rows_stay_short_and_status_files_carry_the_detail() {
     # The tree is meant to be READ. Long explanations inline made rows wrap
     # on a 154-column terminal, which turns a scannable tree into mush. The
@@ -15541,7 +15665,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_claude_check_leaves_repos_without_a_claude_alone test_claude_audit_reports_claude_and_published_state test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
