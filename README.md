@@ -22,17 +22,21 @@ by multiple users and nested several levels deep.
   through every registered submodule.
 - **`flatten`** — fold nested git repos into the outer repo's history as
   plain tracked content. **Three modes**, one per nested repo, differing only
-  in what happens to its git dir: **`--merge`** (the `.git` is **DELETED** —
-  ⚠️ history NOT kept, irreversible), **`--sidecar`** (relocated into a
-  self-contained `.git.real` capsule — portable, full history preserved,
-  but no longer live/IDE-usable), or **`--zip`** (archived into a compact
-  `.git.zip`/`.git.real.zip` and removed). A bare `go` with no mode is refused.
+  in where its history goes — **all three keep it**: **`--merge`** (the whole
+  object database is transplanted *into the outer repo*, refs pinned under
+  `refs/my-git/merged/<path>/`), **`--sidecar`** (relocated into a
+  self-contained `.git.real` capsule — portable, but no longer live/IDE-usable),
+  or **`--zip`** (archived into a compact `.git.zip`/`.git.real.zip`).
+  A bare `go` with no mode is refused.
   See [`flatten`](#flatten--merge-nested-repos-into-the-outer-repo-as-content) below.
 - **`unflatten`** — the reverse: rebuild a live `.git` at a nested path.
-  `--sidecar` and `--zip` are exact, lossless restores; `--merge` is a
-  best-effort reconstruction from this repo's own commit history (via `git
-  subtree split`) for a path whose original `.git` was deleted. Auto-detects
+  All three modes are exact restores — `--merge` hands back the full
+  pre-merge history, its branches, tags **and its remote**, so the restored
+  repo can push again. It falls back to a best-effort `git subtree split`
+  only for snapshots written before merge preserved history. Auto-detects
   the mode per path. See [`unflatten`](#unflatten--rebuild-a-live-git) below.
+- **`purge`** — remove a path's content **and its entire history** from a
+  repo; the only command that rewrites history, behind a typed `I am sure`.
 - **`shadow` / `unshadow`** — content-mirror: keep a nested repo's **live
   `.git`** (so the IDE works) *and* have the parent track its files too;
   `unshadow` reverses it.
@@ -48,6 +52,55 @@ The split between "always recursive" (`st`) and "opt-in recursive"
 own submodules' commit SHAs. What lives *inside* a submodule is that
 submodule's responsibility, not the super's. `-R` is the escape hatch
 for "I want ONE command to settle a whole nested tree."
+
+## The layout this was built for
+
+The tree that drove my-git's design, and the reasoning behind it:
+
+```
+/syst/global            root's repo, own server         ← submodule: src
+└── src                 'me' repo, own server (ada)     ← self-contained
+    ├── icfp            local-only  →  MERGED into src   (history lives in src)
+    ├── sh/trash        local-only  →  MERGED into src
+    ├── py/my-plex      GitHub      →  SHADOWED into src (own .git stays live)
+    ├── c/squashfuse    GitHub      →  SHADOWED into src
+    └── …
+```
+
+**Two rules decide what happens to every nested repo:**
+
+| the repo… | becomes | why |
+|---|---|---|
+| has **no remote** (`⌂` local-only) | **merged** into src | nowhere else to live; src becomes its home and keeps its history |
+| **has a remote** (`↑` publishable) | **shadowed** into src | src carries the files *and* the repo keeps its own `.git`, so work still pushes upstream |
+
+**Why shadow rather than submodules for the published ones.** The goal is that
+cloning `src` gives you *everything, immediately* — no `git submodule update`,
+no network round-trip to GitHub/GitLab, no empty directories. A submodule
+records only a gitlink, so a fresh clone is a skeleton until every third-party
+remote is reachable. Shadowing puts the files in src's own history **and**
+keeps each project's live `.git`, so you get both halves:
+
+- all your work is reflected **in src**, and
+- each project's work still goes to **its own remote**.
+
+The duplication is the point. It is only waste when both repos live on the
+same server — which is exactly why `src` is a plain **submodule** of `global`
+(both are on the same box, so a gitlink is enough) while the third-party
+projects inside src are **shadowed**.
+
+**Ownership follows the same split:** `global` is root's, `src` is `me`'s.
+Keeping them as separate repos means the boundary is enforced by git rather
+than by file permissions.
+
+`my-git st` shows which rule each path landed on, and names the other repo
+involved with `@<repo>`:
+
+```
+└── src                          [raw-nested-git]      ↑
+    ├── icfp                     [merged @src]         ⌂  (history preserved in /syst/global/src)
+    ├── py/my-plex               [shadowed @src]       ↑  CLEAN, ahead 1
+```
 
 ## Nested repos: archived / private / published
 
@@ -825,22 +878,30 @@ such a repo, so the label is not a simple registered/unregistered binary:
   Plain tracked content as far as `sm`/`mc` are concerned — purely
   informational, nothing to register or flatten. See the relocated-repo
   note under `flatten` above.
-- `[merged]` — directory carrying a `.git.merged` file (a former
-  submodule/embedded repo merged via `flatten --merge`, its `.git`
-  permanently deleted). Also purely informational; `my-git unflatten
-  <path> --merge` can attempt a best-effort reconstruction from this
-  repo's own commit history — see [`unflatten`](#unflatten--rebuild-a-live-git).
+- `[merged @R]` — directory carrying a `.git.merged` file (a former
+  submodule/embedded repo absorbed via `flatten --merge`). Its history is
+  **not** gone: the whole object database was transplanted into repo `R`,
+  with every ref pinned under `refs/my-git/merged/<path>/`. `my-git
+  unflatten <path> --merge` hands it back in full — branches, tags and its
+  remote. A snapshot written *before* merge preserved history says so
+  explicitly (`NO preserved history`), and can only be reconstructed
+  best-effort via `git subtree split` — see
+  [`unflatten`](#unflatten--rebuild-a-live-git).
 - `[zipped]` — directory whose git dir was archived via `flatten --zip`
   (a `.git.zip` / `.git.real.zip` beside the worktree, the live dir
   removed). Purely informational; restore it with `my-git unflatten
   <path> --zip`. (A live repo that merely keeps a `-k` backup zip is *not*
   marked `[zipped]`.)
-- `[shadowed]` — content-mirror (case 3b): the nested repo keeps its
-  **live** `.git` (IDE git works) *and* the parent also tracks its files.
-  Carries a `.git.shadow.status` marker (with `first-shadowed` /
-  `last-shadowed` timestamps + HEAD/remote). The line still shows the
-  repo's own live CLEAN/DIRTY state. Set up with `shadow`, undo with
-  `unshadow`.
+- `[shadowed @R]` — content-mirror (case 3b): the nested repo keeps its
+  **live** `.git` (IDE git works) *and* repo `R` also tracks its files.
+  Carries a `.git.shadow.status` marker recording `shadowed-into-repo: R`
+  plus `first-shadowed` / `last-shadowed` timestamps and HEAD/remote. The
+  line still shows the repo's own live CLEAN/DIRTY state. Set up with
+  `shadow`, undo with `unshadow`. Running `my-git` from *inside* a
+  shadowed repo says which repo mirrors it, and how to see the full tree.
+- `[shadowed STALE: @R no longer tracks it]` — the marker is there but no
+  repo mirrors the files any more (e.g. `R` stopped tracking that path).
+  `unshadow` cleans such a marker rather than failing on it.
 
 The top-level scope path itself (root of each tree) carries no tag — it is
 the super-repo, not a nested entry. DIRTY/CLEAN is orthogonal to
