@@ -6100,9 +6100,11 @@ _unfl_restore_preserved() {
     _urp_url=$(sed -n 's|^remote\.origin\.url: ||p' "$_urp_path/.git.merged" | head -n 1)
     if [ -n "$_urp_url" ]; then
       if [ -z "$(git -C "$_urp_path" config --get remote.origin.url 2>/dev/null)" ]; then
-        run git -C "$_urp_path" remote add origin "$_urp_url" 2>/dev/null \
-          && log_medium "$_urp_path: restored remote origin -> $_urp_url" \
-          || log_warn "$_urp_path: could not restore remote origin ($_urp_url) — set it by hand"
+        if run git -C "$_urp_path" remote add origin "$_urp_url" 2>/dev/null; then
+          log_medium "$_urp_path: restored remote origin -> $_urp_url"
+        else
+          log_warn "$_urp_path: could not restore remote origin ($_urp_url) — set it by hand"
+        fi
         # Make the restored branch track it, so push/pull work with no args.
         if [ -n "$_urp_branch" ]; then
           git -C "$_urp_path" config "branch.$_urp_branch.remote" origin 2>/dev/null
