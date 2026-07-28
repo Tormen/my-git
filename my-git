@@ -7804,18 +7804,32 @@ cmd_sync() {
 # Compute where in the central repo a project's .claude should live.
 claude_dest_for() {
   _r=$1
-  # Match against known GIT_REPOS roots; keep relpath under that root.
+  # Compare RESOLVED paths, not strings. The same root is reachable under
+  # several spellings here (/LINKS/global, /syst/global,
+  # /Users/.../system/global all name one directory), so a textual match
+  # missed whenever my-git was invoked through a different one -- and every
+  # project then fell through to misc/, breaking the mirror-the-project-path
+  # layout that every correctly-placed .claude follows.
+  _cdf_rp=$( cd "$_r" 2>/dev/null && pwd -P ) || _cdf_rp=$_r
   for _base in $GIT_REPOS; do
-    case "$_r/" in
-      "$_base"/*)
-        _rel=${_r#"$_base"/}
-        [ "$_r" = "$_base" ] && { printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_base##*/}"; return; }
-        printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "$_rel"
+    _cdf_bp=$( cd "$_base" 2>/dev/null && pwd -P ) || _cdf_bp=$_base
+    [ -n "$_cdf_bp" ] || continue
+    if [ "$_cdf_rp" = "$_cdf_bp" ]; then
+      printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_cdf_bp##*/}"
+      return
+    fi
+    case "$_cdf_rp/" in
+      "$_cdf_bp"/*)
+        printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_cdf_rp#"$_cdf_bp"/}"
         return
         ;;
     esac
   done
-  # Fallback — use the basename under misc/. User gets a warning.
+  # Fallback — basename under misc/. Reaching this means the project is
+  # outside every GIT_REPOS root, which is worth saying out loud: the
+  # result does NOT mirror the project's path, so it will not match its
+  # siblings.
+  log_warn "claude: $_r is under no GIT_REPOS root — placing its .claude at misc/${_r##*/}, which does NOT mirror the project path. Add its root to GIT_REPOS to get the usual layout."
   printf '%s/misc/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_r##*/}"
 }
 
