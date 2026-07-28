@@ -310,6 +310,11 @@ AUTOHEAL_SHADOW_EXCLUDES=1
 # The value IS the strategy; empty/no/off disables the healing entirely.
 AUTOHEAL_PULL_STRATEGY=merge   # merge | rebase | ff-only | "" / no / off
 
+# ─── Conflict viewer ('diff') ────────────────────────────────────────────
+# Program that shows the two conflicting versions side by side. Receives
+# exactly two file paths. vimdiff/nvim -d/opendiff/meld all work.
+DIFF_TOOL=vimdiff
+
 # ─── Auto-commit message template knobs ──────────────────────────────────
 COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
@@ -7628,6 +7633,139 @@ remote_one() {
   fi
 }
 
+# ─── diff: view a conflict's two sides side by side ─────────────────────
+# During a conflict git keeps three versions in the index -- :1 the common
+# ancestor, :2 OURS, :3 THEIRS -- while the worktree file holds neither: it
+# is the merged text with <<<<<<< markers through it. Reading a conflict
+# from that file means reconstructing both sides in your head.
+#
+# This writes the two sides out and opens them side by side. The temp names
+# say WHICH SIDE each one is, including the branch, because "left pane" and
+# "right pane" are not something you should have to remember four files in:
+#     my-plex.LOCAL_ours_main.py
+#     my-plex.REMOTE_theirs_feature.py
+# The original extension is preserved so the viewer still highlights syntax.
+
+# _diff_side_label <ours|theirs>
+#   Name the side being shown. During a REBASE git's ours/theirs are
+#   swapped relative to intuition -- "ours" is the upstream you are
+#   replaying onto, "theirs" is your own commit -- so say which operation
+#   is in progress rather than leaving a label that means the opposite.
+_diff_side_label() {
+  _dsl_side=$1
+  _dsl_gd=$(git rev-parse --git-dir 2>/dev/null)
+  if [ -d "$_dsl_gd/rebase-merge" ] || [ -d "$_dsl_gd/rebase-apply" ]; then
+    case "$_dsl_side" in
+      ours)   printf 'LOCAL_upstream_%s' "$(cat "$_dsl_gd/rebase-merge/onto-name" 2>/dev/null || echo onto)" ;;
+      theirs) printf 'REMOTE_yourcommit_%s' "$(cat "$_dsl_gd/rebase-merge/head-name" 2>/dev/null | sed 's|.*/||' || echo replayed)" ;;
+    esac
+    return
+  fi
+  case "$_dsl_side" in
+    ours)   printf 'LOCAL_ours_%s' "$(git rev-parse --abbrev-ref HEAD 2>/dev/null | sed 's|/|-|g')" ;;
+    theirs) printf 'REMOTE_theirs_%s' "$(git name-rev --name-only MERGE_HEAD 2>/dev/null | sed -e 's|^remotes/||' -e 's|/|-|g' || echo incoming)" ;;
+  esac
+}
+
+cmd_diff() {
+  _df_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help diff; exit 0 ;;
+      -V|--verbose) VRB=1 ;;
+      -VV|--very-verbose) VERYVRB=1 ;;
+      -D|--debug) DBG=1; VERYVRB=1 ;;
+      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
+      --tool) shift; [ $# -gt 0 ] || fatal "diff: --tool needs a program" 64; DIFF_TOOL=$1 ;;
+      --tool=*) DIFF_TOOL=${1#--tool=} ;;
+      -*) fatal "diff: unknown option: $1" 64 ;;
+      *)  [ -n "$_df_file" ] && fatal "diff: only one FILE is supported (got '$_df_file' and '$1')" 64
+          _df_file=$1 ;;
+    esac
+    shift
+  done
+
+  _df_top=$(git_toplevel_of "$PWD") || fatal "diff: not inside a git repo" 1
+  [ -n "$_df_top" ] || fatal "diff: not inside a git repo" 1
+  cd "$_df_top" || fatal "diff: cannot cd to $_df_top" 1
+
+  log_repo_context diff "$_df_top" \
+    "READ-ONLY: writes the two conflicting versions to temp files and opens '${DIFF_TOOL}'" \
+    "nothing in this repo is modified -- resolve by editing the real file yourself"
+
+  _df_list=$(git diff --name-only --diff-filter=U 2>/dev/null)
+  if [ -n "$_df_file" ]; then
+    # Accept a path typed from anywhere in the tree.
+    _df_abs=$(cd "$(dirname "$_df_file")" 2>/dev/null && pwd -P)/$(basename "$_df_file")
+    _df_top_abs=$(cd "$_df_top" && pwd -P)
+    _df_rel=${_df_abs#"$_df_top_abs"/}
+    printf '%s\n' "$_df_list" | grep -qxF "$_df_rel" \
+      || fatal "diff: '$_df_file' is not conflicted. Conflicted right now:$(printf '%s\n' "$_df_list" | sed 's/^/\n     /')" 1
+    _df_list=$_df_rel
+  fi
+  if [ -z "$_df_list" ]; then
+    log_major "$_df_top: no conflicted files — nothing to compare"
+    exit 0
+  fi
+
+  command -v "${DIFF_TOOL%% *}" >/dev/null 2>&1 \
+    || fatal "diff: '${DIFF_TOOL%% *}' not found — set DIFF_TOOL in the config, or pass --tool" 1
+
+  _df_ours=$(_diff_side_label ours)
+  _df_theirs=$(_diff_side_label theirs)
+  _df_n=$(printf '%s\n' "$_df_list" | grep -c .)
+  log_major "$_df_top: $_df_n conflicted file(s); left=$_df_ours  right=$_df_theirs"
+
+  _df_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.diff.XXXXXX") || fatal "diff: mktemp -d failed" 1
+  _df_i=0
+  while IFS= read -r _df_f; do
+    [ -n "$_df_f" ] || continue
+    _df_i=$((_df_i + 1))
+    _df_base=${_df_f##*/}
+    case "$_df_base" in
+      *.*) _df_stem=${_df_base%.*}; _df_ext=.${_df_base##*.} ;;
+      *)   _df_stem=$_df_base;      _df_ext="" ;;
+    esac
+    _df_a="$_df_tmp/$_df_stem.$_df_ours$_df_ext"
+    _df_b="$_df_tmp/$_df_stem.$_df_theirs$_df_ext"
+    # A stage can be ABSENT: add/add has no ancestor, and modify/delete has
+    # no :2 or no :3. Write an empty file and say so, rather than letting
+    # the viewer open on a mystery.
+    if ! git show ":2:$_df_f" > "$_df_a" 2>/dev/null; then
+      : > "$_df_a"; log_warn "$_df_f: no '$_df_ours' version (deleted on that side) — showing an empty file"
+    fi
+    if ! git show ":3:$_df_f" > "$_df_b" 2>/dev/null; then
+      : > "$_df_b"; log_warn "$_df_f: no '$_df_theirs' version (deleted on that side) — showing an empty file"
+    fi
+    log_major "[$_df_i of $_df_n] $_df_f"
+    printf '    > left : %s\n' "$_df_a"
+    printf '    > right: %s\n' "$_df_b"
+    trace "$DIFF_TOOL $_df_a $_df_b"
+    # A full-screen viewer (vimdiff) needs the terminal, and when my-git's
+    # own output is piped or paged it must not inherit that pipe. But
+    # FORCING /dev/tty breaks every case without one -- a pipeline, a
+    # script, the test suite -- with "Device not configured". Use the
+    # terminal when there is one, inherit stdio when there is not.
+    # shellcheck disable=SC2086
+    # NOT '[ -r /dev/tty ]': on macOS the node exists and is world-rw, so
+    # the test passes with no controlling terminal and the redirect then
+    # dies with "Device not configured". Actually OPENING it is the only
+    # honest test -- the same idiom require_tty uses.
+    if ( : </dev/tty ) 2>/dev/null && ( : >/dev/tty ) 2>/dev/null; then
+      $DIFF_TOOL "$_df_a" "$_df_b" </dev/tty >/dev/tty 2>&1 || true
+    else
+      $DIFF_TOOL "$_df_a" "$_df_b" || true
+    fi
+  done <<_DF_EOF
+$_df_list
+_DF_EOF
+
+  log_major "$_df_top: done — the temp copies are in $_df_tmp"
+  printf '    > they are COPIES: resolve by editing the real file, then '\''git add'\'' it\n'
+  printf '    > still conflicted: %s\n' "$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
+  return 0
+}
+
 cmd_remote() {
   RM_CHECK=0
   RM_FORCE=0
@@ -9134,6 +9272,51 @@ See also:      $US --help flatten
 EOF
 }
 
+show_help_diff() {
+  cat <<EOF
+my-git diff
+
+usage: $US [-V|-D] [--tool PROG] diff [<FILE>]
+
+WHICH REPO does this touch?
+  READS          the toplevel of the repo you are standing in, and only its
+                 CONFLICTED files.
+  WRITES         nothing in the repo. The two versions are written to a
+                 fresh temp directory and opened side by side; resolving is
+                 still yours to do in the real file.
+
+During a conflict git keeps three versions in the index -- :1 the common
+ancestor, :2 OURS, :3 THEIRS -- while the file in your worktree holds
+NEITHER: it is the merged text with <<<<<<< markers through it. Reading a
+conflict from that file means reconstructing both sides in your head.
+
+This writes the two sides out and opens '$DIFF_TOOL' on them. The temp
+names say which side each one is, including the branch:
+
+    my-plex.LOCAL_ours_main.py
+    my-plex.REMOTE_theirs_feature.py
+
+The original extension is kept so the viewer still highlights syntax.
+
+With no FILE, every conflicted file is opened in turn ([i of N]).
+
+During a REBASE git's ours/theirs mean the opposite of what most people
+expect -- "ours" is the upstream you are replaying onto, "theirs" is your
+own commit -- so the labels say 'upstream'/'yourcommit' instead, rather
+than a name that means the reverse of what it says.
+
+A side can be ABSENT (add/add has no ancestor; modify/delete has no :2 or
+no :3). That side is shown as an empty file and a warning says which.
+
+Options:
+  --tool PROG   viewer to use instead of \$DIFF_TOOL (vimdiff by default);
+                it receives exactly two paths
+  -V, -VV, -D, -DD   verbosity / debug
+
+  \$DIFF_TOOL is set in the config; 'nvim -d', 'opendiff' and 'meld' all work.
+EOF
+}
+
 show_help_purge() {
   cat <<EOF
 my-git purge
@@ -9696,6 +9879,7 @@ show_help() {
     shadow|sh)           show_help_shadow ;;
     unshadow|unsh)       show_help_unshadow ;;
     purge)               show_help_purge ;;
+    diff)                show_help_diff ;;
     submodules|sub|sm)   show_help_submodules ;;
     claude-check)        show_help_claude_check ;;
     audit)               show_help_audit ;;
@@ -14345,6 +14529,64 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_diff_writes_both_sides_with_names_that_say_which_is_which() {
+    # During a conflict the worktree file holds NEITHER side -- it is the
+    # merged text with <<<<<<< markers. 'diff' writes the two sides out so
+    # they can be read as files, and the NAMES carry the answer to "which
+    # one am I looking at", because left/right is not something to keep in
+    # your head across four files.
+    _rt_repo r
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd r || return 1
+    printf 'a\nb\nc\n' > f.py; echo x > g.txt; git add -A; git commit -q -m base
+    _rt_br=$(git rev-parse --abbrev-ref HEAD)      # whatever init.defaultBranch is
+    git checkout -q -b feature
+    printf 'a\nFEATURE\nc\n' > f.py; echo y-feature > g.txt; git commit -q -am feature
+    git checkout -q "$_rt_br"
+    printf 'a\nMASTER\nc\n' > f.py; echo y-master > g.txt; git commit -q -am mainline
+    git merge feature >/dev/null 2>&1
+
+    _rt_ok "diff over all conflicts" _rt_my_git diff --tool 'diff -u' || return 1
+    _rt_contains "labels the sides in the header" "$_rt_out" "left=LOCAL_ours_$_rt_br" || return 1
+    _rt_contains "names the incoming branch" "$_rt_out" "REMOTE_theirs_feature" || return 1
+    _rt_contains "keeps the extension for syntax" "$_rt_out" "f.LOCAL_ours_$_rt_br.py" || return 1
+    _rt_contains "does both files" "$_rt_out" "[2 of 2]" || return 1
+    _rt_contains "says the copies are not the real file" "$_rt_out" "they are COPIES" || return 1
+
+    # The two sides must hold the two VERSIONS -- not the conflicted file.
+    _rt_dir=$(printf '%s\n' "$(cat "$_rt_out")" | sed -n 's|.*left : \(.*/my-git\.diff\.[^/]*\)/.*|\1|p' | head -n 1)
+    [ -n "$_rt_dir" ] || { _rt_fail "could not find the temp dir in the output"; return 1; }
+    grep -q MASTER  "$_rt_dir/f.LOCAL_ours_$_rt_br.py"    || { _rt_fail "ours side lacks our content"; return 1; }
+    grep -q FEATURE "$_rt_dir/f.REMOTE_theirs_feature.py" || { _rt_fail "theirs side lacks their content"; return 1; }
+    grep -q '<<<<' "$_rt_dir/f.LOCAL_ours_$_rt_br.py" \
+      && { _rt_fail "the ours side still has conflict markers -- it is the merged file, not a side"; return 1; }
+
+    # A path that is not conflicted must be refused, not silently ignored.
+    _rt_my_git diff g.txt --tool 'diff -u' >/dev/null 2>&1 || true
+    _rt_my_git diff README.none --tool 'diff -u' >"$_rt_out" 2>"$_rt_err"
+    _rt_contains "refuses a non-conflicted path" "$_rt_err" "is not conflicted" || return 1
+    return 0
+  }
+
+  test_diff_handles_a_side_that_does_not_exist() {
+    # add/add has no ancestor and modify/delete has no :2 or no :3. Opening
+    # a viewer on a mystery is worse than saying which side is missing.
+    _rt_repo r
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd r || return 1
+    echo base > keep.txt; git add -A; git commit -q -m base
+    _rt_br=$(git rev-parse --abbrev-ref HEAD)
+    git checkout -q -b feature
+    printf 'theirs\n' > only.txt; git add -A; git commit -q -m theirs-adds
+    git checkout -q "$_rt_br"
+    git rm -q keep.txt; printf 'ours\n' > only.txt; git add -A; git commit -q -m ours-adds
+    git merge feature >/dev/null 2>&1
+    _rt_my_git diff --tool 'diff -u' >"$_rt_out" 2>"$_rt_err"
+    # add/add on only.txt: both sides exist, no ancestor -- must still work.
+    _rt_contains "handles add/add" "$_rt_out" "only.LOCAL_ours" || return 1
+    return 0
+  }
+
   test_st_says_old_checkout_not_dirty_when_nothing_was_edited() {
     # A worktree can differ from HEAD without a single local edit: files
     # from an older release attached to newer history diff as pages of
@@ -16364,7 +16606,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_claude_dest_mirrors_the_project_path_under_the_central_repo test_claude_ignore_pattern_matches_the_symlink_not_a_directory test_claude_check_leaves_repos_without_a_claude_alone test_claude_audit_reports_claude_and_published_state test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_claude_dest_mirrors_the_project_path_under_the_central_repo test_claude_ignore_pattern_matches_the_symlink_not_a_directory test_claude_check_leaves_repos_without_a_claude_alone test_claude_audit_reports_claude_and_published_state test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -16520,6 +16762,7 @@ main() {
     shadow|sh)                  cmd_shadow "$@" ;;
     unshadow|unsh)              cmd_unshadow "$@" ;;
     purge)                      cmd_purge "$@" ;;
+    diff)                       cmd_diff "$@" ;;
     submodules|sub|sm)          cmd_submodules "$@" ;;
     unsm|unsub|unsubmodules)    cmd_unsm "$@" ;;
     ignore)                     cmd_ignore "$@" ;;
@@ -16574,6 +16817,7 @@ _my-git() {
     'shadow:Keep nested .git LIVE and also track its files in the parent; content-mirror (alias: sh)'
     'unshadow:Reverse of shadow — parent stops tracking; .git stays live (alias: unsh)'
     'purge:Remove a path'\''s content AND history from a repo — REWRITES HISTORY'
+    'diff:Show a merge conflict'\''s two sides side by side in $DIFF_TOOL'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
     'audit:Read-only health checks (--claude and/or --sidecar)'
     'repair:Fix sidecar setup problems (--sidecar; go to apply)'
