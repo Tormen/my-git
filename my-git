@@ -2029,7 +2029,7 @@ cmd_status() {
     if [ -f "$_root/.git.shadow.status" ]; then
       _st_shinto=$(tracking_repo_of "$_root")
       if [ -n "$_st_shinto" ]; then
-        log_major "this repo is SHADOWED into $_st_shinto — its files are mirrored there too"
+        log_major "this repo is SHADOWED into $_st_shinto (mirroring its files there)"
         printf '    > its own .git (here) is the authoritative history; the mirror is a copy\n'
         printf '    > full tree:  %s st %s\n' "$US" "$_st_shinto"
       else
