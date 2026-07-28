@@ -307,9 +307,8 @@ AUTOHEAL_SHADOW_EXCLUDES=1
 # Give a repo a pull strategy when it has none, so 'pull' on a diverged
 # branch does not die with "Need to specify how to reconcile divergent
 # branches". Only ever set when UNSET -- an existing choice is yours.
-AUTOHEAL_PULL_STRATEGY=1
-# What to set it to: merge (git's historical default), rebase, or ff-only.
-AUTOHEAL_PULL_STRATEGY_VALUE=merge
+# The value IS the strategy; empty/no/off disables the healing entirely.
+AUTOHEAL_PULL_STRATEGY=merge   # merge | rebase | ff-only | "" / no / off
 
 # ─── Auto-commit message template knobs ──────────────────────────────────
 COMMIT_MSG_LAST_N=3
@@ -2924,7 +2923,7 @@ pull_one() {
   # branches" unless a strategy is configured. Only fills the gap when
   # there is one -- an existing preference is an answer, and is left alone.
   _pl_healed=$(autoheal_pull_strategy "$_r")
-  [ -n "$_pl_healed" ] && log_medium "$_r: set pull strategy to ${AUTOHEAL_PULL_STRATEGY_VALUE:-merge} (none was configured)"
+  [ -n "$_pl_healed" ] && log_medium "$_r: set pull strategy to ${AUTOHEAL_PULL_STRATEGY-merge} (none was configured)"
 
   # Honor the ignore marker.
   _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
@@ -6727,6 +6726,13 @@ _shadow_uninstall_hook() {
 # trap restores .git on interrupt so a crash can't lose it. Does NOT commit
 # (caller commits, scoped). Runs in a subshell so the trap is contained; the
 # staged index lives on disk and persists past it. Returns 0 on success.
+# autoheal_off <value>
+#   0 when the knob is switched off. Accepts the same words everywhere so a
+#   person need not remember which knob wanted 0 and which wanted "no".
+autoheal_off() {
+  case "$1" in ''|0|no|No|NO|off|Off|OFF|false|False|FALSE) return 0 ;; *) return 1 ;; esac
+}
+
 # autoheal_pull_strategy <repo>
 #   Give <repo> a pull strategy when it has NONE. Prints the repo path if it
 #   set one.
@@ -6745,17 +6751,21 @@ _shadow_uninstall_hook() {
 #   which is local and never cloned.
 autoheal_pull_strategy() {
   _aps_r=$1
-  [ "${AUTOHEAL_PULL_STRATEGY:-1}" = 1 ] || { log_dbg_med "autoheal: pull strategy disabled (AUTOHEAL_PULL_STRATEGY=0)"; return 0; }
+  _aps_want=${AUTOHEAL_PULL_STRATEGY-merge}
+  if autoheal_off "$_aps_want"; then
+    log_dbg_med "autoheal: pull strategy disabled (AUTOHEAL_PULL_STRATEGY='$_aps_want')"
+    return 0
+  fi
   [ -e "$_aps_r/.git" ] || return 0
   # --get looks at the full chain (local, global, system): an inherited
   # preference counts as already answered.
   [ -z "$(run_as_owner_capture "$_aps_r" git config --get pull.rebase 2>/dev/null)" ] || return 0
   [ -z "$(run_as_owner_capture "$_aps_r" git config --get pull.ff 2>/dev/null)" ] || return 0
-  case "${AUTOHEAL_PULL_STRATEGY_VALUE:-merge}" in
+  case "$_aps_want" in
     merge)   _aps_k=pull.rebase; _aps_v=false ;;
     rebase)  _aps_k=pull.rebase; _aps_v=true ;;
     ff-only) _aps_k=pull.ff;     _aps_v=only ;;
-    *) log_warn "autoheal: AUTOHEAL_PULL_STRATEGY_VALUE='${AUTOHEAL_PULL_STRATEGY_VALUE}' is not merge/rebase/ff-only — skipping"; return 0 ;;
+    *) log_warn "autoheal: AUTOHEAL_PULL_STRATEGY='$_aps_want' is not merge/rebase/ff-only (or empty/no/off to disable) — skipping"; return 0 ;;
   esac
   trace "git -C $_aps_r config $_aps_k $_aps_v   # autoheal: no pull strategy was set"
   if run_as_owner "$_aps_r" git config "$_aps_k" "$_aps_v" 2>/dev/null; then
@@ -6786,7 +6796,10 @@ _SHADOW_EXCL_END='# <<< my-git shadow <<<'
 #   own instead of lingering.
 shadow_sync_excludes() {
   _sse_top=$1
-  [ "${AUTOHEAL_SHADOW_EXCLUDES:-1}" = 1 ] || { log_dbg_med "autoheal: shadow excludes disabled (AUTOHEAL_SHADOW_EXCLUDES=0)"; return 0; }
+  if autoheal_off "${AUTOHEAL_SHADOW_EXCLUDES-1}"; then
+    log_dbg_med "autoheal: shadow excludes disabled (AUTOHEAL_SHADOW_EXCLUDES='${AUTOHEAL_SHADOW_EXCLUDES-1}')"
+    return 0
+  fi
   [ -d "$_sse_top" ] || return 0
   _sse_map=$(mktemp "${TMPDIR:-/tmp}/${US}.ssemap.XXXXXX" 2>/dev/null) || return 0
 
@@ -9481,11 +9494,13 @@ values come from the user's config):
   CHECK_CLAUDE_SETUP          Audit .claude/ during 'mc'; 0 disables.
   AUTOHEAL_SHADOW_EXCLUDES    Hide a nested SHADOWED repo from the repo that
                               physically contains it (.git/info/exclude,
-                              which no clone carries). 1=heal, 0=leave.
-  AUTOHEAL_PULL_STRATEGY      Give a repo a pull strategy when it has NONE,
-                              so 'pull' on a diverged branch does not abort.
-                              Never overrides an existing choice. 1/0.
-  AUTOHEAL_PULL_STRATEGY_VALUE  merge (default) | rebase | ff-only
+                              which no clone carries). 1 (default) to heal;
+                              empty / 0 / no / off to leave it alone.
+  AUTOHEAL_PULL_STRATEGY      The strategy to give a repo that has NONE, so
+                              'pull' on a diverged branch does not abort:
+                              merge (default) | rebase | ff-only.
+                              Empty / no / off disables the healing.
+                              Never overrides a strategy already set.
   CLAUDE_PROJECT_DIR_CENTRAL_REPO
                               Central tree where .claude dirs live.
   COMMIT_MSG_LAST_N           # of recent log entries in auto-commit body.
@@ -14081,11 +14096,24 @@ _RT_STALE_CONF_EOF
     [ "$(git config --get pull.rebase)" = true ] \
       || { _rt_fail "overwrote an existing preference"; return 1; }
 
-    # And the knob must switch it off entirely.
+    # The knob IS the strategy, so it must also be able to choose one...
     git config --unset pull.rebase
-    AUTOHEAL_PULL_STRATEGY=0 _rt_my_git pull go >/dev/null 2>&1
-    [ -z "$(git config --get pull.rebase)" ] \
-      || { _rt_fail "healed despite AUTOHEAL_PULL_STRATEGY=0"; return 1; }
+    AUTOHEAL_PULL_STRATEGY=rebase _rt_my_git pull go >/dev/null 2>&1
+    [ "$(git config --get pull.rebase)" = true ] \
+      || { _rt_fail "AUTOHEAL_PULL_STRATEGY=rebase did not choose rebase"; return 1; }
+    git config --unset pull.rebase
+    AUTOHEAL_PULL_STRATEGY=ff-only _rt_my_git pull go >/dev/null 2>&1
+    [ "$(git config --get pull.ff)" = only ] \
+      || { _rt_fail "AUTOHEAL_PULL_STRATEGY=ff-only did not set pull.ff"; return 1; }
+    git config --unset pull.ff
+
+    # ...and every off-word must disable it.
+    for _rt_off in "" no off 0; do
+      git config --unset pull.rebase 2>/dev/null
+      AUTOHEAL_PULL_STRATEGY="$_rt_off" _rt_my_git pull go >/dev/null 2>&1
+      [ -z "$(git config --get pull.rebase)" ] \
+        || { _rt_fail "healed despite AUTOHEAL_PULL_STRATEGY='$_rt_off'"; return 1; }
+    done
     return 0
   }
 
@@ -14099,9 +14127,11 @@ _RT_STALE_CONF_EOF
     git clone -q ../inner_o 'mid/,archive/nested' >/dev/null 2>&1
     _rt_ok "shadow go" _rt_my_git shadow go 'mid/,archive/nested' || return 1
     rm -f mid/.git/info/exclude
-    AUTOHEAL_SHADOW_EXCLUDES=0 _rt_my_git st >/dev/null 2>&1
-    grep -qF ',archive/nested/' mid/.git/info/exclude 2>/dev/null \
-      && { _rt_fail "healed despite AUTOHEAL_SHADOW_EXCLUDES=0"; return 1; }
+    for _rt_off in 0 no off ""; do
+      AUTOHEAL_SHADOW_EXCLUDES="$_rt_off" _rt_my_git st >/dev/null 2>&1
+      grep -qF ',archive/nested/' mid/.git/info/exclude 2>/dev/null \
+        && { _rt_fail "healed despite AUTOHEAL_SHADOW_EXCLUDES='$_rt_off'"; return 1; }
+    done
     # ...and ON by default it heals.
     _rt_ok "st with the knob at its default" _rt_my_git st || return 1
     _rt_contains "healed by default" mid/.git/info/exclude ",archive/nested/" || return 1
