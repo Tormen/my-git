@@ -6745,9 +6745,11 @@ _shadow_one() {
     if [ -d "$_sho_encl_gd" ]; then
       mkdir -p "$_sho_encl_gd/info" 2>/dev/null || true
       if ! grep -qxF "$_sho_rel" "$_sho_encl_gd/info/exclude" 2>/dev/null; then
-        printf '%s\n' "$_sho_rel" >> "$_sho_encl_gd/info/exclude" 2>/dev/null \
-          && log_medium "shadow: $_sho_encl will no longer report $_sho_rel as untracked (local .git/info/exclude)" \
-          || log_dbg_med "shadow: could not exclude $_sho_rel in $_sho_encl (cosmetic)"
+        if printf '%s\n' "$_sho_rel" >> "$_sho_encl_gd/info/exclude" 2>/dev/null; then
+          log_medium "shadow: $_sho_encl will no longer report $_sho_rel as untracked (local .git/info/exclude)"
+        else
+          log_dbg_med "shadow: could not exclude $_sho_rel in $_sho_encl (cosmetic)"
+        fi
       fi
     fi
   fi
