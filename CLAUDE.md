@@ -37,6 +37,10 @@ userland: BSD `sed`/`grep`/`stat`, `stat -f`, etc.).
 - **analyze by default**, apply with **`go`**, confirm per-item with **`-i`**.
 - A bare verb acts **tree-wide** (except `sm` which is single-level + `-R`, and
   `ignore` which needs a path — no bulk "ignore everything").
+- `pull`, `push` and `mc` walk **the tree `st` shows** — every live repo at or
+  below the scope root, not the submodule tree. Narrow with `--sm`
+  (submodules only) or `--sh` (shadowed only). There is no `-R`: operating on
+  one repo is what plain `git` already does.
 - A single **PATH** scopes to one repo. For `sm`/`unsm` the path is resolved to its
   **immediate enclosing repo** (the repo that directly contains it), not the
   toplevel you run from — so `sm <path> go` and `unsm <path>` act on the same repo.
@@ -57,7 +61,9 @@ remote (publishable), blank = n/a (zipped/stale). The Summary shows counts:
 ## Command map (dispatch near end of file, `case "$_sub" in`)
 
 - `status|st|s` → `cmd_status` (recursive tree overview + Summary).
-- `masscommits|mc|c` → `cmd_masscommits` (single level; `-R` = bottom-up walk).
+- `masscommits|mc|c` → `cmd_masscommits` (whole tree, deepest first; `--sm`/`--sh` narrow).
+- `push|ps` → `cmd_push` (whole tree; analyze/`go`; never invents an upstream,
+  never pushes a diverged branch, skips local-only).
 - `submodules|sub|sm` → `cmd_submodules`/`_sm_run_here` (register nested→submodule).
 - `unsm|unsub` → `cmd_unsm` (reverse of sm: de-register → raw-nested-git,
   de-absorbing the gitdir; whole-tree default).
