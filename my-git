@@ -1399,9 +1399,17 @@ list_unregistered_nested() {
   _r=$1
   [ -d "$_r" ] || return 0
   _regtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.reg.XXXXXX")
-  run_as_owner_capture "$_r" git config -f .gitmodules \
-    --get-regexp '^submodule\..*\.path$' 2>/dev/null \
-    | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
+  # No .gitmodules, no registrations -- and asking git anyway is not free:
+  # as root this call is launchctl + sudo + git, three processes per repo,
+  # to read a file that is absent in every repo of a tree with no
+  # submodules. A file test answers it without forking at all.
+  if [ -f "$_r/.gitmodules" ]; then
+    run_as_owner_capture "$_r" git config -f .gitmodules \
+      --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+      | awk '{$1=""; sub(/^ /,""); print}' > "$_regtmp" 2>/dev/null || : > "$_regtmp"
+  else
+    : > "$_regtmp"
+  fi
   _realtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.real.XXXXXX")
   list_realized_dirs "$_r" > "$_realtmp" 2>/dev/null || : > "$_realtmp"
   trace "(cd $_r && find . -name .git -print)   # discover UNREGISTERED nested repos"
@@ -3231,7 +3239,14 @@ push_one() {
 
   # Local-only repos are the '⌂' rows in st. Not an error -- there is
   # simply nowhere to publish to.
-  if [ -z "$(run_as_owner_capture "$_r" git remote 2>/dev/null)" ]; then
+  #
+  # One 'git config --get' instead of 'git remote' AND a later
+  # 'git remote get-url origin': as root each call is launchctl + sudo +
+  # git, so a redundant one costs three processes per repo. Only when this
+  # comes back empty do we ask the more expensive question, to tell "no
+  # remotes at all" from "no remote named origin".
+  _ps_url=$(run_as_owner_capture "$_r" git config --get remote.origin.url 2>/dev/null)
+  if [ -z "$_ps_url" ] && [ -z "$(run_as_owner_capture "$_r" git remote 2>/dev/null)" ]; then
     [ "$VRB" = 1 ] && log_medium "$_r: [local-only (no remote) — nothing to publish]"
     PS_N_NOREMOTE=$((PS_N_NOREMOTE + 1)); return 0
   fi
@@ -3285,7 +3300,6 @@ push_one() {
       _ps_warned_patterns=1
     }
   elif [ "${PUSH_REMOTE_SCOPE:-mine}" != all ]; then
-    _ps_url=$(run_as_owner_capture "$_r" git remote get-url origin 2>/dev/null)
     _ps_mine=0
     for _ps_pat in ${MINE_URL_PATTERNS:-}; do
       # Prefix, not substring: "https://github.com/Tormen/" must not match
@@ -3306,10 +3320,12 @@ push_one() {
     fi
   fi
 
-  _ahead=$(run_as_owner_capture "$_r" git rev-list --count "$_up..HEAD" 2>/dev/null)
-  _behind=$(run_as_owner_capture "$_r" git rev-list --count "HEAD..$_up" 2>/dev/null)
-  [ -n "$_ahead" ] || _ahead=0
-  [ -n "$_behind" ] || _behind=0
+  # --left-right --count answers both sides in one call: "<behind>\t<ahead>".
+  _ps_lr=$(run_as_owner_capture "$_r" git rev-list --left-right --count "$_up...HEAD" 2>/dev/null)
+  _behind=${_ps_lr%%	*}
+  _ahead=${_ps_lr##*	}
+  case "$_ahead" in ''|*[!0-9]*) _ahead=0 ;; esac
+  case "$_behind" in ''|*[!0-9]*) _behind=0 ;; esac
 
   if [ "$_ahead" -eq 0 ]; then
     [ "$VRB" = 1 ] && log_medium "$_r: up to date with $_up"
@@ -3344,7 +3360,6 @@ push_one() {
     log_ok "push: $_r — $_ahead commit(s) published to $_up"
     PS_N_PUSHED=$((PS_N_PUSHED + 1)); return 0
   fi
-  _ps_url=$(run_as_owner_capture "$_r" git remote get-url origin 2>/dev/null)
   log_fail "push: $_r — git push to $_up FAILED"
   case "$_ps_err$_ps_url" in
     *terminal\ prompts\ disabled*|*Authentication\ failed*|*could\ not\ read\ Username*)
