@@ -1384,7 +1384,9 @@ _unzip_gitdir() {
   return 0
 }
 
-# list_unregistered_nested <repo>
+# list_unregistered_nested <repo> [realized-dirs]
+#   The second argument is an optional, already-computed list of realized
+#   (sidecar) dirs -- pass it when you have one, to skip a whole tree walk.
 #   Print paths (relative to $repo) of DIRECT nested git repos that are NOT
 #   registered in $repo/.gitmodules — i.e. embedded/unregistered repos. Skips
 #   descendants of registered submodules (those are that sub's concern) and
@@ -1411,7 +1413,15 @@ list_unregistered_nested() {
     : > "$_regtmp"
   fi
   _realtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.real.XXXXXX")
-  list_realized_dirs "$_r" > "$_realtmp" 2>/dev/null || : > "$_realtmp"
+  # The caller may already hold this list -- walk_tree_lines computes it a
+  # few lines before calling us, and recomputing meant a SECOND full
+  # recursive walk of the same tree for every repo (82 walks for 41 repos).
+  # ${2-} distinguishes "not passed" from "passed and legitimately empty".
+  if [ "${2-__unset__}" = __unset__ ]; then
+    list_realized_dirs "$_r" > "$_realtmp" 2>/dev/null || : > "$_realtmp"
+  else
+    printf '%s\n' "${2-}" | grep -v '^$' > "$_realtmp" 2>/dev/null || : > "$_realtmp"
+  fi
   trace "(cd $_r && find . -name .git -print)   # discover UNREGISTERED nested repos"
   ( cd "$_r" 2>/dev/null || exit 0
     # Prune:
@@ -1798,7 +1808,7 @@ walk_tree_lines() (
     | awk 'function is_under(a, n, p,   i) { for (i=1;i<=n;i++) if (p==a[i] || index(p, a[i] "/")==1) return 1; return 0 }
            { if (is_under(kept, nk, $0)) next; print; kept[++nk]=$0 }')
   if [ "${SCOPE_MANAGED:-1}" = 1 ] || [ "${RECURSIVE:-0}" = 1 ]; then
-    _subs_unreg=$(list_unregistered_nested "$_root")
+    _subs_unreg=$(list_unregistered_nested "$_root" "$_subs_realized")
   else
     _subs_unreg=""
   fi
