@@ -2818,7 +2818,26 @@ commit_one() {
   # the super's). Using bare '--ignore-submodules' (aka =all) would
   # hide gitlink bumps too — bug: the super would falsely show CLEAN
   # after children committed under -R.
-  _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
+  # ONE call, as 'st' already does: '-b' prepends
+  #   ## <branch>...<upstream> [ahead N, behind M]
+  # so branch, whether an upstream exists, and how far ahead we are all
+  # arrive with the status -- replacing the separate rev-parse,
+  # 'branch -a' and 'log' this used to run per repo. 'branch -a' was the
+  # worst of them: it enumerates every ref, including every remote one,
+  # to answer a yes/no question. Under root each call is launchctl + sudo
+  # + git, so three fewer calls per repo is nine fewer processes.
+  _sb_mc=$(run_as_owner_capture "$_r" git status -b --porcelain --ignore-submodules=dirty 2>/dev/null)
+  # Split header from entries with parameter expansion only (no head/tail
+  # subprocess, and no broken-pipe noise) -- same idiom as status_one.
+  _bline_mc=$_sb_mc
+  _porc=""
+  case "$_sb_mc" in
+    *"
+"*) _bline_mc=${_sb_mc%%"
+"*}
+        _porc=${_sb_mc#*"
+"} ;;
+  esac
 
   # Push is allowed only when BOTH conditions hold:
   #   (1) repo path matches an entry in GIT_REPOS (explicit allowlist), AND
@@ -2847,21 +2866,31 @@ commit_one() {
   #   state=dirty              DIRTY (N) [M:..  A:..  ??:..]  action: add+commit (+push if pushable)
   _state=""; _state_desc=""; _action=""
   if [ -z "$_porc" ]; then
-    _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    # '## main...origin/main [ahead 2, behind 1]' -> branch, upstream, ahead.
+    # No upstream at all means no '...' in the header.
+    _hdr_mc=${_bline_mc#\#\# }
+    _branch=${_hdr_mc%%...*}
+    _branch=${_branch%% *}
+    case "$_hdr_mc" in
+      *...*) _has_remote=1 ;;
+      *)     _has_remote="" ;;
+    esac
     _rem_ref=origin/$_branch
-    _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null | grep -E "^\s*remotes/$_rem_ref$" || true)
     if [ -z "$_has_remote" ]; then
       _state=clean-no-remote
       _state_desc="CLEAN (no remote for $_branch)"
       _action=noop
     else
-      _div=$(run_as_owner_capture "$_r" git log --oneline "${_rem_ref}..${_branch}" 2>/dev/null)
-      if [ -z "$_div" ]; then
+      _ahead=0
+      case "$_bline_mc" in
+        *"[ahead "*) _ahead=${_bline_mc#*"[ahead "}; _ahead=${_ahead%%[!0-9]*} ;;
+      esac
+      [ -n "$_ahead" ] || _ahead=0
+      if [ "$_ahead" -eq 0 ]; then
         _state=clean-matched
         _state_desc="CLEAN :))"
         _action=noop
       else
-        _ahead=$(printf '%s\n' "$_div" | grep -c . 2>/dev/null | head -1)
         _state=clean-ahead
         _state_desc="CLEAN, ahead=$_ahead"
         if [ "$_pushable" = 1 ]; then
