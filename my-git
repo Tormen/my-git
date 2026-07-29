@@ -1281,7 +1281,14 @@ list_shadow_markers() {
   _lsm_r=$1
   [ -d "$_lsm_r" ] || return 0
   ( cd "$_lsm_r" 2>/dev/null || exit 0
-    _pex="-path ./.git -o -name ${GIT_SIDECAR_DIRNAME:-.git.real} -o -name .git.merged"
+    # Same prune set as list_shadowed_dirs, including '-name .git'. The
+    # marker is written at <path>/.git.shadow.status -- a SIBLING of .git,
+    # never inside it (one write site, _shadow_write_status) -- so descending
+    # into gitdirs cannot find one. Verified on the real tree: identical 25
+    # markers either way, no marker inside any .git anywhere, and 2.5x
+    # faster with the prune (1.47s -> 0.59s over 10 walks; 5919 files inside
+    # .git dirs were being read for nothing).
+    _pex="-path ./.git -o -name .git -o -name ${GIT_SIDECAR_DIRNAME:-.git.real} -o -name .git.merged"
     for _ed in ${ST_EXCLUDE_DIRS:-}; do
       _pex="$_pex -o -name $_ed"
     done
