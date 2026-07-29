@@ -332,16 +332,18 @@ XUSER_LAUNCHCTL=1
 # pulseaudio) alongside your own. Pushing to someone else's project does
 # not merely fail -- it fails with a 403 AFTER prompting for credentials,
 # once per repo. So decide it up front instead.
-#   mine  publish only to remotes matching PUSH_MINE_PATTERNS (default)
+#   mine  publish only to remotes matching MINE_URL_PATTERNS (default)
 #   all   try every repo that is ahead
 PUSH_REMOTE_SCOPE=mine
-# Space-separated substrings identifying YOUR remotes. Matched against the
-# remote URL, so "github.com:Tormen/" and "github.com/Tormen/" both belong
-# here if you use ssh and https forms. Foreign repos are reported, never
-# pushed silently -- and never turned into a pull request behind your back:
-# a PR is an outward-facing act that needs a fork, a branch and a reason
-# written by a human.
-PUSH_MINE_PATTERNS="github.com:Tormen/ github.com/Tormen/ my-gits: gits4root:"
+# Which remote URLs are YOURS. Space-separated PREFIXES -- a URL belongs to
+# you when it STARTS with one of them, so the ssh and https spellings of the
+# same account are separate entries, and "github.com/Tormen/" cannot be
+# matched accidentally inside someone else's URL.
+#
+# Not named after 'push': it states a fact about your remotes, and anything
+# else that needs to tell yours from a third party's should ask the same
+# question rather than growing its own list.
+MINE_URL_PATTERNS="git@github.com:Tormen/ https://github.com/Tormen/ my-gits: gits4root: /LINKS/gits/"
 
 # ─── Conflict viewer ('diff') ────────────────────────────────────────────
 # Program that shows the two conflicting versions side by side. Receives
@@ -3202,10 +3204,19 @@ push_one() {
     # leaves the machine. If it does NOT exist, a push would CREATE a branch
     # on the remote, which is publishing, not healing, and on a foreign
     # remote is not even yours to do. That half stays a human decision.
+    # Ask the REMOTE, not refs/remotes/origin/*. A remote-tracking ref is a
+    # cache of a past fetch and can outlive the branch by years: this repo
+    # carries refs/remotes/origin/with-progress-bar and origin/master while
+    # the remote has only main and progress-bar. Trusting the cache adopted
+    # an upstream that does not exist -- which is how this comment got
+    # written.
     if [ "${AUTOHEAL_UPSTREAM:-1}" = 1 ] \
-       && run_as_owner_capture "$_r" git rev-parse -q --verify "refs/remotes/origin/$_branch" >/dev/null 2>&1; then
+       && [ -n "$(run_as_owner_capture "$_r" git ls-remote --heads origin "$_branch" 2>/dev/null)" ]; then
+      # Fetch just that branch so the tracking ref exists to point at.
+      run_as_owner "$_r" git fetch -q origin \
+        "refs/heads/$_branch:refs/remotes/origin/$_branch" >/dev/null 2>&1
       if run_as_owner "$_r" git branch --set-upstream-to="origin/$_branch" "$_branch" >/dev/null 2>&1; then
-        log_medium "$_r: tracked origin/$_branch (it already existed; nothing published)"
+        log_medium "$_r: tracked origin/$_branch (it already exists there; nothing published)"
         _up="origin/$_branch"
       fi
     fi
@@ -3224,16 +3235,18 @@ push_one() {
   # EVERY repo as foreign and refuse to push at all -- a config written
   # before these keys existed would quietly stop publishing your own work.
   # Say so once and behave as 'all' rather than blocking on a blank.
-  if [ "${PUSH_REMOTE_SCOPE:-mine}" != all ] && [ -z "${PUSH_MINE_PATTERNS:-}" ]; then
+  if [ "${PUSH_REMOTE_SCOPE:-mine}" != all ] && [ -z "${MINE_URL_PATTERNS:-}" ]; then
     [ "${_ps_warned_patterns:-0}" = 1 ] || {
-      log_warn "PUSH_REMOTE_SCOPE=mine but PUSH_MINE_PATTERNS is empty — your config predates it. Treating every remote as yours; add the key (see '$US --create-config') to filter foreign upstreams."
+      log_warn "PUSH_REMOTE_SCOPE=mine but MINE_URL_PATTERNS is empty — your config predates it. Treating every remote as yours; add the key (see '$US --create-config') to filter foreign upstreams."
       _ps_warned_patterns=1
     }
   elif [ "${PUSH_REMOTE_SCOPE:-mine}" != all ]; then
     _ps_url=$(run_as_owner_capture "$_r" git remote get-url origin 2>/dev/null)
     _ps_mine=0
-    for _ps_pat in ${PUSH_MINE_PATTERNS:-}; do
-      case "$_ps_url" in *"$_ps_pat"*) _ps_mine=1; break ;; esac
+    for _ps_pat in ${MINE_URL_PATTERNS:-}; do
+      # Prefix, not substring: "https://github.com/Tormen/" must not match
+      # "https://github.com/someone/fork-of-Tormen/...".
+      case "$_ps_url" in "$_ps_pat"*) _ps_mine=1; break ;; esac
     done
     if [ "$_ps_mine" = 0 ]; then
       _ps_a=$(run_as_owner_capture "$_r" git rev-list --count "$_up..HEAD" 2>/dev/null)
@@ -15523,12 +15536,21 @@ _RT_STALE_CONF_EOF
 
     # "mine" = anything whose URL contains 'mine_bare'.
     # Exported, not an 'env' prefix: _rt_my_git is a shell function.
-    PUSH_REMOTE_SCOPE=mine; PUSH_MINE_PATTERNS=mine_bare
-    export PUSH_REMOTE_SCOPE PUSH_MINE_PATTERNS
+    # The pattern is a PREFIX, so use the real URL -- a substring of it
+    # (which an earlier version of this test used) must not match.
+    PUSH_REMOTE_SCOPE=mine
+    MINE_URL_PATTERNS=$(git -C ours config --get remote.origin.url)
+    export PUSH_REMOTE_SCOPE MINE_URL_PATTERNS
     _rt_ok "push analyze, scope=mine" _rt_my_git push || return 1
     _rt_contains "the foreign repo is named, not pushed" "$_rt_out" "FOREIGN remote" || return 1
     _rt_contains "and counted separately" "$_rt_out" "foreign=1" || return 1
     _rt_contains "while our own is still offered" "$_rt_out" "would-push=1" || return 1
+
+    # A bare substring of the URL must NOT qualify: prefixes only.
+    MINE_URL_PATTERNS=bare; export MINE_URL_PATTERNS
+    _rt_ok "substring is not a prefix" _rt_my_git push || return 1
+    _rt_contains "so both repos read as foreign" "$_rt_out" "foreign=2" || return 1
+    MINE_URL_PATTERNS=$(git -C ours config --get remote.origin.url); export MINE_URL_PATTERNS
 
     _rt_before=$(git -C ../theirs_bare rev-list --count HEAD 2>/dev/null)
     _rt_ok "push go, scope=mine" _rt_my_git push go || return 1
@@ -15540,13 +15562,13 @@ _RT_STALE_CONF_EOF
     # existed would then silently stop pushing the user's own work.
     _rt_before_mine=$(git -C ../mine_bare rev-list --count HEAD 2>/dev/null)
     printf 'c\n' >> ours/m.md && git -C ours commit -q -am "more work" 2>/dev/null
-    PUSH_MINE_PATTERNS=""; export PUSH_MINE_PATTERNS
+    MINE_URL_PATTERNS=""; export MINE_URL_PATTERNS
     _rt_ok "push go with no patterns configured" _rt_my_git push go || return 1
     # log_warn writes to stderr, which the harness captures separately.
-    _rt_contains "says the config predates the key" "$_rt_err" "PUSH_MINE_PATTERNS is empty" || return 1
+    _rt_contains "says the config predates the key" "$_rt_err" "MINE_URL_PATTERNS is empty" || return 1
     _rt_blank_ok=0
     [ "$(git -C ../mine_bare rev-list --count HEAD 2>/dev/null)" -gt "$_rt_before_mine" ] && _rt_blank_ok=1
-    unset PUSH_REMOTE_SCOPE PUSH_MINE_PATTERNS
+    unset PUSH_REMOTE_SCOPE MINE_URL_PATTERNS
     [ "$_rt_blank_ok" = 1 ] \
       || { _rt_fail "a blank pattern list silently blocked the user's own push"; return 1; }
     return 0
@@ -15580,6 +15602,19 @@ _RT_STALE_CONF_EOF
     _rt_contains "adopted the branch that already existed" "$_rt_out" "ahead" || return 1
     [ -n "$(git -C proj rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" ] \
       || { _rt_fail "did not adopt origin/known, which already existed"; return 1; }
+
+    # Case 1b: a STALE remote-tracking ref. The branch was deleted upstream
+    # (or never existed there) but the local cache still names it. Adopting
+    # that records an upstream that is not real.
+    git -C proj checkout -q -b ghost 2>/dev/null
+    git -C proj update-ref refs/remotes/origin/ghost HEAD 2>/dev/null
+    printf 'g\n' >> proj/a.md && git -C proj commit -q -am "work on ghost" 2>/dev/null
+    _rt_ok "push analyze with a stale tracking ref" _rt_my_git push || return 1
+    if git -C proj rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+      _rt_fail "adopted a STALE refs/remotes/origin/ghost — the remote has no such branch"
+      return 1
+    fi
+    _rt_ok "stale cache was not mistaken for a real branch" true || return 1
 
     # Case 2: a branch origin has never heard of.
     git -C proj checkout -q -b novel 2>/dev/null
