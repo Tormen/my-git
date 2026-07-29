@@ -3065,7 +3065,13 @@ cmd_masscommits() {
   # walk mode, so "which git did that commit go to" is answered up front.
   log_repo_context mc "$(printf '%s' "$_roots" | tr '\n' ' ')" \
     "EACH repo below commits to its OWN .git and pushes to its OWN remote -- no shared repo receives anything" \
-    "$([ "$RECURSIVE" = 1 ] && printf -- '-R: walking every nested repo bottom-up (deepest committed first, so parent gitlinks can bump)' || printf 'single level: only the repo(s) named above, NOT their nested repos')" \
+    "$(if [ "$MC_SM_ONLY" = 1 ]; then
+         printf -- '--sm: the SUBMODULE tree only, bottom-up (deepest committed first, so parent gitlinks can bump)'
+       elif [ "$MC_SH_ONLY" = 1 ]; then
+         printf -- '--sh: the SHADOWED repos only'
+       else
+         printf 'the whole tree below, bottom-up (deepest committed first, so parent gitlinks can bump)'
+       fi)" \
     "$([ "$_mc_mode" != go ] && printf 'analyze only -- nothing is written')"
 
   _rc_total=0
