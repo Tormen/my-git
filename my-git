@@ -1494,6 +1494,24 @@ select_tree_nodes() {
   fi
 }
 
+# _gated_subtree_hint <root>
+#   The cross-user gate is per REPO, but skipping a root skips everything
+#   below it -- so a user who owns src but not the global root above it sees
+#   "nothing to do" for a tree of 26 repos that are entirely theirs. Until
+#   the gate descends instead of aborting, at least say where the work went.
+_gated_subtree_hint() {
+  _gsh_r=$1
+  printf '    > repos BELOW it are skipped too, even ones you own.\n'
+  { list_direct_submodules "$_gsh_r" 2>/dev/null
+    list_unregistered_nested "$_gsh_r" 2>/dev/null
+  } | sort -u | while IFS= read -r _gsh_c; do
+        [ -n "$_gsh_c" ] || continue
+        [ -e "$_gsh_r/$_gsh_c/.git" ] || continue
+        printf '    > run it there instead:  (cd %s/%s && %s ...)\n' "$_gsh_r" "$_gsh_c" "$US"
+      done
+  printf '    > or as the owner:  sudo %s ...\n' "$US"
+}
+
 # is_nested_ignored <repo> <sub>
 #   Return 0 if $repo/$sub has the my-git.ignore marker.
 is_nested_ignored() {
@@ -2105,13 +2123,18 @@ cmd_status() {
   # Per-repo state counts are collected into a separate tmp (one char
   # per repo: C=clean, A=ahead, B=behind, V=diverged, D=dirty, E=error/skip).
   _stcounts_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stcounts.XXXXXX")
+  # KIND is a separate axis from STATE. A shadowed repo has both: it is
+  # shadowed AND it is clean or dirty. Counting them in one list made the
+  # summary read as a partition of the total when it was not -- 25 rows
+  # displayed DIRTY while the summary said DIRTY=1.
+  _stkind_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stkind.XXXXXX")
   # Parallel tallies for the flag column: publish state (L=local-only ⌂,
   # R=has-remote ↑) and the my-git.ignore marker (I). Counted in
   # the Summary. Only the default tree path fills these (the -V per-node view
   # renders no flag column).
   _stflag_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stflag.XXXXXX")
   _stign_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stign.XXXXXX")
-  trap 'rm -f "$_rtmp" "$_stcounts_tmp" "$_stflag_tmp" "$_stign_tmp"' EXIT INT TERM HUP
+  trap 'rm -f "$_rtmp" "$_stcounts_tmp" "$_stkind_tmp" "$_stflag_tmp" "$_stign_tmp"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   _first=1
   while IFS= read -r _root; do
@@ -2126,6 +2149,7 @@ cmd_status() {
         ;;
       warn)
         printf '%s  [SKIPPED — cross-user policy]\n' "$_root"
+        _gated_subtree_hint "$_root"
         echo E >> "$_stcounts_tmp"
         continue
         ;;
@@ -2361,10 +2385,13 @@ _ST_MKEOF
         case "$_flag" in '⌂') echo L >> "$_stflag_tmp" ;; '↑') echo R >> "$_stflag_tmp" ;; esac
         case "$_tag" in unreg-ign|reg-ign) echo I >> "$_stign_tmp" ;; esac
         case "$_tag" in
-          realized) echo R >> "$_stcounts_tmp"; continue ;;
-          merged)   echo G >> "$_stcounts_tmp"; continue ;;
-          zipped)   echo Z >> "$_stcounts_tmp"; continue ;;
-          shadowed) echo H >> "$_stcounts_tmp"; continue ;;
+          # These two keep a LIVE .git, so they have a state as well as a
+          # kind -- record the kind here and fall through to be classified.
+          realized) echo R >> "$_stkind_tmp" ;;
+          shadowed) echo H >> "$_stkind_tmp" ;;
+          # These two have no .git at all: kind is the whole story.
+          merged)   echo G >> "$_stkind_tmp"; echo G >> "$_stcounts_tmp"; continue ;;
+          zipped)   echo Z >> "$_stkind_tmp"; echo Z >> "$_stcounts_tmp"; continue ;;
         esac
         case "$_sum" in
           "CLEAN :))"*)         echo C ;;
@@ -2418,10 +2445,10 @@ _ST_MKEOF
     _n_dirty=$(grep -c '^D$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_oldco=$(grep -c '^O$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_err=$(grep -c '^E$' "$_stcounts_tmp" 2>/dev/null | head -1)
-    _n_realized=$(grep -c '^R$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_realized=$(grep -c '^R$' "$_stkind_tmp" 2>/dev/null | head -1)
     _n_merged=$(grep -c '^G$' "$_stcounts_tmp" 2>/dev/null | head -1)
     _n_zipped=$(grep -c '^Z$' "$_stcounts_tmp" 2>/dev/null | head -1)
-    _n_shadowed=$(grep -c '^H$' "$_stcounts_tmp" 2>/dev/null | head -1)
+    _n_shadowed=$(grep -c '^H$' "$_stkind_tmp" 2>/dev/null | head -1)
     echo
     log_major "Summary"
     _parts=""
@@ -2431,12 +2458,20 @@ _ST_MKEOF
     [ "$_n_div" -gt 0 ]      && _parts="$_parts $(c_yellow "diverged=$_n_div")"
     [ "$_n_dirty" -gt 0 ]    && _parts="$_parts $(c_yellow "DIRTY=$_n_dirty")"
     [ "$_n_oldco" -gt 0 ]    && _parts="$_parts old-checkout=$_n_oldco"
-    [ "$_n_realized" -gt 0 ] && _parts="$_parts sidecar=$_n_realized"
-    [ "$_n_merged" -gt 0 ]   && _parts="$_parts merged=$_n_merged"
-    [ "$_n_zipped" -gt 0 ]   && _parts="$_parts zipped=$_n_zipped"
-    [ "$_n_shadowed" -gt 0 ] && _parts="$_parts shadowed=$_n_shadowed"
+    [ "$_n_merged" -gt 0 ]   && _parts="$_parts merged=$_n_merged(no .git)"
+    [ "$_n_zipped" -gt 0 ]   && _parts="$_parts zipped=$_n_zipped(no .git)"
     [ "$_n_err" -gt 0 ]      && _parts="$_parts $(c_red "err/skip=$_n_err")"
     printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$_st_total" "$_parts" "$C_RESET"
+    # Kinds are a SEPARATE axis and overlap the states above -- a shadowed
+    # repo is counted once as shadowed here and once as clean/dirty there.
+    # Its own line, so the two are never read as adding up.
+    _kparts=""
+    [ "$_n_shadowed" -gt 0 ] && _kparts="$_kparts  shadowed=$_n_shadowed"
+    [ "$_n_realized" -gt 0 ] && _kparts="$_kparts  sidecar=$_n_realized"
+    [ "$_n_merged" -gt 0 ]   && _kparts="$_kparts  merged=$_n_merged"
+    [ "$_n_zipped" -gt 0 ]   && _kparts="$_kparts  zipped=$_n_zipped"
+    [ -n "$_kparts" ] && printf '  %s>> kinds: %s   (overlaps the states above)%s\n' \
+      "$C_BLUE" "$_kparts" "$C_RESET"
     # Flag-column tally + inline meaning (default tree only; empty under -V,
     # where the -V legend already spells the flags out). Each part is shown
     # only when non-zero so the line stays terse.
@@ -2449,7 +2484,7 @@ _ST_MKEOF
     [ "${_n_ignored:-0}" -gt 0 ]   && _fparts="$_fparts  ignored(my-git leaves it alone; not descended)=$_n_ignored"
     [ -n "$_fparts" ] && printf '  %s>> flags:%s%s\n' "$C_BLUE" "$_fparts" "$C_RESET"
   fi
-  rm -f "$_stcounts_tmp" "$_stflag_tmp" "$_stign_tmp"
+  rm -f "$_stcounts_tmp" "$_stkind_tmp" "$_stflag_tmp" "$_stign_tmp"
 }
 
 # ─── Masscommits subcommand ─────────────────────────────────────────────
@@ -2929,7 +2964,8 @@ cmd_masscommits() {
     priv_gate "$_root"
     case "$PRIV_ACTION" in
       skip) continue ;;
-      warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
+      warn) log_major "$_root: [SKIPPED — cross-user policy]"
+            _gated_subtree_hint "$_root"; continue ;;
     esac
     # The whole tree, like pull and push -- committing ONE repo is what
     # plain git already does. Deepest first, so a parent's gitlink can bump
@@ -3158,7 +3194,8 @@ cmd_push() {
     priv_gate "$_root"
     case "$PRIV_ACTION" in
       skip) continue ;;
-      warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
+      warn) log_major "$_root: [SKIPPED — cross-user policy]"
+            _gated_subtree_hint "$_root"; continue ;;
     esac
     _nodes=$(select_tree_nodes "$_root" "$PS_SM_ONLY" "$PS_SH_ONLY")
     _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.psnodes.XXXXXX")
@@ -3382,7 +3419,8 @@ cmd_pull() {
     priv_gate "$_root"
     case "$PRIV_ACTION" in
       skip) continue ;;
-      warn) log_major "$_root: [SKIPPED — cross-user policy]"; continue ;;
+      warn) log_major "$_root: [SKIPPED — cross-user policy]"
+            _gated_subtree_hint "$_root"; continue ;;
     esac
     # The whole tree by default. Pulling ONE repo is what plain git already
     # does; my-git exists for the multitude, and 'st' -- the command people
