@@ -3286,12 +3286,30 @@ push_one() {
     PS_N_NOREMOTE=$((PS_N_NOREMOTE + 1)); return 0
   fi
 
-  _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  # ONE call for branch + upstream + ahead/behind, as pull, mc and st do.
+  # '## <branch>...<upstream> [ahead N, behind M]', entries after.
+  _sb_ps=$(run_as_owner_capture "$_r" git status -b --porcelain --ignore-submodules=dirty 2>/dev/null)
+  _bline_ps=$_sb_ps
+  case "$_sb_ps" in
+    *"
+"*) _bline_ps=${_sb_ps%%"
+"*} ;;
+  esac
+  _hdr_ps=${_bline_ps#\#\# }
+  _branch=${_hdr_ps%%...*}
+  _branch=${_branch%% *}
+  case "$_hdr_ps" in
+    # Detached HEAD reads '## HEAD (no branch)'.
+    "HEAD"*) _branch=HEAD ;;
+  esac
   if [ -z "$_branch" ] || [ "$_branch" = HEAD ]; then
     log_warn "$_r: detached HEAD — not pushing"
     PS_N_SKIPPED=$((PS_N_SKIPPED + 1)); return 0
   fi
-  _up=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)
+  _up=""
+  case "$_hdr_ps" in
+    *...*) _up=${_hdr_ps#*...}; _up=${_up%% *} ;;
+  esac
   if [ -z "$_up" ]; then
     # Heal ONLY the safe half. If origin/<same-name> already exists, setting
     # tracking records a fact that is already true -- local config, nothing
@@ -3312,6 +3330,16 @@ push_one() {
       if run_as_owner "$_r" git branch --set-upstream-to="origin/$_branch" "$_branch" >/dev/null 2>&1; then
         log_medium "$_r: tracked origin/$_branch (it already exists there; nothing published)"
         _up="origin/$_branch"
+        # The header we parsed was read BEFORE the upstream existed, so its
+        # ahead/behind is 0 by definition. Re-read it -- one extra call, and
+        # only on the rare run that actually adopts a branch.
+        _sb_ps=$(run_as_owner_capture "$_r" git status -b --porcelain --ignore-submodules=dirty 2>/dev/null)
+        case "$_sb_ps" in
+          *"
+"*) _bline_ps=${_sb_ps%%"
+"*} ;;
+          *)   _bline_ps=$_sb_ps ;;
+        esac
       fi
     fi
   fi
@@ -3342,7 +3370,10 @@ push_one() {
       case "$_ps_url" in "$_ps_pat"*) _ps_mine=1; break ;; esac
     done
     if [ "$_ps_mine" = 0 ]; then
-      _ps_a=$(run_as_owner_capture "$_r" git rev-list --count "$_up..HEAD" 2>/dev/null)
+      _ps_a=0
+      case "$_bline_ps" in
+        *"[ahead "*) _ps_a=${_bline_ps#*"[ahead "}; _ps_a=${_ps_a%%[!0-9]*} ;;
+      esac
       if [ "${_ps_a:-0}" -gt 0 ]; then
         log_major "$(printf '%-60s %s' "$_r" "FOREIGN remote, $_ps_a local commit(s) -> not pushed")"
         printf '    > %s is not yours. Contribute deliberately when ready:\n' "$_ps_url"
@@ -3355,12 +3386,16 @@ push_one() {
     fi
   fi
 
-  # --left-right --count answers both sides in one call: "<behind>\t<ahead>".
-  _ps_lr=$(run_as_owner_capture "$_r" git rev-list --left-right --count "$_up...HEAD" 2>/dev/null)
-  _behind=${_ps_lr%%	*}
-  _ahead=${_ps_lr##*	}
-  case "$_ahead" in ''|*[!0-9]*) _ahead=0 ;; esac
-  case "$_behind" in ''|*[!0-9]*) _behind=0 ;; esac
+  # Already in the status header -- no extra call.
+  _ahead=0; _behind=0
+  case "$_bline_ps" in
+    *"[ahead "*) _ahead=${_bline_ps#*"[ahead "}; _ahead=${_ahead%%[!0-9]*} ;;
+  esac
+  case "$_bline_ps" in
+    *"behind "*) _behind=${_bline_ps#*"behind "}; _behind=${_behind%%[!0-9]*} ;;
+  esac
+  [ -n "$_ahead" ] || _ahead=0
+  [ -n "$_behind" ] || _behind=0
 
   if [ "$_ahead" -eq 0 ]; then
     [ "$VRB" = 1 ] && log_medium "$_r: up to date with $_up"
@@ -3545,21 +3580,43 @@ pull_one() {
     fi
   fi
 
-  # Compute ahead/behind vs current branch's tracked remote.
-  _branch=$(run_as_owner_capture "$_r" git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  # ONE call for all four questions -- branch, does an upstream exist, how
+  # far ahead/behind, and is the worktree dirty. '-b' prepends
+  #   ## <branch>...<upstream> [ahead N, behind M]
+  # and the entries follow. This replaced rev-parse + 'branch -a' +
+  # rev-list + status; 'branch -a' in particular enumerated every ref,
+  # remote ones included, to answer one yes/no. Same shape st and mc use.
+  _sb_pl=$(run_as_owner_capture "$_r" git status -b --porcelain --ignore-submodules=dirty 2>/dev/null)
+  _bline_pl=$_sb_pl
+  _porc=""
+  case "$_sb_pl" in
+    *"
+"*) _bline_pl=${_sb_pl%%"
+"*}
+        _porc=${_sb_pl#*"
+"} ;;
+  esac
+  _hdr_pl=${_bline_pl#\#\# }
+  _branch=${_hdr_pl%%...*}
+  _branch=${_branch%% *}
   _rem_ref=origin/$_branch
-  _has_remote=$(run_as_owner_capture "$_r" git branch -a 2>/dev/null \
-    | grep -E "^[[:space:]]*remotes/$_rem_ref$" || true)
+  case "$_hdr_pl" in
+    *...*) _has_remote=1 ;;
+    *)     _has_remote="" ;;
+  esac
   if [ -z "$_has_remote" ]; then
     _desc="fetched; no origin/$_branch tracking ref"
     _action=noop
   else
-    _ab=$(run_as_owner_capture "$_r" git rev-list --left-right --count \
-      "${_rem_ref}...${_branch}" 2>/dev/null)
-    _behind=$(printf '%s' "$_ab" | awk '{print $1+0}')
-    _ahead=$(printf '%s' "$_ab" | awk '{print $2+0}')
-    # Worktree dirty?
-    _porc=$(run_as_owner_capture "$_r" git status --porcelain --ignore-submodules=dirty 2>/dev/null)
+    _ahead=0; _behind=0
+    case "$_bline_pl" in
+      *"[ahead "*) _ahead=${_bline_pl#*"[ahead "}; _ahead=${_ahead%%[!0-9]*} ;;
+    esac
+    case "$_bline_pl" in
+      *"behind "*) _behind=${_bline_pl#*"behind "}; _behind=${_behind%%[!0-9]*} ;;
+    esac
+    [ -n "$_ahead" ] || _ahead=0
+    [ -n "$_behind" ] || _behind=0
     if [ -n "$_porc" ]; then
       _desc="DIRTY (${_ahead:-0}/${_behind:-0} ahead/behind)"
       _action="skip (worktree dirty)"
