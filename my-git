@@ -678,17 +678,36 @@ priv_gate() {
 #   credential helper works from a root-run my-git.
 #   Answered once per target: probing launchctl on every git call would
 #   cost a fork per repo per command.
+# Decided ONCE per run, from the parent shell -- see _xu_init_session. A
+# memo inside this function would be useless: nearly every caller invokes it
+# through run_as_owner_capture inside $(...), a subshell, so the cached
+# answer dies with each command and the probe would run per git call
+# (~150 of them on this tree).
 _xu_session_uid() {
-  _xus_t=$1
-  if [ "${_xu_memo_tgt:-}" = "$_xus_t" ]; then printf '%s' "${_xu_memo_uid:-}"; return 0; fi
-  _xu_memo_tgt=$_xus_t; _xu_memo_uid=""
-  if [ "${XUSER_LAUNCHCTL:-1}" = 1 ] && [ "$(file_owner /dev/console 2>/dev/null)" = "$_xus_t" ]; then
-    _xus_u=$(id -u "$_xus_t" 2>/dev/null)
-    # Probe: no graphical session (ssh-only box, or logged out) means the
-    # per-user domain does not exist and asuser fails. Fall back quietly.
-    [ -n "$_xus_u" ] && launchctl asuser "$_xus_u" true >/dev/null 2>&1 && _xu_memo_uid=$_xus_u
-  fi
-  printf '%s' "$_xu_memo_uid"
+  [ -n "${_XU_SESSION_USER:-}" ] && [ "$1" = "$_XU_SESSION_USER" ] \
+    && printf '%s' "${_XU_SESSION_UID:-}"
+  return 0
+}
+
+# _xu_init_session
+#   Who is at the console, and can we join their launchd session? Answered
+#   once, before any subcommand runs, so the result is inherited by every
+#   subshell below. Only meaningful as root: that is the only case where
+#   my-git drops to another user at all.
+_xu_init_session() {
+  _XU_SESSION_USER=""; _XU_SESSION_UID=""
+  [ "$ME" = root ] || return 0
+  [ "${XUSER_LAUNCHCTL:-1}" = 1 ] || return 0
+  _xui_u=$(file_owner /dev/console 2>/dev/null)
+  [ -n "$_xui_u" ] && [ "$_xui_u" != root ] || return 0
+  _xui_id=$(id -u "$_xui_u" 2>/dev/null)
+  [ -n "$_xui_id" ] || return 0
+  # No graphical session (ssh-only host, logged out) means the per-user
+  # domain does not exist and asuser fails -- fall back to plain su.
+  launchctl asuser "$_xui_id" true >/dev/null 2>&1 || return 0
+  _XU_SESSION_USER=$_xui_u; _XU_SESSION_UID=$_xui_id
+  log_dbg_med "session: $_xui_u (uid $_xui_id) is at the console — git will run in their launchd session (keychain reachable)"
+  return 0
 }
 
 _xuser_exec() {
@@ -17837,14 +17856,17 @@ main() {
   # ─── No subcommand → legacy default: status (piped through less if TTY) ───
   if [ $# -eq 0 ]; then
     if [ -t 1 ]; then
+      _xu_init_session
       cmd_status #| less -R
     else
+      _xu_init_session
       cmd_status
     fi
     exit $?
   fi
 
   _sub=$1; shift
+  _xu_init_session
   case "$_sub" in
     status|st|s)                cmd_status "$@" ;;
     masscommits|mc|c)           cmd_masscommits "$@" ;;
