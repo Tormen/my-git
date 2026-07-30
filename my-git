@@ -523,7 +523,22 @@ file_owner() {
   # fallback never fires). Try GNU's '-c' first instead: it exits
   # non-zero ("invalid option") on BSD/macOS stat, so the fallback to
   # BSD's '-f' only fires where it's actually needed.
-  stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null
+  # ...but only ONCE. Which stat this machine has cannot change during a
+  # run, and the losing form is a whole process guaranteed to fail:
+  # profiling one 41-repo 'st' showed 107 'stat -c' calls, every one
+  # failing, ahead of 107 'stat -f' calls that worked. _init_stat_flavour
+  # settles it in the parent shell so subshells inherit the answer; the
+  # last branch keeps this correct if anything calls us before main runs.
+  case "${_STAT_OWNER_MODE:-}" in
+    gnu) stat -c '%U'  "$1" 2>/dev/null ;;
+    bsd) stat -f '%Su' "$1" 2>/dev/null ;;
+    *)   stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null ;;
+  esac
+}
+
+# Settle GNU-vs-BSD stat once, in the parent, so every subshell inherits it.
+_init_stat_flavour() {
+  if stat -c '%U' / >/dev/null 2>&1; then _STAT_OWNER_MODE=gnu; else _STAT_OWNER_MODE=bsd; fi
 }
 
 is_managed_path() {
@@ -18032,16 +18047,17 @@ main() {
   # ─── No subcommand → legacy default: status (piped through less if TTY) ───
   if [ $# -eq 0 ]; then
     if [ -t 1 ]; then
-      _xu_init_session
+      _init_stat_flavour; _xu_init_session
       cmd_status #| less -R
     else
-      _xu_init_session
+      _init_stat_flavour; _xu_init_session
       cmd_status
     fi
     exit $?
   fi
 
   _sub=$1; shift
+  _init_stat_flavour
   _xu_init_session
   case "$_sub" in
     status|st|s)                cmd_status "$@" ;;
