@@ -955,8 +955,8 @@ list_realized_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '$_lrd_grd' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e "s|/${_lrd_grd}\$||" -e "s|^${_lrd_grd}\$||" \
-    | grep -v '^$' | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
+  ) | sed -e 's|^\./||' -e "s|/${_lrd_grd}\$||" -e "s|^${_lrd_grd}\$||" -e '/^$/d' \
+    | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
     | { if [ "$_lrd_collapse" = collapse ]; then
           # Collapse-mode: keep only the TOP-MOST sidecar of each nest and
           # drop any sidecar sitting under an already-kept one. This is for
@@ -1230,8 +1230,7 @@ list_merged_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.merged' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' \
-    | grep -v '^$' \
+  ) | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' -e '/^$/d' \
     | while IFS= read -r _lmd_p; do
         [ -n "$_lmd_p" ] || continue
         if [ -e "$_lmd_r/$_lmd_p/.git" ] || [ -e "$_lmd_r/$_lmd_p/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
@@ -1265,8 +1264,8 @@ list_zipped_dirs() {
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o \\( -name .git.zip -o -name .git.real.zip \\) -print 2>/dev/null"
   ) | sed -e 's|^\./||' -e 's|/\.git\.real\.zip$||' -e 's|/\.git\.zip$||' \
-        -e 's|^\.git\.real\.zip$||' -e 's|^\.git\.zip$||' \
-    | grep -v '^$' | sort -u | while IFS= read -r _lzd_d; do
+        -e 's|^\.git\.real\.zip$||' -e 's|^\.git\.zip$||' -e '/^$/d' \
+    | sort -u | while IFS= read -r _lzd_d; do
         # Skip a dir that still has a LIVE git dir next to the zip (gz -k):
         # it is a working repo, not an archived one.
         [ -e "$_lzd_r/$_lzd_d/.git" ] && continue
@@ -1309,8 +1308,8 @@ list_shadow_markers() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.shadow.status' -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' \
-    | grep -v '^$' | sort -u
+  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
+    | sort -u
 }
 
 list_shadowed_dirs() {
@@ -1325,8 +1324,8 @@ list_shadowed_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.shadow.status' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' \
-    | grep -v '^$' | sort -u | while IFS= read -r _lsh_d; do
+  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
+    | sort -u | while IFS= read -r _lsh_d; do
         # A marker only means "shadowed" while a LIVE .git sits beside it.
         [ -e "$_lsh_r/$_lsh_d/.git" ] || continue
         printf '%s\n' "$_lsh_d"
