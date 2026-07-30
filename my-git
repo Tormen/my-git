@@ -2988,7 +2988,10 @@ commit_one() {
       ;;
     clean-ahead)
       if [ "$_pushable" != 1 ]; then
-        log_major "$_r: $_state_desc  ($_nopush_reason — no push)"
+        # The reason is already in _state_desc (set where the state was
+        # classified) -- appending it again printed it twice:
+        #   CLEAN, ahead=3  (not in GIT_REPOS → no push)  (not in GIT_REPOS — no push)
+        log_major "$_r: $_state_desc"
         MC_N_CLEAN=$((MC_N_CLEAN + 1))
         return 0
       fi
