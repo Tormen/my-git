@@ -732,8 +732,13 @@ _xuser_exec() {
   if [ "$ME" = "root" ]; then
     _xu_uid=$(_xu_session_uid "$_tgt")
     if [ -n "$_xu_uid" ]; then
-      log_dbg_med "launchctl asuser $_xu_uid sudo -u $_tgt sh -c \"cd $_repo && $_cmdstr\"  # joins $_tgt's session: keychain reachable"
-      run launchctl asuser "$_xu_uid" sudo -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr"
+      # -H is not optional. sudo leaves HOME pointing at the CALLER's home
+      # unless told otherwise, so git ran as the right user but read root's
+      # config path -- no user.name, no user.email, and every commit died
+      # with "Author identity unknown". 'su' set HOME for free, which is why
+      # this only appeared once the launchctl path replaced it.
+      log_dbg_med "launchctl asuser $_xu_uid sudo -H -u $_tgt sh -c \"cd $_repo && $_cmdstr\"  # joins $_tgt's session (keychain) with $_tgt's HOME (gitconfig)"
+      run launchctl asuser "$_xu_uid" sudo -H -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr"
       return $?
     fi
     log_dbg_med "su $_tgt -c \"cd $_repo && $_cmdstr\"  # no console session for $_tgt: no keychain"
