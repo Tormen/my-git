@@ -8549,7 +8549,14 @@ cmd_rehydrate() {
         # every secondary machine would end up with a dirty container and
         # content ahead of what it records. fetch moves objects only and
         # cannot touch a working file.
-        run git -C "$_rh_p" fetch -q --all --prune </dev/null >/dev/null 2>&1 || true
+        # Do NOT swallow this. "could not reach the remote" and "the files
+        # match no commit" are opposite conclusions that look identical from
+        # the outside, and discarding the error turned a root-owned
+        # .git/objects -- so 'me' could not unpack what it had just
+        # downloaded -- into a silent "nothing to repair" on a whole machine.
+        if ! _rh_ferr=$(run git -C "$_rh_p" fetch -q --all --prune </dev/null 2>&1); then
+          log_warn "rehydrate: $_rh_p — fetch FAILED, so a matching commit may exist that cannot be seen from here: $(printf '%s' "$_rh_ferr" | tail -n 2 | tr '\n' ' ')"
+        fi
         _rh_m=$(wt_matches_commit "$_rh_p" 2>/dev/null </dev/null) || _rh_m=""
       fi
       if [ -n "$_rh_m" ]; then
