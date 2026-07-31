@@ -8540,6 +8540,18 @@ cmd_rehydrate() {
       # Only fires when the worktree hashes to a commit exactly -- a repo
       # with genuine local edits matches nothing and is never touched.
       _rh_m=$(wt_matches_commit "$_rh_p" 2>/dev/null </dev/null) || _rh_m=""
+      if [ -z "$_rh_m" ]; then
+        # No match yet does not mean no match exists: the commit these files
+        # ARE may simply not have been fetched here. Fetch and ask again.
+        #
+        # fetch, not pull, deliberately. pull would fast-forward the worktree
+        # to upstream's tip -- changing files that the container TRACKS, so
+        # every secondary machine would end up with a dirty container and
+        # content ahead of what it records. fetch moves objects only and
+        # cannot touch a working file.
+        run git -C "$_rh_p" fetch -q --all --prune </dev/null >/dev/null 2>&1 || true
+        _rh_m=$(wt_matches_commit "$_rh_p" 2>/dev/null </dev/null) || _rh_m=""
+      fi
       if [ -n "$_rh_m" ]; then
         _rh_h=$(git -C "$_rh_p" rev-parse HEAD 2>/dev/null </dev/null)
         [ -n "$_rh_h" ] && [ "$_rh_m" != "$_rh_h" ] \
