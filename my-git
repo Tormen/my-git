@@ -2326,7 +2326,14 @@ cmd_status() {
       _st_act=$(git -C "$_root/$_st_mk" config --get remote.origin.url 2>/dev/null)
       [ -n "$_st_act" ] || continue
       [ "$_st_rec" = "$_st_act" ] && continue
-      log_warn "$_st_mk: its marker records remote '${_st_rec:-<none>}' but the repo now uses '$_st_act' — 'rehydrate' would clone the OLD one. Refresh with: $US shadow go $_st_mk"
+      # This heals itself: the shadow pre-commit hook rewrites the marker's
+      # remote on every commit in the container. Say so -- offering only a
+      # manual command made a transient, self-correcting drift read as
+      # something broken. st does NOT write it here on purpose: the marker is
+      # a TRACKED file, and st only ever writes .git/info/exclude, which is
+      # local and can never become a commit. Dirtying tracked files belongs
+      # to commit time, which is where the hook does it.
+      log_warn "$_st_mk: its marker records remote '${_st_rec:-<none>}' but the repo now uses '$_st_act' — until it is refreshed, 'rehydrate' would clone the OLD one. It refreshes on the next commit here; to do it now: $US shadow go $_st_mk"
     done <<_ST_MKEOF
 $(list_shadowed_dirs "$_root" 2>/dev/null)
 _ST_MKEOF
