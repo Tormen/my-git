@@ -1367,6 +1367,7 @@ list_zipped_dirs() {
 list_shadow_markers() {
   _lsm_r=$1
   [ -d "$_lsm_r" ] || return 0
+  { _disc_query "$_lsm_r" .git.shadow.status || \
   ( cd "$_lsm_r" 2>/dev/null || exit 0
     # Same prune set as list_shadowed_dirs, including '-name .git'. The
     # marker is written at <path>/.git.shadow.status -- a SIBLING of .git,
@@ -1381,7 +1382,7 @@ list_shadow_markers() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.shadow.status' -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
+  ) ; } | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
     | sort -u
 }
 
@@ -2009,8 +2010,13 @@ walk_tree_lines() (
   # Shadowed dirs have a live .git, so a MANAGED scope already finds them via
   # _subs_unreg — but they're a my-git marker, so union them in explicitly to
   # surface them in a FOREIGN scope too (like sidecars/merged/zipped).
-  _all=$(printf '%s\n%s\n%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" "$_subs_stale" "$_markers" "$_subs_shadowed" | grep -v '^$' | sort -u)
-  _all=$(printf '%s\n%s\n' "$_all" "$_subs_norepo" | grep -v '^$' | sort -u)
+  # ONE pipeline, not three. This runs per NODE, so each extra stage is a
+  # fork times the size of the tree: the old form spent 6 processes here
+  # (2 x grep + 2 x sort + the printfs' subshells) where 2 will do, and the
+  # intermediate 'sort -u' was redundant anyway -- the collapse below
+  # re-sorts everything from scratch.
+  _all=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$_subs_reg" "$_subs_unreg" \
+           "$_subs_stale" "$_markers" "$_subs_shadowed" "$_subs_norepo" | sort -u)
   # Collapse the FULL set to top-most (same rule as _markers above, now applied
   # over everything): a nested repo — e.g. a [shadowed] one under a [merged]
   # parent, or a [zipped] one under a [shadowed] parent — is surfaced by
@@ -2018,11 +2024,18 @@ walk_tree_lines() (
   # list_shadowed_dirs (recursive) and list_unregistered_nested (descending
   # through merged content that has no .git boundary) return such deep paths,
   # which previously double-listed: once nested, once flat at the top.
-  _all=$(printf '%s\n' "$_all" | grep -v '^$' | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
+  _all=$(printf '%s\n' "$_all" | awk -F/ 'NF && $0 != "" {print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
     | awk 'function is_under(a, n, p,   i) { for (i=1;i<=n;i++) if (p==a[i] || index(p, a[i] "/")==1) return 1; return 0 }
            { if (is_under(kept, nk, $0)) next; print; kept[++nk]=$0 }')
   [ -z "$_all" ] && return 0
-  _total=$(printf '%s\n' "$_all" | grep -c .)
+  # Counting lines already held in a variable does not need two processes.
+  _total=0
+  _ct_oifs=$IFS; IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $_all
+  IFS=$_ct_oifs
+  for _ct_l in "$@"; do [ -n "$_ct_l" ] && _total=$((_total + 1)); done
   _i=0
   printf '%s\n' "$_all" | while IFS= read -r _sub; do
     [ -n "$_sub" ] || continue
@@ -2476,6 +2489,11 @@ cmd_status() {
   _first=1
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
+    # ONE marker sweep for this root, before anything asks. Built here rather
+    # than just before the tree walk because the stale-marker report and the
+    # exclude healing both call list_shadowed_dirs first, and were still
+    # paying for their own full find of the tree.
+    _disc_cache_build "$_root"
     priv_gate "$_root"
     [ "$_first" = 1 ] || printf '\n'
     _first=0
@@ -2603,9 +2621,6 @@ _ST_MKEOF
       # Tag the ROOT itself if it's a sidecar/merged path (so 'st <sidecar>'
       # / 'st <merged>' render correctly instead of failing status_summary).
       _root_tag=$(flatten_marker_tag "$_root")
-      # One marker sweep for this whole root, instead of five per node.
-      # 'st' is read-only, so a snapshot cannot go stale under it.
-      _disc_cache_build "$_root"
       walk_tree_lines "$_root" "$_root" "" "" "$_root_tag" \
         | while IFS="$(printf '\t')" read -r _left _abs _tag; do
             # Every tag that describes a RELATIONSHIP carries '@<repo>' —
@@ -2613,7 +2628,7 @@ _ST_MKEOF
             # ([raw-nested-git], [zipped]) carry no '@', because there is
             # no second repo to name.
             _at=$(related_repo_of "$_abs" "$_tag")
-            [ -n "$_at" ] && _at=" @$(basename "$_at")"
+            [ -n "$_at" ] && _at=" @${_at##*/}"
             _mark=""
             case "$_tag" in
               reg)       _mark="[registered-sm$_at]" ;;
@@ -2634,7 +2649,7 @@ _ST_MKEOF
                          else
                            _shinto=$(sed -n 's|^shadowed-into-repo: ||p' "$_abs/.git.shadow.status" 2>/dev/null | head -n 1)
                            if [ -n "$_shinto" ] && [ "$_shinto" != "<unknown>" ]; then
-                             _mark="[shadowed STALE: @$(basename "$_shinto") no longer tracks it]"
+                             _mark="[shadowed STALE: @${_shinto##*/} no longer tracks it]"
                            else
                              _mark="[shadowed STALE: no repo tracks it]"
                            fi
