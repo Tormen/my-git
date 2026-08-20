@@ -288,12 +288,18 @@ _default_config_content() {
 # invoked outside of any tracked repo and without explicit path arguments).
 GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
 
-# ─── .claude setup enforcement (masscommits + claude-check) ──────────────
-# 1 = audit+auto-fix; 0 = disable entirely
-CHECK_CLAUDE_SETUP=1
-# Central repo where all <project>/.claude directories live as real dirs.
-# Each project's .claude must be a symlink into this tree.
-CLAUDE_PROJECT_DIR_CENTRAL_REPO="/LINKS/src/,claude-configs"
+# ─── Container force-add: what src carries despite a child ignoring it ───
+# A container repo (e.g. /LINKS/src) mirrors its child repos' files. It
+# HONOURS each child's .gitignore -- a file the child ignores is
+# regenerable by definition (.venv, node_modules, build/), and mirroring
+# it once put 14,327 virtualenv files into the container in one command.
+#
+# But "ignored by the child" also covers deliberately-private-but-valuable
+# files (*.local), which the child hides from GitHub and the container is
+# the ONLY carrier for. This names the file that lists those exceptions.
+# It lives at the CONTAINER ROOT only: a child-level copy would be tracked
+# by that child and pushed, making its contents public.
+FORCE_ADD_PATTERNS_FILE=".git.force-add-patterns"
 
 # ─── Self-healing of derived local state ─────────────────────────────────
 # These repair BOOKKEEPING, never project content, and write ONLY to files
@@ -357,7 +363,7 @@ COMMIT_MSG_DIFF_MAX_FILES=10
 # ─── mc: auto-include untracked files ────────────────────────────────────
 # 1 = treat '??' porcelain entries (new files the user added but didn't
 #     'git add' yet) as auto-committable along with my-git-caused dirt
-#     (submodule gitlink bumps, .claude/.gitignore edits). Rationale:
+#     (submodule gitlink bumps, .gitignore edits). Rationale:
 #     new files are harmless to add; dragging the user through a prompt
 #     for every new file is noise. Set 0 to prompt for untracked too.
 MC_AUTO_COMMIT_UNTRACKED=1
@@ -2395,8 +2401,8 @@ _ST_MKEOF
     # exclusively to .git/info/exclude -- local, never cloned, so it can
     # never become a commit or reach a remote. It also cannot survive a
     # fresh clone, so something has to re-establish it, and the command
-    # people actually run is 'st'. (Contrast the .claude check, which
-    # wrote a TRACKED .gitignore and therefore had to stop enforcing.)
+    # people actually run is 'st'. (Contrast anything that would write a
+    # TRACKED .gitignore, which must never happen behind the user's back.)
     # sort -u: a repo can be healed on both sides in one run (its own marker
     # AND the block hiding a repo nested inside it) and must count once.
     _st_fixed=$(shadow_sync_excludes "$_root" | sort -u)
@@ -2765,7 +2771,7 @@ $(run_as_owner_capture "$_r" git log "-${COMMIT_MSG_LAST_N}" 2>/dev/null)"
 # where:
 #    bumps    = paths that appear in <repo>/.gitmodules (submodule gitlink bumps)
 #    recorded = paths whose abs form is in MC_COMMIT_PATHS
-#               (my-git-side edits to .gitignore, .claude, etc.)
+#               (my-git-side edits to .gitignore, markers, etc.)
 #    user     = everything else (the user's own dirt)
 _mc_classify_dirt() {
   _cd_r=$1
@@ -2908,14 +2914,11 @@ commit_one() {
       ;;
   esac
 
-  # .claude setup audit (before staging so auto-fixes are part of the commit).
-  if [ "$CHECK_CLAUDE_SETUP" = 1 ]; then
-    ensure_claude_setup "$_r" || {
-      log_error "$_r: .claude setup check failed (see above)"
-      MC_N_ERROR=$((MC_N_ERROR + 1))
-      return 1
-    }
-  fi
+  # Carry the files this repo's children ignore but the user wants moved
+  # between machines. BEFORE the dirtiness check below, not after: a
+  # container whose only change is a new .local file reads as CLEAN
+  # otherwise, and mc returns without ever committing it.
+  container_force_add "$_r" >/dev/null || true
 
   # --ignore-submodules=dirty: show gitlink BUMPS (new commits in
   # submodules) so -R bottom-up walk can catch them in the parent's
@@ -7594,9 +7597,9 @@ _SHADOW_EXCL_END='# <<< my-git shadow <<<'
 #   .git.shadow.status markers on disk, my-git owns it entirely, and it is
 #   idempotent. It also does not travel -- .git/info/exclude is local and
 #   never cloned -- so a fresh clone starts with none of it and needs this
-#   to re-establish the arrangement. That is why 'st' may run it, unlike
-#   the .claude check: this writes ONLY to .git/info/exclude, never to a
-#   tracked file, so it can never become a commit or reach a remote.
+#   to re-establish the arrangement. That is why 'st' may run it: this
+#   writes ONLY to .git/info/exclude, never to a tracked file, so it can
+#   never become a commit or reach a remote.
 #
 #   Written as a managed block so re-deriving never touches hand-written
 #   exclude lines, and a path that stops being shadowed drops out on its
@@ -7790,6 +7793,13 @@ _shadow_one() {
     rmdir "$_sho_tmp" 2>/dev/null
     exit $_sho_rc
   )
+  _sho_rc=$?
+  # The plain add above honours the child's .gitignore, which is what
+  # keeps .venv and node_modules out of the mirror. The files the child
+  # hides from GitHub but wants on every machine are the exception, and
+  # they are named explicitly in the container's force-add pattern file.
+  container_force_add "$PWD" >/dev/null || true
+  return $_sho_rc
 }
 
 # my-git shadow [go] [-i] [path]     (analyze by default)
@@ -8876,7 +8886,7 @@ cmd_remote() {
 #
 # Composite "settle the tree" pipeline: sm → pull → mc.
 #   Phase 1: sm     — register new nested repos, rebind moved ones,
-#                     clean stale .gitmodules entries, .claude fixes.
+#                     clean stale .gitmodules entries.
 #   Phase 2: pull   — fetch + fast-forward.
 #   Phase 3: mc     — commit (auto + user-dirt) + push where allowed.
 # Same flags apply uniformly to all three phases. Analyze by default.
@@ -8928,7 +8938,7 @@ cmd_sync() {
     log_major "sync: ── $_sy_root ──"
 
     echo
-    log_major "sync: phase 1/3 — sm (register / rebind / stale cleanup / .claude)"
+    log_major "sync: phase 1/3 — sm (register / rebind / stale cleanup)"
     echo
     # sm operates on CWD, so cd in; subshell to keep outer $PWD untouched.
     # shellcheck disable=SC2086
@@ -8963,62 +8973,11 @@ cmd_sync() {
   return $_worst
 }
 
-# ─── .claude setup enforcement ──────────────────────────────────────────
-# Compute where in the central repo a project's .claude should live.
-claude_dest_for() {
-  _r=$1
-  # Compare RESOLVED paths, not strings. The same root is reachable under
-  # several spellings here (/LINKS/global, /syst/global,
-  # /Users/.../system/global all name one directory), so a textual match
-  # missed whenever my-git was invoked through a different one -- and every
-  # project then fell through to misc/, breaking the mirror-the-project-path
-  # layout that every correctly-placed .claude follows.
-  _cdf_rp=$( cd "$_r" 2>/dev/null && pwd -P ) || _cdf_rp=$_r
-  # The central repo lives INSIDE the tree it serves
-  # (/LINKS/src/,claude-configs alongside /LINKS/src/sh/my-git), and the
-  # layout mirrors each project's path relative to THAT parent:
-  #   src/sh/my-appleRAID  ->  ,claude-configs/sh/my-appleRAID
-  # So the parent is the natural anchor, and it is derived rather than
-  # configured twice. Deriving it from GIT_REPOS instead produced
-  # ',claude-configs/src/sh/my-git' -- correct relative to /LINKS/global,
-  # but not what any existing sibling looks like.
-  _cdf_anchor=${CLAUDE_PROJECT_DIR_CENTRAL_REPO%/*}
-  _cdf_ap=$( cd "$_cdf_anchor" 2>/dev/null && pwd -P ) || _cdf_ap=""
-  if [ -n "$_cdf_ap" ]; then
-    case "$_cdf_rp/" in
-      "$_cdf_ap"/*)
-        printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_cdf_rp#"$_cdf_ap"/}"
-        return
-        ;;
-    esac
-  fi
-  for _base in $GIT_REPOS; do
-    _cdf_bp=$( cd "$_base" 2>/dev/null && pwd -P ) || _cdf_bp=$_base
-    [ -n "$_cdf_bp" ] || continue
-    if [ "$_cdf_rp" = "$_cdf_bp" ]; then
-      printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_cdf_bp##*/}"
-      return
-    fi
-    case "$_cdf_rp/" in
-      "$_cdf_bp"/*)
-        printf '%s/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_cdf_rp#"$_cdf_bp"/}"
-        return
-        ;;
-    esac
-  done
-  # Fallback — basename under misc/. Reaching this means the project is
-  # outside every GIT_REPOS root, which is worth saying out loud: the
-  # result does NOT mirror the project's path, so it will not match its
-  # siblings.
-  log_warn "claude: $_r is under no GIT_REPOS root — placing its .claude at misc/${_r##*/}, which does NOT mirror the project path. Add its root to GIT_REPOS to get the usual layout."
-  printf '%s/misc/%s\n' "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" "${_r##*/}"
-}
-
 # _mc_record_change <abs-path>
-# Append <abs-path> to MC_COMMIT_PATHS if not already there. Mirror of
-# _sm_record_change. Used by mc helpers that mutate tracked files so
-# the end-of-node auto-commit can include exactly those paths (and
-# NOTHING the user edited) in a 'git commit --only' call.
+# Append <abs-path> to MC_COMMIT_PATHS if not already there. A path recorded
+# here is classified as my-git-CAUSED dirt, so mc commits it transparently
+# instead of prompting: my-git must never ask the user to confirm a change
+# my-git itself made.
 _mc_record_change() {
   _rc_p=$1
   [ -n "$_rc_p" ] || return 0
@@ -9034,308 +8993,88 @@ ${_rc_p}
 "
 }
 
-# Ensure '.claude' appears in <repo>/.gitignore (safe, idempotent).
-# Return 0 on success, 1 on failure.
-ensure_claude_gitignore() {
-  _r=$1
-  _gi=$_r/.gitignore
-  if [ -f "$_gi" ]; then
-    # A pattern WITHOUT a trailing slash is the effective one -- see the
-    # note below on symlinks. Accept it and stop.
-    if grep -Eq '^/?\.claude$' "$_gi" 2>/dev/null; then
-      log_dbg_med ".gitignore already lists .claude: $_gi"
-      return 0
-    fi
-    # Only the '.claude/' form present: it matches DIRECTORIES only, so it
-    # does nothing for the symlink the convention actually creates. Upgrade
-    # it in place rather than appending a second, near-identical line.
-    if grep -Eq '^/?\.claude/(\*\*)?$' "$_gi" 2>/dev/null; then
-      if [ "$DRY_RUN" = 1 ]; then
-        log_major "$_gi lists only '.claude/', which cannot match a symlink — DRY: would replace with '.claude'"
-        return 0
+# ─── Container force-add ────────────────────────────────────────────────
+# A container repo (src) MIRRORS its children's files but HONOURS their
+# .gitignore, because a file the child ignores is regenerable by definition.
+# That rule has one exception: files the child hides from its PUBLIC remote
+# yet wants carried between machines (*.local). The container is their only
+# carrier, so it names them explicitly in $FORCE_ADD_PATTERNS_FILE at its
+# own root -- see the config block for why the file cannot live in a child.
+#
+# Read <root>/$FORCE_ADD_PATTERNS_FILE: one glob per line, '#' comments and
+# blank lines dropped. Returns 1 when the repo declares no such file, which
+# is the normal case -- only a container carries one.
+_force_add_patterns() {
+  [ -n "${FORCE_ADD_PATTERNS_FILE:-}" ] || return 1
+  [ -f "$1/$FORCE_ADD_PATTERNS_FILE" ] || return 1
+  sed -e 's/[[:space:]]*$//' "$1/$FORCE_ADD_PATTERNS_FILE" \
+    | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$'
+}
+
+# Does PATH have a COMPONENT matching GLOB?
+# gitignore semantics for a slash-less pattern: it matches at any depth, and
+# a DIRECTORY name as readily as a file name. That is what lets 'memory.local'
+# carry 'memory.local/MEMORY.md' without a pattern naming the file -- and it
+# is why the pattern set can be two lines instead of a list of extensions.
+_fap_path_matches() {
+  _fpm_p=$1; _fpm_g=$2
+  while : ; do
+    # shellcheck disable=SC2254  # the glob IS the pattern -- unquoted on purpose
+    case "${_fpm_p##*/}" in $_fpm_g) return 0 ;; esac
+    case "$_fpm_p" in */*) _fpm_p=${_fpm_p%/*} ;; *) return 1 ;; esac
+  done
+}
+
+# Force-add, into <repo>'s index, every ignored file matching a configured
+# pattern. Prints the number of paths staged (0 when there is nothing to do).
+#
+# Deliberately NOT 'git add -f -- <dir>': -f overrides every .gitignore in
+# the tree, so a directory argument would sweep in .venv / node_modules /
+# build the moment one sat beside a wanted file. Two virtualenvs (14,327
+# files) reached this container that way once. Only paths that ALREADY
+# matched a configured pattern are ever named.
+container_force_add() {
+  _cfa_r=$1
+  _cfa_pats=$(_force_add_patterns "$_cfa_r") || return 0
+  [ -n "$_cfa_pats" ] || return 0
+  _cfa_all=$(mktemp "${TMPDIR:-/tmp}/${US}.fapall.XXXXXX" 2>/dev/null) || return 0
+  _cfa_hit=$(mktemp "${TMPDIR:-/tmp}/${US}.faphit.XXXXXX" 2>/dev/null) || { rm -f "$_cfa_all"; return 0; }
+  # -o -i lists what the container currently IGNORES -- which is exactly the
+  # set that a plain 'add -A' would leave behind. Already-tracked files are
+  # absent from it and need no forcing: an ignore rule has no say over a
+  # path that is already in the index, so one forced add per file is all
+  # this ever costs.
+  run_as_owner_capture "$_cfa_r" git ls-files -o -i --exclude-standard \
+    > "$_cfa_all" 2>/dev/null || { rm -f "$_cfa_all" "$_cfa_hit"; return 0; }
+  while IFS= read -r _cfa_f; do
+    [ -n "$_cfa_f" ] || continue
+    while IFS= read -r _cfa_g; do
+      [ -n "$_cfa_g" ] || continue
+      if _fap_path_matches "$_cfa_f" "$_cfa_g"; then
+        printf '%s\n' "$_cfa_f" >> "$_cfa_hit"; break
       fi
-      _ecg_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.ecg.XXXXXX" 2>/dev/null) || return 1
-      # Drop every slash-form line, then fall through to append the good one.
-      # NOT chained on grep's status: 'grep -v' exits 1 when it selects
-      # NOTHING, which is exactly the case where the file contains only the
-      # lines being removed -- so '&& cat' silently skipped the write and
-      # left the broken pattern in place.
-      grep -Ev '^/?\.claude/(\*\*)?$' "$_gi" > "$_ecg_tmp" 2>/dev/null
-      cat "$_ecg_tmp" > "$_gi" 2>/dev/null
-      rm -f "$_ecg_tmp" 2>/dev/null
-      log_major "$_gi: replaced '.claude/' with '.claude' (the slash form cannot match a symlink)"
+    done <<_FAP_PAT_EOF
+$_cfa_pats
+_FAP_PAT_EOF
+  done < "$_cfa_all"
+  _cfa_n=$(awk 'END{print NR+0}' "$_cfa_hit" 2>/dev/null)
+  if [ "${_cfa_n:-0}" -gt 0 ]; then
+    log_medium "$_cfa_r: carrying $_cfa_n file(s) the child repos ignore (per $FORCE_ADD_PATTERNS_FILE)"
+    [ "$VRB" = 1 ] && while IFS= read -r _cfa_l; do log_minor "$_cfa_l"; done < "$_cfa_hit"
+    # One call, paths from a file: an argv list would blow the limit on a
+    # big sweep, and naming them one at a time would fork per file.
+    if run_as_owner_capture "$_cfa_r" git add -f --pathspec-from-file="$_cfa_hit" \
+         >/dev/null 2>&1; then
+      # my-git staged these, so mc must not stop and ask the user about them.
+      while IFS= read -r _cfa_l; do
+        [ -n "$_cfa_l" ] && _mc_record_change "$_cfa_r/$_cfa_l"
+      done < "$_cfa_hit"
+    else
+      log_warn "$_cfa_r: could not force-add $_cfa_n path(s) listed by $FORCE_ADD_PATTERNS_FILE — they will NOT travel to your other machines"
     fi
   fi
-  if [ "$DRY_RUN" = 1 ]; then
-    log_major ".claude missing from $_gi — DRY: would append"
-    return 0
-  fi
-  log_major ".claude added to $_gi"
-  # Preserve trailing newline; if file exists without final newline, fix that.
-  if [ -f "$_gi" ] && [ -s "$_gi" ]; then
-    _last=$(tail -c1 "$_gi" 2>/dev/null)
-    if [ "$_last" != "" ] && [ "$_last" != "
-" ]; then
-      printf '\n' >> "$_gi" 2>/dev/null \
-        || { sudo -n true 2>/dev/null || sudo true; echo "" | sudo tee -a "$_gi" >/dev/null; }
-    fi
-  fi
-  # '.claude' WITHOUT a trailing slash. The convention makes .claude a
-  # SYMLINK into the central configs repo, and git treats a symlink as a
-  # FILE -- a pattern ending in '/' matches directories only, so '.claude/'
-  # can never match it. Every project set up correctly therefore reported
-  # its own .claude as untracked, forever, because of the line my-git
-  # itself wrote. Without the slash it matches BOTH a symlink and a real
-  # directory, so it also covers a not-yet-migrated project.
-  if ! printf '.claude\n' >> "$_gi" 2>/dev/null; then
-    printf '.claude\n' | sudo tee -a "$_gi" >/dev/null || return 1
-  fi
-  # Record the .gitignore path so commit_one phase-1 auto-commit picks it up.
-  _mc_record_change "$_gi"
-  return 0
-}
-
-# Classify and (when safe) auto-migrate <repo>/.claude.
-# Return 0 on clean/fixed; 1 on unfixable problem (caller should fail).
-ensure_claude_setup() {
-  _r=$1
-
-  # Skip if this IS (or is inside) the central repo itself.
-  case "$_r/" in
-    "$CLAUDE_PROJECT_DIR_CENTRAL_REPO"/*|"$CLAUDE_PROJECT_DIR_CENTRAL_REPO"*/)
-      log_dbg_med "claude-check: $_r is inside central repo — skipping"
-      return 0 ;;
-  esac
-
-  _cl=$_r/.claude
-
-  # Only a repo that ACTUALLY HAS a .claude gets the ignore line.
-  #
-  # This used to run unconditionally, and 'mc' runs these checks before every
-  # commit -- so a single 'mc -R' wrote '.claude/' into the .gitignore of
-  # every repo in the tree and committed it, including third-party clones
-  # that have no .claude and are not ours to change. Eleven repos sat one
-  # unpushable commit ahead of their upstreams for months because of it.
-  #
-  # The existence of .claude is also the ownership test in practice: nobody
-  # sets one up in a repo they do not work in.
-  if [ -e "$_cl" ]; then
-    ensure_claude_gitignore "$_r" || { log_error "$_r: could not update .gitignore"; return 1; }
-  else
-    log_dbg_med "claude-check: $_r has no .claude — not touching its .gitignore"
-    return 0
-  fi
-  if [ -L "$_cl" ]; then
-    _tgt=$(readlink "$_cl")
-    # Resolve target to real absolute path (follows symlinks + resolves '..').
-    _tgt_real=$( cd -P -- "$_cl" 2>/dev/null && pwd -P ) || _tgt_real=
-    [ -z "$_tgt_real" ] && {
-      case "$_tgt" in /*) _tgt_real=$_tgt ;; *) _tgt_real=$_r/$_tgt ;; esac
-    }
-    # Also resolve the central repo (it may itself contain symlinks like /LINKS).
-    _ctr_real=$( cd -P -- "$CLAUDE_PROJECT_DIR_CENTRAL_REPO" 2>/dev/null && pwd -P ) \
-      || _ctr_real=$CLAUDE_PROJECT_DIR_CENTRAL_REPO
-    case "$_tgt_real" in
-      "$_ctr_real"/*|"$_ctr_real")
-        log_medium "$_r/.claude -> $_tgt (in central repo)"
-        return 0
-        ;;
-      *)
-        log_major "$_r/.claude points OUTSIDE central repo: $_tgt"
-        log_medium "  resolved: $_tgt_real"
-        log_medium "  central:  $_ctr_real"
-        log_medium "not auto-correcting (user intent unclear)"
-        return 0
-        ;;
-    esac
-  fi
-
-  if [ ! -e "$_cl" ]; then
-    # Nothing there — fine.
-    return 0
-  fi
-
-  if [ ! -d "$_cl" ]; then
-    log_error "$_r/.claude exists but is not a symlink or directory"
-    return 1
-  fi
-
-  # Real directory — auto-migrate.
-  _dest=$(claude_dest_for "$_r")
-  log_major "$_r/.claude is a real directory — migrating to central repo"
-  log_medium "destination: $_dest"
-
-  # Refuse if destination exists and is non-empty.
-  if [ -e "$_dest" ]; then
-    if [ -n "$(ls -A "$_dest" 2>/dev/null)" ]; then
-      log_error "destination already exists and is non-empty: $_dest"
-      log_medium "resolve manually, then re-run  (see: my-git --help claude-check)"
-      return 1
-    fi
-  fi
-
-  # Refuse if settings.json is present — rule classification needs human judgement.
-  if [ -f "$_cl/settings.json" ]; then
-    log_error "$_r/.claude/settings.json present — manual migration required"
-    log_medium "per CLAUDE.md: split narrow/blanket/one-off rules by hand."
-    log_medium "skipping this project; nothing moved."
-    return 1
-  fi
-
-  if [ "$DRY_RUN" = 1 ]; then
-    log_medium "DRY: would mkdir $_dest, move files, rmdir $_cl, symlink"
-    return 0
-  fi
-
-  if [ "$INTERACTIVE" = 1 ]; then
-    printf '    proceed with migration?  %s[y]es%s / %s[N]o%s (default: No): ' \
-      "$C_GREEN" "$C_RESET" "$C_RED" "$C_RESET" >&2
-    read -r _ans </dev/tty || _ans=n
-    case "$_ans" in y|Y|yes) : ;; *) log_medium "skipped by user"; return 1 ;; esac
-  fi
-
-  mkdir -p "$_dest" || { log_error "mkdir failed: $_dest"; return 1; }
-  # Move everything except settings.json (which we refused above).
-  _moved=0
-  for _f in "$_cl"/* "$_cl"/.[!.]* "$_cl"/..?*; do
-    [ -e "$_f" ] || continue
-    run mv -- "$_f" "$_dest/" || { log_error "mv failed: $_f"; return 1; }
-    _moved=$((_moved + 1))
-  done
-  log_medium "moved $_moved item(s)"
-
-  # A .gitignore that travelled along from .claude/ can INVERT its meaning
-  # here. Inside a project, a rule like '*' correctly hides assistant state
-  # from that project's published repo. Inside the central store -- whose
-  # entire purpose is to BE tracked, so the config reaches every machine --
-  # the same line hides it from the repo meant to carry it. It is then never
-  # committed, never pushed, and exists on exactly one machine.
-  #
-  # Seen for real: ,github/my-booking-tool's config carried a .gitignore
-  # containing '*'. The move preserved it, the central store could not track
-  # a single file, and the config sat on one machine while every other
-  # machine showed no trace of it having existed.
-  #
-  # Ask git rather than pattern-match: if the store cannot track what was
-  # just moved, whatever came with it has to go. Recoverable -- _rm_user
-  # puts it in the trash.
-  if [ -f "$_dest/.gitignore" ]; then
-    _cc_probe=$(ls -1 "$_dest" 2>/dev/null | grep -v '^\.gitignore$' | head -n 1)
-    if [ -n "$_cc_probe" ] \
-       && git -C "$_dest" check-ignore -q -- "$_dest/$_cc_probe" 2>/dev/null; then
-      log_warn "claude-check: $_dest/.gitignore came from .claude/ and would keep this config UNTRACKED here — removing it (recoverable: it goes to the trash). Without this the config never leaves this machine."
-      _rm_user "$_dest/.gitignore"
-    fi
-  fi
-
-  rmdir "$_cl" || { log_error "rmdir $_cl failed (not empty?)"; return 1; }
-
-  # Relative symlink.
-  _rel=$(python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$_dest" "$_r" 2>/dev/null)
-  if [ -z "$_rel" ]; then
-    _rel=$_dest
-    log_medium "(absolute link; python3 unavailable for relative calc)"
-  fi
-  ln -s "$_rel" "$_cl" || { log_error "ln -s failed"; return 1; }
-  log_major "$_r/.claude -> $_rel  (migration complete)"
-  # Record the migrated .claude symlink so commit_one phase-1 auto-commit
-  # picks it up (it's a tracked file change caused by my-git, not user).
-  _mc_record_change "$_cl"
-  return 0
-}
-
-cmd_claude_check() {
-  _args=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -h|--help) show_help claude-check; exit 0 ;;
-      -V|--verbose) VRB=1 ;;
-      -VV|--very-verbose)          VERYVRB=1 ;;
-      -D|--debug)   DBG=1; VERYVRB=1 ;;
-      -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
-      -n|-T|--try|--dry|--dry-run) DRY_RUN=1 ;;
-      -i|--interactive) INTERACTIVE=1; require_tty claude-check ;;
-      -R|--recursive) RECURSIVE=1 ;;
-      --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
-      -*)           fatal "claude-check: unknown option: $1" 64 ;;
-      *)            _args="$_args $(shell_escape "$1")" ;;
-    esac
-    shift
-  done
-  # shellcheck disable=SC2086
-  eval "set -- $_args"
-
-  # READ-ONLY, unconditionally. This is an audit: it answers "what is the
-  # state of the tree", never "make it so". Enforcement belongs to 'mc',
-  # which is already writing to the repo it checks.
-  DRY_RUN=1
-
-  _roots=$(resolve_scope "$@") || exit 1
-  [ -z "$_roots" ] && { log_error "no repositories to audit"; exit 1; }
-
-  # An audit that prints nothing when all is well tells you nothing: this
-  # was silent on a whole tree, so 'audit --claude' looked broken. Report a
-  # line per repo with the two facts that decide what should happen to it --
-  # does it HAVE a .claude, and is it PUBLISHED (does it have a remote).
-  printf '%-46s %-9s %-11s %s\n' 'REPO' '.claude' 'PUBLISHED' 'NOTE'
-  printf '%s\n' "$_roots" | while IFS= read -r _root; do
-    [ -n "$_root" ] || continue
-    # walk_submodules only sees REGISTERED submodules. Once a tree uses
-    # shadowing (live .git kept, files mirrored) there are none, and this
-    # audit reported a single line for a tree of 20+ repos. Every nested
-    # repo has a .claude question to answer, registered or not.
-    _nodes=$(printf '%s\n%s\n' "$_root" "$(list_unregistered_nested "$_root" 2>/dev/null | while IFS= read -r _n; do
-               [ -n "$_n" ] && printf '%s/%s\n' "$_root" "$_n"; done)" \
-             | grep -v '^$' | sort -u)
-    # Top-down reading order.
-    printf '%s\n' "$_nodes" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}' \
-      | while IFS= read -r _node; do
-          [ -n "$_node" ] || continue
-          _cc_rel=${_node#"$_root"/}; [ "$_cc_rel" = "$_node" ] && _cc_rel=$(basename "$_node")
-          # .claude: symlink into the central repo is the convention; a real
-          # directory is the thing claude-check exists to migrate.
-          if [ -L "$_node/.claude" ]; then _cc_cl='symlink'
-          elif [ -d "$_node/.claude" ]; then _cc_cl='REAL-DIR'
-          elif [ -e "$_node/.claude" ]; then _cc_cl='file?'
-          else _cc_cl='-'; fi
-          _cc_url=$(run_as_owner_capture "$_node" git config --get remote.origin.url 2>/dev/null)
-          if [ -n "$_cc_url" ]; then
-            _cc_pub=$(basename "$_cc_url" .git)
-          else
-            _cc_pub='- (local)'
-          fi
-          # The ignore line belongs here IFF there is a .claude to ignore.
-          _cc_note=''
-          if [ "$_cc_cl" != '-' ]; then
-            if grep -Eq '^/?\.claude$' "$_node/.gitignore" 2>/dev/null; then
-              _cc_note='ok'
-            elif grep -Eq '^/?\.claude/(\*\*)?$' "$_node/.gitignore" 2>/dev/null; then
-              # The slash form matches directories only; the convention makes
-              # .claude a SYMLINK, which git treats as a file.
-              _cc_note='.gitignore has ".claude/" — cannot match a symlink, use ".claude"'
-            else
-              _cc_note='.gitignore MISSING .claude'
-            fi
-            [ "$_cc_cl" = 'REAL-DIR' ] && _cc_note="$_cc_note; not a symlink into the central repo"
-          elif grep -Eq '^/?\.claude/?$' "$_node/.gitignore" 2>/dev/null; then
-            # An ignore line with no .claude beside it is USUALLY the damage
-            # this tool once caused -- but '.claude/' in a .gitignore matches
-            # at ANY depth, and a parent that mirrors nested repos (shadow)
-            # relies on it to keep THEIR .claude dirs out of its index. src
-            # has no .claude at its root yet shields six nested ones; calling
-            # that line removable nearly got a load-bearing line deleted.
-            if [ -n "$(find "$_node" -name .claude -not -path '*/.git/*' -not -path '*/.git.real/*' -print 2>/dev/null | head -n 1)" ]; then
-              _cc_note='ok (no .claude at the root, but the line shields NESTED .claude dirs)'
-            else
-              _cc_note='.gitignore ignores .claude/ but there is NONE here (root or nested)'
-            fi
-          fi
-          printf '%-46s %-9s %-11s %s\n' "$_cc_rel" "$_cc_cl" "$_cc_pub" "$_cc_note"
-          # NOTHING is changed here. An audit reports; it does not enforce.
-          # Enforcement lives in 'mc', which runs ensure_claude_setup before
-          # committing a repo it is already writing to.
-        done
-  done
+  rm -f "$_cfa_all" "$_cfa_hit"
+  printf '%s\n' "${_cfa_n:-0}"
 }
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -9494,9 +9233,9 @@ _do_sidecar_audit() {
   return 0
 }
 
-# my-git audit [--claude] [--sidecar] [-R] [paths...]   (read-only)
+# my-git audit [--sidecar] [-R] [paths...]   (read-only)
 cmd_audit() {
-  _au_claude=0; _au_sidecar=0; _args=""
+  _au_sidecar=0; _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) show_help audit; exit 0 ;;
@@ -9505,7 +9244,6 @@ cmd_audit() {
       -D|--debug)   DBG=1; VERYVRB=1 ;;
       -DD|--deepdbg|--deep-dbg) DBG=1; DEEPDBG=1; VERYVRB=1; set -x; PS4='+ [${LINENO}] ' ;;
       -R|--recursive) RECURSIVE=1 ;;
-      --claude)     _au_claude=1 ;;
       --sidecar)    _au_sidecar=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "audit: unknown option: $1" 64 ;;
@@ -9516,11 +9254,7 @@ cmd_audit() {
   # shellcheck disable=SC2086
   eval "set -- $_args"
   # Default: audit everything we know how to.
-  [ "$_au_claude" = 0 ] && [ "$_au_sidecar" = 0 ] && { _au_claude=1; _au_sidecar=1; }
-  if [ "$_au_claude" = 1 ]; then
-    # shellcheck disable=SC2086
-    ( cmd_claude_check "$@" )
-  fi
+  [ "$_au_sidecar" = 0 ] && _au_sidecar=1
   if [ "$_au_sidecar" = 1 ]; then
     _roots=$(resolve_scope "$@") || exit 1
     _au_oifs=$IFS; IFS='
@@ -9640,7 +9374,7 @@ Subcommands:
 
   sync | syn               Composite: sm → pull → mc (settle the tree in one shot)
   remote | rem             List / audit git remotes across the tree (--check for warnings)
-  audit                    Read-only health checks (--claude and/or --sidecar)
+  audit                    Read-only health checks (--sidecar)
   repair                   Fix sidecar setup problems (--sidecar; analyze, 'go' to apply)
   help                     Show this help
 
@@ -9665,7 +9399,7 @@ Global options:
                            'unflatten', 'sidecar', 'merge', 'sm', 'st').
   -h, --help [TOPIC]       Show help (topic = subcommand or option)
 
-Scope (st / mc / claude-check):
+Scope (st / mc):
   explicit paths           operate on each given repo
   none + inside git repo   operate on that repo (CWD-aware)
   none + outside any repo  fallback to \$GIT_REPOS from config
@@ -9820,7 +9554,8 @@ Per-repo output in analyze mode (one line each):
   <path>   DIRTY (N) [auto:A]                  -> auto-commit A
 
 For each repo in scope (go mode):
-  1. Audits .claude setup   (CHECK_CLAUDE_SETUP in config; see: --help claude-check)
+  1. Force-adds the paths the container carries for its children
+       (FORCE_ADD_PATTERNS_FILE in config)
   2. If dirty:
        Phase 1 (auto) — bumps + recorded paths are committed TRANSPARENTLY
                         via 'git commit --only', no prompt. See 'Auto-commit
@@ -9839,9 +9574,9 @@ Auto-commit of my-git-caused changes (phase 1):
         housekeeping, not a user decision. Under -R bottom-up walk this
         is the common case: children commit, parent's gitlinks advance.
     (b) PATHS explicitly recorded via _mc_record_change during this mc
-        run: .gitignore (when ensure_claude_gitignore appends '.claude/')
-        and <repo>/.claude (when ensure_claude_setup migrates a real dir
-        to a symlink).
+        run — today, the paths force-added on the children's behalf
+        (see FORCE_ADD_PATTERNS_FILE). my-git staged them, so my-git
+        never asks you to confirm them.
   Both are auto-staged and committed together with subject
       my-git mc: auto-commit (bumps=N recorded=M)
   via 'git commit --only -- <paths>', then pushed if pushable. Nothing
@@ -9886,7 +9621,6 @@ Options:
                                       before each commit+push or push-only
                                       action (shows porcelain + commit subject
                                       for commits; divergence log for pushes).
-                                      Also governs destructive .claude migration
   -R, --recursive                    Walk the full submodule tree bottom-up
   --force                            Bypass per-repo my-git.ignore
                                       markers (same as 'sm --force')
@@ -10504,10 +10238,10 @@ Composite "settle the tree" — runs sm → pull → mc in order. Each
 phase receives the flags you passed to sync.
 
   Phase 1: sm    register new nested repos, rebind moved ones, clean
-                 stale .gitmodules entries, .claude setup fixes.
+                 stale .gitmodules entries.
   Phase 2: pull  fetch origin everywhere; fast-forward clean+behind.
   Phase 3: mc    auto-commit my-git-caused dirt (gitlink bumps from
-                 phases 1+2, .gitignore/.claude fixes), then prompt-
+                 phases 1+2, .gitignore fixes), then prompt-
                  gate user-dirt under -i; push where allowed.
 
 Order rationale: sm first so registration is authoritative before
@@ -10529,51 +10263,13 @@ effects already committed stay — my-git's "never undo user commits" rule.
 EOF
 }
 
-show_help_claude_check() {
-  cat <<EOF
-my-git claude-check
-
-usage: $US claude-check [--apply] [-i] [paths...]
-
-Audits each repo in scope to enforce the .claude-symlink convention:
-  1. .gitignore should contain '.claude/'   -- but ONLY for a repo that
-     actually HAS a .claude (see the note below)
-  2. <repo>/.claude must be a symlink into \$CLAUDE_PROJECT_DIR_CENTRAL_REPO
-  3. If it is a real dir:
-     - settings.json present → HARD ERROR (manual split required)
-     - no settings.json      → auto-migrate:
-                               mv files → central, rmdir, create symlink
-
-This command is READ-ONLY. It reports one line per repo -- whether it has
-a .claude, whether it is published, and anything inconsistent -- and
-changes nothing. Enforcement happens in 'my-git mc', which runs the same
-checks on a repo it is already committing to.
-
-A repo only ever gets '.claude/' added to its .gitignore if it actually
-HAS a .claude. This check used to run unconditionally, so a single
-'mc -R' wrote that line into every repo in the tree -- including
-third-party clones with no .claude -- and committed it, leaving eleven
-repos one unpushable commit ahead of their upstreams.
-
-Options:
-  -i, --interactive  Prompt before each migration (in 'mc')
-  -V, -VV, -D, -DD   Verbosity / debug
-  --help
-
-Config:
-  CHECK_CLAUDE_SETUP=0 disables the check entirely in 'mc'.
-  CLAUDE_PROJECT_DIR_CENTRAL_REPO = $CLAUDE_PROJECT_DIR_CENTRAL_REPO
-EOF
-}
-
 show_help_audit() {
   _grd_disp=${GIT_SIDECAR_DIRNAME:-.git.real}
   cat <<EOF
-$US audit [--claude] [--sidecar] [-R] [PATH...]      (read-only)
+$US audit [--sidecar] [-R] [PATH...]      (read-only)
 
-Read-only health checks over the tree. With no flag, runs BOTH audits.
+Read-only health checks over the tree.
 
-  --claude     Run the .claude-setup check (same as '$US claude-check').
   --sidecar    Audit the SETUP of every sidecar (.git.real) under scope.
 
 Sidecar audit reports (never changes anything):
@@ -10596,7 +10292,6 @@ PATH...      Limit to the given super-repo(s)/subtree(s); default: all
              configured GIT_REPOS.
 
 See also:      $US --help repair
-               $US --help claude-check
 EOF
 }
 
@@ -10850,7 +10545,9 @@ values come from the user's config):
                                 submodules, third-party forks) gets commit
                                 only, no push — protects against pushing to
                                 upstream repos you don't own.
-  CHECK_CLAUDE_SETUP          Audit .claude/ during 'mc'; 0 disables.
+  FORCE_ADD_PATTERNS_FILE     Name of the CONTAINER-ROOT file listing globs
+                              this repo carries even though a child repo
+                              ignores them (default .git.force-add-patterns).
   AUTOHEAL_SHADOW_EXCLUDES    Hide a nested SHADOWED repo from the repo that
                               physically contains it (.git/info/exclude,
                               which no clone carries). 1 (default) to heal;
@@ -10860,8 +10557,6 @@ values come from the user's config):
                               merge (default) | rebase | ff-only.
                               Empty / no / off disables the healing.
                               Never overrides a strategy already set.
-  CLAUDE_PROJECT_DIR_CENTRAL_REPO
-                              Central tree where .claude dirs live.
   COMMIT_MSG_LAST_N           # of recent log entries in auto-commit body.
   COMMIT_MSG_DIFF_MAX_FILES   Switch to file-list block above this count.
   PRIV_POLICY_USER_TO_ROOT    non-root caller, root-owned repo (default warn)
@@ -11012,7 +10707,6 @@ show_help() {
     diff)                show_help_diff ;;
     rehydrate)           show_help_rehydrate ;;
     submodules|sub|sm)   show_help_submodules ;;
-    claude-check)        show_help_claude_check ;;
     audit)               show_help_audit ;;
     repair)              show_help_repair ;;
     config|--config|--create-config) show_help_config ;;
@@ -13828,8 +13522,7 @@ cmd_run_tests() {
   _rt_conf() {
     cat > "$1" <<'_RT_CONF_EOF'
 GIT_REPOS=""
-CHECK_CLAUDE_SETUP=0
-CLAUDE_PROJECT_DIR_CENTRAL_REPO=""
+FORCE_ADD_PATTERNS_FILE=".git.force-add-patterns"
 COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
 MC_AUTO_COMMIT_UNTRACKED=1
@@ -15174,8 +14867,6 @@ _RT_CONF_EOF
     # predates that variable's existence.
     cat > "$_rt_conf_path" <<'_RT_STALE_CONF_EOF'
 GIT_REPOS=""
-CHECK_CLAUDE_SETUP=0
-CLAUDE_PROJECT_DIR_CENTRAL_REPO=""
 COMMIT_MSG_LAST_N=3
 COMMIT_MSG_DIFF_MAX_FILES=10
 MC_AUTO_COMMIT_UNTRACKED=1
@@ -16340,132 +16031,151 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  test_claude_dest_mirrors_the_project_path_under_the_central_repo() {
-    # The central repo lives INSIDE the tree it serves, and the layout
-    # mirrors each project's path relative to THAT parent:
-    #   <tree>/sh/proj  ->  <tree>/,claude-configs/sh/proj
-    # Two bugs put migrated dirs elsewhere: paths were matched as STRINGS
-    # (so /LINKS/global vs /syst/global -- one directory, two spellings --
-    # missed entirely and fell through to misc/), and anchoring on a
-    # GIT_REPOS root gave ',claude-configs/src/sh/proj', correct relative
-    # to the wrong thing and matching no existing sibling.
-    _rt_repo tree
+  test_container_carries_the_local_files_a_child_hides() {
+    # The whole point of the arrangement: a project hides its assistant
+    # config from GitHub with two GENERIC patterns (nothing names the tool --
+    # which is why even this fixture calls the directory '.conf.d'),
+    # and the container carries it anyway so it reaches the user's other
+    # machines. Without this the config lived on exactly one machine for
+    # weeks and nobody noticed.
+    _rt_repo_file up_o a.md
+    _rt_repo container
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    mkdir -p tree/sh/proj tree/,claude-configs
-    ( cd tree/sh/proj && git init -q . && git config user.email t@t.com \
-        && git config user.name t && echo a > a.md && git add -A && git commit -q -m i )
-    mkdir -p tree/sh/proj/.claude && echo '{}' > tree/sh/proj/.claude/settings.local.json
-    printf 'CHECK_CLAUDE_SETUP=1\nCLAUDE_PROJECT_DIR_CENTRAL_REPO=%s\n' \
-      "$PWD/tree/,claude-configs" >> "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    # The container declares what it carries despite a child ignoring it.
+    printf '# carried anyway\n*.local\n*.local.*\n' > .git.force-add-patterns
+    # The child hides them from its own remote -- generically.
+    printf '*.local\n*.local.*\n.venv/\n' > proj/.gitignore
+    mkdir -p proj/.conf.d/memory.local proj/.venv/bin
+    printf '{}\n'      > proj/.conf.d/settings.local.json
+    printf '# index\n' > proj/.conf.d/memory.local/MEMORY.md
+    printf 'junk\n'    > proj/.venv/bin/activate
+    printf 'real\n'    > proj/keep.py
+    ( cd proj && git add .gitignore keep.py \
+      && git -c user.name=T -c user.email=t@t commit -qm "real work" ) >/dev/null 2>&1
 
-    cd tree/sh/proj || return 1
-    _rt_my_git mc go >/dev/null 2>&1
-    [ -L .claude ] || { _rt_fail ".claude was not turned into a symlink"; return 1; }
-    _rt_dest=$(cd .claude 2>/dev/null && pwd -P)
-    _rt_want=$(cd "$PWD/../../,claude-configs" 2>/dev/null && pwd -P)/sh/proj
-    [ "$_rt_dest" = "$_rt_want" ] \
-      || { _rt_fail "landed at '$_rt_dest', expected '$_rt_want'"; return 1; }
-    _rt_exists "the settings came with it" .claude/settings.local.json || return 1
-    return 0
-  }
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
 
-  test_claude_ignore_pattern_matches_the_symlink_not_a_directory() {
-    # The convention makes .claude a SYMLINK into the central configs repo,
-    # and git treats a symlink as a FILE -- so '.claude/' (and '.claude/**')
-    # match DIRECTORIES only and can never match it. my-git wrote exactly
-    # that pattern, so every correctly-set-up project reported its own
-    # .claude as untracked forever, because of the line my-git added.
-    _rt_repo_file proj a.md
-    mkdir -p central/proj
-    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    printf 'CHECK_CLAUDE_SETUP=1\nCLAUDE_PROJECT_DIR_CENTRAL_REPO=%s\n' "$PWD/central" >> "$_rt_conf_path"
-    cd proj || return 1
-    printf '%s\n' '*.pyc' '.claude/' '.claude/**' 'build/' > .gitignore
-    git add -A && git commit -q -m "gitignore with the ineffective pattern"
-    ln -s ../central/proj .claude
-    [ -n "$(git status --porcelain)" ] \
-      || { _rt_fail "setup: the symlink should be reported as untracked"; return 1; }
-
-    _rt_my_git mc go >/dev/null 2>&1
-    [ -z "$(git status --porcelain)" ] \
-      || { _rt_fail "the symlink is STILL untracked: $(git status --porcelain)"; return 1; }
-    _rt_contains "the effective pattern is present" .gitignore ".claude" || return 1
-    grep -qxE '/?\.claude/(\*\*)?' .gitignore \
-      && { _rt_fail "the ineffective slash form was left behind"; return 1; }
-    # Unrelated lines must survive the rewrite -- this edits a TRACKED file.
-    _rt_contains "unrelated line kept (before)" .gitignore "*.pyc" || return 1
-    _rt_contains "unrelated line kept (after)" .gitignore "build/" || return 1
-    return 0
-  }
-
-  test_claude_check_leaves_repos_without_a_claude_alone() {
-    # ROOT CAUSE of eleven repos sitting one unpushable commit ahead of their
-    # upstreams for months: ensure_claude_setup ALWAYS appended '.claude/' to
-    # .gitignore, and 'mc' runs these checks before every commit -- so one
-    # 'mc -R' wrote that line into every repo in the tree, including
-    # third-party clones with no .claude, and committed it.
-    # A repo only gets the line if it actually HAS a .claude. That test also
-    # serves as the ownership test: nobody sets one up in a stranger's repo.
-    _rt_repo_file kid_o a.md
-    _rt_repo par
-    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    ( cd par && git clone -q ../kid_o stranger >/dev/null 2>&1
-      git clone -q ../kid_o mine     >/dev/null 2>&1 )
-    cd par || return 1
-    mkdir -p mine/.claude && echo '{}' > mine/.claude/settings.local.json
-    # The harness config disables the .claude audit so tests never touch the
-    # real setup; this test is ABOUT that audit, so switch it on and point it
-    # at a scratch central repo.
-    mkdir -p "$PWD/central"
-    printf 'CHECK_CLAUDE_SETUP=1\nCLAUDE_PROJECT_DIR_CENTRAL_REPO=%s\n' "$PWD/central" >> "$_rt_conf_path"
-
-    # Enforcement lives in 'mc' now -- 'claude-check' is a pure audit. Run it
-    # inside each repo: even 'mc -R' walks only REGISTERED submodules, so it
-    # never descends into a shadowed or plain nested repo.
-    ( cd stranger && _rt_my_git mc go >/dev/null 2>&1 )
-    ( cd mine     && _rt_my_git mc go >/dev/null 2>&1 )
-
-    # The stranger's repo must be untouched.
-    if [ -f stranger/.gitignore ] && grep -Eq '^/?\.claude/?$' stranger/.gitignore; then
-      _rt_fail "wrote .claude/ into a repo that has no .claude"; return 1
+    [ -n "$(git ls-files -- proj/.conf.d/settings.local.json)" ] \
+      || { _rt_fail "the container did not carry settings.local.json"; return 1; }
+    _rt_ok "a .local.* file is carried" true || return 1
+    # A DIRECTORY named *.local carries its contents without a pattern of
+    # its own -- which is why the pattern set is two lines, not a list of
+    # extensions, and why memory/ had to be renamed memory.local/.
+    [ -n "$(git ls-files -- proj/.conf.d/memory.local/MEMORY.md)" ] \
+      || { _rt_fail "a file inside a *.local DIRECTORY was not carried"; return 1; }
+    _rt_ok "a *.local directory carries its contents" true || return 1
+    # The child's OWN repo must still publish none of it.
+    if ( cd proj && git ls-files --error-unmatch .conf.d/settings.local.json ) >/dev/null 2>&1; then
+      _rt_fail "the child repo tracks the config it is supposed to hide"; return 1
     fi
-    # ...while a repo that HAS one still gets it.
-    grep -Eq '^/?\.claude/?$' mine/.gitignore 2>/dev/null \
-      || { _rt_fail "a repo WITH a .claude did not get the ignore line"; return 1; }
+    _rt_ok "the child publishes none of it" true || return 1
+    # And the junk beside it is still junk.
+    if [ -n "$(git ls-files -- 'proj/.venv/*')" ]; then
+      _rt_fail "force-add widened to what the child ignores as junk"; return 1
+    fi
+    _rt_ok "the force-add did not widen to .venv" true || return 1
     return 0
   }
 
-  test_claude_audit_reports_claude_and_published_state() {
-    # An audit that prints nothing when all is well tells you nothing -- this
-    # one was silent over a whole tree, so 'audit --claude' looked broken.
-    # And it walked only REGISTERED submodules, so a shadowed tree reported a
-    # single line for 20+ repos.
-    _rt_repo_file kid_o a.md
-    _rt_repo par
+  test_mc_carries_a_local_file_created_after_the_shadow() {
+    # The gap that a shadow-time-only force-add leaves: a file written LATER
+    # (a new auto-memory entry, a permission granted next week) is ignored by
+    # the child, so the container's plain 'add -A' never sees it and only an
+    # explicit 'shadow go' would catch it. It has to travel on an ordinary
+    # 'mc go' -- and the container must not read as CLEAN when that file is
+    # the only thing that changed.
+    _rt_repo_file up_o a.md
+    _rt_repo container
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    ( cd par && git clone -q ../kid_o pub >/dev/null 2>&1 )
-    cd par || return 1
-    mkdir -p pub/.claude
-    _rt_ok "claude-check (read-only)" _rt_my_git claude-check || return 1
-    _rt_contains "has a header" "$_rt_out" ".claude" || return 1
-    _rt_contains "names the PUBLISHED column" "$_rt_out" "PUBLISHED" || return 1
-    _rt_contains "reports the nested repo, not just the root" "$_rt_out" "pub" || return 1
-    # A parent with NO root .claude whose ignore line shields a NESTED
-    # .claude (src's exact shape) must not be advised to remove the line.
-    printf '.claude/\n' > .gitignore
-    _rt_ok "claude-check with a shielding parent line" _rt_my_git claude-check || return 1
-    _rt_contains "recognises the shield" "$_rt_out" "shields NESTED" || return 1
-    _rt_not_contains "must not call the parent line removable" "$_rt_out" "NONE here (root or nested)" || return 1
-    rm -f .gitignore
-    # An audit must not change anything -- not even the thing it is auditing.
-    _rt_before=$(git -C pub rev-parse HEAD)
-    [ -f pub/.gitignore ] && _rt_gi_before=$(cat pub/.gitignore) || _rt_gi_before=''
-    _rt_ok "claude-check again" _rt_my_git claude-check || return 1
-    [ "$(git -C pub rev-parse HEAD)" = "$_rt_before" ] \
-      || { _rt_fail "the audit COMMITTED something"; return 1; }
-    [ -f pub/.gitignore ] && _rt_gi_after=$(cat pub/.gitignore) || _rt_gi_after=''
-    [ "$_rt_gi_after" = "$_rt_gi_before" ] \
-      || { _rt_fail "the audit modified .gitignore — it must be read-only"; return 1; }
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    printf '*.local\n*.local.*\n' > .git.force-add-patterns
+    printf '*.local\n*.local.*\n' > proj/.gitignore
+    printf 'real\n' > proj/keep.py
+    ( cd proj && git add .gitignore keep.py \
+      && git -c user.name=T -c user.email=t@t commit -qm "real work" ) >/dev/null 2>&1
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm "container baseline" >/dev/null 2>&1
+
+    # Now the file appears, long after the shadow.
+    mkdir -p proj/.conf.d
+    printf '{"later":true}\n' > proj/.conf.d/settings.local.json
+
+    _rt_ok "mc go picks it up" _rt_my_git mc go || return 1
+    [ -n "$(git ls-files -- proj/.conf.d/settings.local.json)" ] \
+      || { _rt_fail "a .local file created after the shadow never travelled"; return 1; }
+    _rt_ok "the later file is tracked" true || return 1
+    git diff --quiet HEAD -- proj/.conf.d/settings.local.json 2>/dev/null \
+      || { _rt_fail "it was staged but never committed"; return 1; }
+    _rt_ok "and committed" true || return 1
+    return 0
+  }
+
+  test_force_add_patterns_do_not_match_lookalike_names() {
+    # '*.local' plus '*.local.*' rather than one '*.local*': the single-glob
+    # form swallows 'config.locale' and 'app.localhost.conf', which are
+    # ordinary project files that must stay visible and published.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    printf '*.local\n*.local.*\n' > .git.force-add-patterns
+    # The child ignores EVERYTHING here, so the only thing that can put a
+    # file into the container is a pattern match -- which makes this a clean
+    # read of what the two globs actually cover.
+    printf '*\n' > proj/.gitignore
+    printf 'a\n' > proj/notes.local
+    printf 'b\n' > proj/config.locale
+    printf 'c\n' > proj/app.localhost.conf
+    ( cd proj && git add -f .gitignore \
+      && git -c user.name=T -c user.email=t@t commit -qm base ) >/dev/null 2>&1
+
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+
+    [ -n "$(git ls-files -- proj/notes.local)" ] \
+      || { _rt_fail "'*.local' did not match notes.local"; return 1; }
+    _rt_ok "*.local matches notes.local" true || return 1
+    if [ -n "$(git ls-files -- proj/config.locale proj/app.localhost.conf)" ]; then
+      _rt_fail "the patterns swallowed a lookalike: $(git ls-files -- proj/config.locale proj/app.localhost.conf | tr '\n' ' ')"
+      return 1
+    fi
+    _rt_ok "config.locale and app.localhost.conf stay out" true || return 1
+    return 0
+  }
+
+  test_a_container_without_the_patterns_file_carries_nothing_extra() {
+    # The file is the ONLY thing that grants the power, and it lives at the
+    # container root. A repo that does not declare one must behave exactly as
+    # before -- honouring every child .gitignore, no exceptions. This is what
+    # stops a child from granting itself the force by committing its own copy.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    # No .git.force-add-patterns at the container root -- but the CHILD has
+    # one, which must count for nothing here.
+    printf '*.local\n*.local.*\n' > proj/.git.force-add-patterns
+    printf '*.local\n*.local.*\n' > proj/.gitignore
+    mkdir -p proj/.conf.d
+    printf '{}\n'   > proj/.conf.d/settings.local.json
+    printf 'real\n' > proj/keep.py
+    ( cd proj && git add .gitignore keep.py \
+      && git -c user.name=T -c user.email=t@t commit -qm base ) >/dev/null 2>&1
+
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+
+    [ -n "$(git ls-files -- proj/keep.py)" ] \
+      || { _rt_fail "the container did not mirror an ordinary file"; return 1; }
+    _rt_ok "ordinary files still mirrored" true || return 1
+    if [ -n "$(git ls-files -- proj/.conf.d/settings.local.json)" ]; then
+      _rt_fail "a CHILD's pattern file granted the force-add"; return 1
+    fi
+    _rt_ok "a child's own pattern file grants nothing" true || return 1
     return 0
   }
 
@@ -18327,7 +18037,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_claude_dest_mirrors_the_project_path_under_the_central_repo test_claude_ignore_pattern_matches_the_symlink_not_a_directory test_claude_check_leaves_repos_without_a_claude_alone test_claude_audit_reports_claude_and_published_state test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -18495,7 +18205,6 @@ main() {
     unsm|unsub|unsubmodules)    cmd_unsm "$@" ;;
     ignore)                     cmd_ignore "$@" ;;
     unignore)                   cmd_unignore "$@" ;;
-    claude-check)               cmd_claude_check "$@" ;;
     audit)                      cmd_audit "$@" ;;
     repair)                     cmd_repair "$@" ;;
     help)                       show_help "${1:-top}" ;;
@@ -18548,7 +18257,7 @@ _my-git() {
     'diff:Show a merge conflict'\''s two sides side by side in $DIFF_TOOL'
     'rehydrate:Give a fresh clone back each shadowed project'\''s own .git'
     'submodules:Discover & register nested repos as submodules (alias: sm, sub)'
-    'audit:Read-only health checks (--claude and/or --sidecar)'
+    'audit:Read-only health checks (--sidecar)'
     'repair:Fix sidecar setup problems (--sidecar; go to apply)'
     'help:Show help (help <topic> for a subcommand'\''s own page)'
   )
@@ -18689,7 +18398,6 @@ _my-git() {
         audit)
           _arguments \
             $global_opts \
-            '--claude[Run the .claude-setup check (same as claude-check)]' \
             '--sidecar[Audit the setup of every sidecar under scope]' \
             '*: :_directories'
           ;;
