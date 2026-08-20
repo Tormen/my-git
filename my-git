@@ -534,6 +534,21 @@ _init_stat_flavour() {
   if stat -c '%U' / >/dev/null 2>&1; then _STAT_OWNER_MODE=gnu; else _STAT_OWNER_MODE=bsd; fi
 }
 
+# ONE scratch file for every run_as_owner_capture stderr, for the whole run.
+# It used to mktemp per call and then grep + cat + rm it -- four processes
+# each, ~1,100 over an 'st' of a big tree, to inspect a file that is empty
+# almost every time. Created here, in the PARENT shell, so the subshells that
+# do the capturing inherit the name instead of each making their own.
+#
+# No truncation needed: every capture redirects with '2>', which truncates.
+# Nothing nests, either -- what runs under the capture is git or find, never
+# my-git -- so one file per run cannot collide with itself.
+_init_raoc_errfile() {
+  _RAOC_ERRFILE=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _RAOC_ERRFILE=""
+  [ -n "$_RAOC_ERRFILE" ] && trap 'rm -f "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  return 0
+}
+
 is_managed_path() {
   # 0 = path is in GIT_REPOS (or a descendant); 1 = foreign.
   # "Managed" means: my-git is authorized to recursively discover
@@ -831,18 +846,28 @@ run_as_owner_capture() {
   # Route stderr through a temp so an ACCESS failure (mixed ownership) is
   # detected and warned about loudly instead of vanishing into an empty
   # result. stdout still flows straight to the caller's $() unchanged.
-  _raoc_err=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _raoc_err=""
+  # Normally the run-wide file, made once by _init_raoc_errfile. Fall back to
+  # a per-call one if we got here without that init (--run-tests, a future
+  # entry point): losing the capture would silently disable the loud
+  # mixed-ownership warning, which is the whole reason stderr is captured.
+  _raoc_err=${_RAOC_ERRFILE:-}; _raoc_own=0
+  if [ -z "$_raoc_err" ]; then
+    _raoc_err=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _raoc_err=""
+    _raoc_own=1
+  fi
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
     ( cd "$_repo" && run "$@" ) 2>"${_raoc_err:-/dev/null}"; _raoc_rc=$?
   else
     _xuser_exec "$_owner" "$_repo" "$@" 2>"${_raoc_err:-/dev/null}"; _raoc_rc=$?
   fi
-  if [ -n "$_raoc_err" ]; then
+  # '[ -s ]' is a builtin: the common case (git said nothing on stderr) now
+  # costs no processes at all, where it used to cost three.
+  if [ -s "$_raoc_err" ]; then
     grep -qiE 'permission denied|dubious ownership' "$_raoc_err" 2>/dev/null \
       && _mixed_ownership_warn "$_repo" "$_owner"
     cat "$_raoc_err" >&2       # never swallow git's own message
-    rm -f "$_raoc_err"
   fi
+  [ "$_raoc_own" = 1 ] && rm -f "$_raoc_err"
   return "$_raoc_rc"
 }
 
@@ -968,8 +993,9 @@ list_realized_dirs() {
   _lrd_collapse=${2:-}          # 'collapse' => keep only top-most of a nest
   [ -d "$_lrd_r" ] || return 0
   _lrd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
-  trace "(cd $_lrd_r && find . -name $_lrd_grd -prune -print)   # discover sidecars"
-  ( cd "$_lrd_r" 2>/dev/null || exit 0
+  { _disc_query "$_lrd_r" "$_lrd_grd" || \
+  ( trace "(cd $_lrd_r && find . -name $_lrd_grd -prune -print)   # discover sidecars"
+    cd "$_lrd_r" 2>/dev/null || exit 0
     # PERF: prune the CONTENTS of every git-internal dir (.git, .git.merged,
     # and the sidecar dir itself) — none of them can contain a sidecar we're
     # looking for, but they hold big object databases (~37% of a real tree's
@@ -981,7 +1007,7 @@ list_realized_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '$_lrd_grd' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e "s|/${_lrd_grd}\$||" -e "s|^${_lrd_grd}\$||" -e '/^$/d' \
+  ) ; } | sed -e 's|^\./||' -e "s|/${_lrd_grd}\$||" -e "s|^${_lrd_grd}\$||" -e '/^$/d' \
     | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
     | { if [ "$_lrd_collapse" = collapse ]; then
           # Collapse-mode: keep only the TOP-MOST sidecar of each nest and
@@ -1266,8 +1292,9 @@ push_preserved_refs() {
 list_merged_dirs() {
   _lmd_r=$1
   [ -d "$_lmd_r" ] || return 0
-  trace "(cd $_lmd_r && find . -name .git.merged -print)   # discover merged paths"
-  ( cd "$_lmd_r" 2>/dev/null || exit 0
+  { _disc_query "$_lmd_r" .git.merged || \
+  ( trace "(cd $_lmd_r && find . -name .git.merged -print)   # discover merged paths"
+    cd "$_lmd_r" 2>/dev/null || exit 0
     # PERF: prune git-internal dir contents (see list_realized_dirs).
     _pex="-path ./.git -o -name .git -o -name ${GIT_SIDECAR_DIRNAME:-.git.real}"
     for _ed in ${ST_EXCLUDE_DIRS:-}; do
@@ -1275,7 +1302,7 @@ list_merged_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.merged' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' -e '/^$/d' \
+  ) ; } | sed -e 's|^\./||' -e 's|/\.git\.merged$||' -e 's|^\.git\.merged$||' -e '/^$/d' \
     | while IFS= read -r _lmd_p; do
         [ -n "$_lmd_p" ] || continue
         if [ -e "$_lmd_r/$_lmd_p/.git" ] || [ -e "$_lmd_r/$_lmd_p/${GIT_SIDECAR_DIRNAME:-.git.real}" ]; then
@@ -1299,8 +1326,9 @@ list_zipped_dirs() {
   _lzd_r=$1
   [ -d "$_lzd_r" ] || return 0
   _lzd_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
-  trace "(cd $_lzd_r && find . \\( -name .git.zip -o -name $_lzd_grd.zip \\) -print)   # discover zipped git dirs"
-  ( cd "$_lzd_r" 2>/dev/null || exit 0
+  { _disc_query "$_lzd_r" .git.zip "$_lzd_grd.zip" || \
+  ( trace "(cd $_lzd_r && find . \\( -name .git.zip -o -name $_lzd_grd.zip \\) -print)   # discover zipped git dirs"
+    cd "$_lzd_r" 2>/dev/null || exit 0
     # PERF: prune git-internal dir contents (see list_realized_dirs).
     _pex="-path ./.git -o -name .git -o -name $_lzd_grd -o -name .git.merged"
     for _ed in ${ST_EXCLUDE_DIRS:-}; do
@@ -1308,7 +1336,7 @@ list_zipped_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o \\( -name .git.zip -o -name .git.real.zip \\) -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.real\.zip$||' -e 's|/\.git\.zip$||' \
+  ) ; } | sed -e 's|^\./||' -e 's|/\.git\.real\.zip$||' -e 's|/\.git\.zip$||' \
         -e 's|^\.git\.real\.zip$||' -e 's|^\.git\.zip$||' -e '/^$/d' \
     | sort -u | while IFS= read -r _lzd_d; do
         # Skip a dir that still has a LIVE git dir next to the zip (gz -k):
@@ -1360,8 +1388,9 @@ list_shadow_markers() {
 list_shadowed_dirs() {
   _lsh_r=$1
   [ -d "$_lsh_r" ] || return 0
-  trace "(cd $_lsh_r && find . -name .git.shadow.status -print)   # discover shadowed repos"
-  ( cd "$_lsh_r" 2>/dev/null || exit 0
+  { _disc_query "$_lsh_r" .git.shadow.status || \
+  ( trace "(cd $_lsh_r && find . -name .git.shadow.status -print)   # discover shadowed repos"
+    cd "$_lsh_r" 2>/dev/null || exit 0
     # PERF: prune git-internal dir contents (see list_realized_dirs).
     _pex="-path ./.git -o -name .git -o -name ${GIT_SIDECAR_DIRNAME:-.git.real} -o -name .git.merged"
     for _ed in ${ST_EXCLUDE_DIRS:-}; do
@@ -1369,7 +1398,7 @@ list_shadowed_dirs() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name '.git.shadow.status' -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
+  ) ; } | sed -e 's|^\./||' -e 's|/\.git\.shadow\.status$||' -e 's|^\.git\.shadow\.status$||' -e '/^$/d' \
     | sort -u | while IFS= read -r _lsh_d; do
         # A marker only means "shadowed" while a LIVE .git sits beside it.
         [ -e "$_lsh_r/$_lsh_d/.git" ] || continue
@@ -1489,8 +1518,9 @@ list_unregistered_nested() {
   else
     printf '%s\n' "${2-}" | grep -v '^$' > "$_realtmp" 2>/dev/null || : > "$_realtmp"
   fi
-  trace "(cd $_r && find . -name .git -print)   # discover UNREGISTERED nested repos"
-  ( cd "$_r" 2>/dev/null || exit 0
+  { _disc_query "$_r" .git || \
+  ( trace "(cd $_r && find . -name .git -print)   # discover UNREGISTERED nested repos"
+    cd "$_r" 2>/dev/null || exit 0
     # Prune:
     #   - './.git' (the scope root itself — we only want NESTED repos)
     #   - every basename in ST_EXCLUDE_DIRS (cache/build roots that
@@ -1513,7 +1543,7 @@ list_unregistered_nested() {
     done
     # shellcheck disable=SC2086
     eval "find . \\( $_pex \\) -prune -o -name .git -prune -print 2>/dev/null"
-  ) | sed -e 's|^\./||' -e 's|/\.git$||' \
+  ) ; } | sed -e 's|^\./||' -e 's|/\.git$||' \
     | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
     | awk -v reg="$_regtmp" -v real="$_realtmp" '
       # Sorted by DEPTH first (shallowest paths first), not plain
@@ -1816,6 +1846,93 @@ resolve_scope() {
 }
 
 # ─── Status subcommand ──────────────────────────────────────────────────
+# ─── One-pass marker discovery ──────────────────────────────────────────
+# Five discovery helpers each ran their own 'find' from every node of the
+# tree: 5 x 43 = 215 walks for one 'st', and because each walks its whole
+# subtree, a file under py/my-plex was visited by the src walk AND the
+# my-plex one, once per level of nesting. Measured 1.15s of a 5.9s run;
+# one combined pass over the same tree costs 0.03s.
+#
+# So: sweep once from the scope root for EVERY marker, then answer each
+# helper from that list. The cache is built only by read-only callers (see
+# cmd_status) -- a command that creates or removes markers as it goes must
+# not answer from a snapshot taken before it started.
+#
+# _disc_cache_build <top>   fills _DISC_ROOT / _DISC_LIST
+_disc_cache_build() {
+  _DISC_ROOT=""; _DISC_LIST=""
+  [ -d "$1" ] || return 0
+  _dcb_grd=${GIT_SIDECAR_DIRNAME:-.git.real}
+  # Same prune set the individual finds use: './.git' (the root's own, which
+  # is pruned WITHOUT printing -- list_unregistered_nested would otherwise
+  # read it as a nested repo) plus the configured cache/build dirs.
+  _dcb_pex="-path ./.git"
+  for _dcb_ed in ${ST_EXCLUDE_DIRS:-}; do
+    _dcb_pex="$_dcb_pex -o -name $_dcb_ed"
+  done
+  trace "(cd $1 && find . -name '.git*' -prune -print)   # discover ALL markers, one pass"
+  _DISC_LIST=$( cd "$1" 2>/dev/null || exit 0
+    # shellcheck disable=SC2086
+    eval "find . \( $_dcb_pex \) -prune -o \( -name .git -o -name '$_dcb_grd' \
+            -o -name .git.merged -o -name .git.zip -o -name '$_dcb_grd.zip' \
+            -o -name .git.shadow.status \) -prune -print 2>/dev/null" )
+  _DISC_ROOT=$1
+}
+
+# _disc_cache_clear   — drop it, so a later mutating pass cannot read a
+#                        snapshot that predates its own changes.
+_disc_cache_clear() { _DISC_ROOT=""; _DISC_LIST=""; }
+
+# _disc_query <root> <marker-basename>...
+#   Emit the cached hits under <root> as './<path>/<marker>' lines, exactly
+#   as the find they replace would have. Returns 1 when there is no usable
+#   cache, so every caller can fall through to its own find.
+#
+#   Fork-free on purpose: an awk or grep per query would trade 215 finds for
+#   215 of something else. Newline word-splitting into the positional
+#   parameters (local to this function) lets the whole filter run in the
+#   shell.
+_disc_query() {
+  [ -n "${_DISC_ROOT:-}" ] || return 1
+  _dq_root=$1; shift
+  case "$_dq_root" in
+    "$_DISC_ROOT")   _dq_pre="./" ;;
+    "$_DISC_ROOT"/*) _dq_pre="./${_dq_root#"$_DISC_ROOT"/}/" ;;
+    *) return 1 ;;                      # outside the swept tree
+  esac
+  _dq_names=" $* "
+  _dq_out=""
+  _dq_oifs=$IFS; IFS='
+'
+  # shellcheck disable=SC2086
+  set -- $_DISC_LIST
+  IFS=$_dq_oifs
+  for _dq_l in "$@"; do
+    case "$_dq_l" in "$_dq_pre"*) ;; *) continue ;; esac
+    _dq_rel="./${_dq_l#"$_dq_pre"}"
+    # The root's own '.git' is pruned without printing by every find here.
+    [ "$_dq_rel" = "./.git" ] && continue
+    case "$_dq_names" in *" ${_dq_l##*/} "*) ;; *) continue ;; esac
+    _dq_out="$_dq_out$_dq_rel
+"
+  done
+  [ -n "$_dq_out" ] && printf '%s' "$_dq_out"
+  return 0
+}
+
+# _list_has <newline-separated-list> <needle-already-wrapped-in-newlines>
+# Whole-line membership with NO subprocess -- the equivalent of
+# 'printf %s\\n "$list" | grep -qxF "$item"', which costs two forks per call.
+# The caller wraps the needle once and reuses it across a chain of branches.
+_list_has() {
+  case "
+$1
+" in
+    *"$2"*) return 0 ;;
+  esac
+  return 1
+}
+
 # walk_tree_lines <abs_path> <display> <branch_prefix> <child_prefix> <tag>
 #   Pre-order DFS emitting one TAB-separated line per node:
 #     <branch_prefix>\t<abs_path>\t<display>\t<tag>
@@ -1922,19 +2039,28 @@ walk_tree_lines() (
     # dir has no .git of its own, so it would otherwise fall through to
     # unreg by default — but it's neither registered nor a plain embedded
     # repo, so it gets its own tag). Otherwise reg vs unreg by membership.
-    if printf '%s\n' "$_subs_stale" | grep -qxF "$_sub"; then
+    # Membership by 'case', not 'printf | grep': the pipeline forks twice PER
+    # BRANCH per subdirectory, which measured 250 processes in one 'st' of a
+    # 43-node tree. Same idiom as _mc_record_change. The needle is wrapped in
+    # newlines ONCE here, so the seven branches cost seven string comparisons
+    # and no processes at all -- and the wrapping is what makes it a
+    # whole-line match, exactly what 'grep -qxF' gave.
+    _nl_sub="
+$_sub
+"
+    if _list_has "$_subs_stale" "$_nl_sub"; then
       _ntag=stale
-    elif printf '%s\n' "$_subs_reg" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_reg" "$_nl_sub"; then
       _ntag=reg
-    elif printf '%s\n' "$_subs_realized" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_realized" "$_nl_sub"; then
       _ntag=realized
-    elif printf '%s\n' "$_subs_merged" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_merged" "$_nl_sub"; then
       _ntag=merged
-    elif printf '%s\n' "$_subs_zipped" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_zipped" "$_nl_sub"; then
       _ntag=zipped
-    elif printf '%s\n' "$_subs_norepo" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_norepo" "$_nl_sub"; then
       _ntag=norepo
-    elif printf '%s\n' "$_subs_shadowed" | grep -qxF "$_sub"; then
+    elif _list_has "$_subs_shadowed" "$_nl_sub"; then
       # A shadowed dir has a live .git (would otherwise read as unreg) — its
       # '.git.shadow.status' marker gives it its own tag instead.
       _ntag=shadowed
@@ -2342,7 +2468,10 @@ cmd_status() {
   # renders no flag column).
   _stflag_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stflag.XXXXXX")
   _stign_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stign.XXXXXX")
-  trap 'rm -f "$_rtmp" "$_stcounts_tmp" "$_stkind_tmp" "$_stflag_tmp" "$_stign_tmp"' EXIT INT TERM HUP
+  # $_RAOC_ERRFILE rides along in every EXIT trap: POSIX sh has no trap
+  # stacking, so installing one here REPLACES the global one that would
+  # otherwise clean it up.
+  trap 'rm -f "$_rtmp" "$_stcounts_tmp" "$_stkind_tmp" "$_stflag_tmp" "$_stign_tmp" "$_RAOC_ERRFILE"; _disc_cache_clear' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   _first=1
   while IFS= read -r _root; do
@@ -2474,6 +2603,9 @@ _ST_MKEOF
       # Tag the ROOT itself if it's a sidecar/merged path (so 'st <sidecar>'
       # / 'st <merged>' render correctly instead of failing status_summary).
       _root_tag=$(flatten_marker_tag "$_root")
+      # One marker sweep for this whole root, instead of five per node.
+      # 'st' is read-only, so a snapshot cannot go stale under it.
+      _disc_cache_build "$_root"
       walk_tree_lines "$_root" "$_root" "" "" "$_root_tag" \
         | while IFS="$(printf '\t')" read -r _left _abs _tag; do
             # Every tag that describes a RELATIONSHIP carries '@<repo>' —
@@ -3225,7 +3357,7 @@ cmd_masscommits() {
   # File-redirected while keeps us in the parent shell so root-level
   # priv_gate fail aborts the whole run.
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
-  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
+  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
@@ -3599,7 +3731,7 @@ cmd_push() {
 
   _rc_total=0
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.psroots.XXXXXX")
-  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
+  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root <&8; do
     [ -n "$_root" ] || continue
@@ -3847,7 +3979,7 @@ cmd_pull() {
 
   _rc_total=0
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
-  trap 'rm -f "$_rtmp"' EXIT INT TERM HUP
+  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
@@ -8883,7 +9015,7 @@ cmd_remote() {
   RM_N_TOTAL=0; RM_N_NOREMOTE=0; RM_N_IGNORED=0; RM_N_SUS=0
   _rm_sus_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmsus.XXXXXX")
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmroots.XXXXXX")
-  trap 'rm -f "$_rm_sus_tmp" "$_rtmp"' EXIT INT TERM HUP
+  trap 'rm -f "$_rm_sus_tmp" "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
   printf '%s\n' "$_roots" > "$_rtmp"
 
   while IFS= read -r _rm_root; do
@@ -17567,11 +17699,15 @@ PYDRV
       && zip -qr .git.real.zip .git.real >/dev/null 2>&1 && rm -rf .git.real )
     cd top || return 1
     _rt_ok "st -VV runs" _rt_my_git -VV st "$PWD" || return 1
-    _rt_contains "-VV traces the sidecar discovery find" "$_rt_err" "discover sidecars" || return 1
-    _rt_contains "-VV traces the zipped discovery find" "$_rt_err" "discover zipped git dirs" || return 1
+    # 'st' sweeps for every marker in ONE pass, so that is the command -VV
+    # must show. The per-helper find traces moved INSIDE their fallback
+    # branch: a trace that names a command which did not run is worse than
+    # no trace, because it is read as evidence.
+    _rt_contains "-VV traces the one-pass discovery" "$_rt_err" "discover ALL markers" || return 1
+    _rt_not_contains "and not a find that never ran" "$_rt_err" "discover sidecars" || return 1
     # plain -V (human axis) must NOT show the raw find trace
     _rt_ok "st -V runs" _rt_my_git -V st "$PWD" || return 1
-    _rt_not_contains "-V stays clean of raw command trace" "$_rt_err" "discover sidecars" || return 1
+    _rt_not_contains "-V stays clean of raw command trace" "$_rt_err" "discover ALL markers" || return 1
     return 0
   }
 
@@ -18347,10 +18483,10 @@ main() {
   # ─── No subcommand → legacy default: status (piped through less if TTY) ───
   if [ $# -eq 0 ]; then
     if [ -t 1 ]; then
-      _init_stat_flavour; _xu_init_session
+      _init_stat_flavour; _xu_init_session; _init_raoc_errfile
       cmd_status #| less -R
     else
-      _init_stat_flavour; _xu_init_session
+      _init_stat_flavour; _xu_init_session; _init_raoc_errfile
       cmd_status
     fi
     exit $?
@@ -18359,6 +18495,7 @@ main() {
   _sub=$1; shift
   _init_stat_flavour
   _xu_init_session
+  _init_raoc_errfile
   case "$_sub" in
     status|st|s)                cmd_status "$@" ;;
     masscommits|mc|c)           cmd_masscommits "$@" ;;
