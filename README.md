@@ -168,8 +168,7 @@ config file.
 | Variable                              | Default                                  | Meaning                                                                     |
 |---------------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | `GIT_REPOS`                           | see default config                       | Fallback super-repo list (used only when no repo is scoped via CWD or args) |
-| `CHECK_CLAUDE_SETUP`                  | `1`                                      | Audit `.claude/` during `mc`; `0` disables                                  |
-| `CLAUDE_PROJECT_DIR_CENTRAL_REPO`     | `/LINKS/src/,claude-configs`             | Central tree where project `.claude/` dirs live                             |
+| `FORCE_ADD_PATTERNS_FILE`             | `.git.force-add-patterns`                | Container-root file listing globs this repo carries despite a child ignoring them |
 | `COMMIT_MSG_LAST_N`                   | `3`                                      | Number of recent log entries in auto-commit body                            |
 | `COMMIT_MSG_DIFF_MAX_FILES`           | `10`                                     | Above this count, commit body shows file list instead of diffs              |
 | `PRIV_POLICY_USER_TO_ROOT`            | `warn`                                   | Non-root caller vs. a root-owned repo — see [Privilege](#privilege-sudo--su--policy) |
@@ -200,7 +199,6 @@ my-git sm -R go                # register everything, walking the whole tree top
 my-git sm --clean-stale        # ONLY remove stale registrations, anywhere in the tree
 my-git sync go -R              # one-shot: sm → pull → mc across the tree
 my-git remote --check -R       # audit remotes (⚠ on suspicious URLs)
-my-git audit --claude          # audit .claude/ symlink convention
 my-git flatten                 # analyze: nested repos this would merge as content (THIS repo)
 my-git flatten go --merge       # apply one of the 3 modes (--merge/--sidecar/--zip)
 my-git flatten go -i              # per-item: choose skip/sidecar/merge/delete for each nested repo
@@ -229,7 +227,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
 | `unshadow`      | `unsh`         | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
 | `purge`         | —              | single PATH | Remove a path's content **and its entire history** from a repo — the only command that rewrites history. Resolves the repo by searching enclosing repos' **history** (not their index), `--from` to disambiguate; refuses unless the path is a repo in its own right; backs up `.git`, then demands you type `I am sure` |
-| `audit`         |                | always    | Read-only health checks: `--claude` (`.claude/` symlink convention) and/or `--sidecar` (sidecar setup) |
+| `audit`         |                | always    | Read-only health checks: `--sidecar` (sidecar setup) |
 | `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
@@ -363,7 +361,7 @@ separately:
 
 | Bucket | What counts | Handling |
 |--------|-------------|----------|
-| my-git-caused | submodule gitlink bumps (super recording a new child SHA); edits to `.gitignore`/`.gitmodules`/`.claude` made by my-git in this run | **auto-committed** via `git commit --only -- <paths>` with subject `my-git <mc\|sm>: auto-commit (bumps=N recorded=M)` — no prompt, even under `-i`. Pushed if the repo is pushable. |
+| my-git-caused | submodule gitlink bumps (super recording a new child SHA); edits to `.gitignore`/`.gitmodules` made by my-git in this run, and paths force-added for a child (see `.git.force-add-patterns`) | **auto-committed** via `git commit --only -- <paths>` with subject `my-git <mc\|sm>: auto-commit (bumps=N recorded=M)` — no prompt, even under `-i`. Pushed if the repo is pushable. |
 | user | everything else (your own edits, new files, etc.) | normal flow — prompted under `-i`, committed straight through without `-i`. |
 
 `git commit --only` guarantees the two buckets become two separate
@@ -1079,24 +1077,72 @@ exception (`git config --global --add ...`), then retries — governed by
 `SM_AUTO_SAFE_DIRECTORY` (default on). This applies wherever `my-git`
 resolves a repo's toplevel itself (e.g. `flatten`), not just inside `sm`.
 
-## `.claude` setup enforcement
+## Carrying local-only files between machines
 
-`mc` (and the standalone `audit --claude`) enforces the convention that each
-project's `.claude/` is a **symlink** into `$CLAUDE_PROJECT_DIR_CENTRAL_REPO`,
-not a real directory inside the project repo. On each repo:
+A project often has files it must NOT publish but DOES want on every machine
+you work from: editor and tooling config, personal notes, granted
+permissions. They are two different questions, and they get two different
+answers.
 
-1. `.gitignore` — must contain `.claude/` (auto-appended if missing).
-2. `.claude` — classified:
-   - Symlink into the central repo → OK (silent).
-   - Symlink pointing elsewhere → MAJOR warning; no auto-fix.
-   - Real dir with only `settings.local.json` (± other non-`settings.json`
-     files) → auto-migrate: move into central repo, `rmdir`, create
-     symlink.
-   - Real dir containing `settings.json` → **hard error**; `settings.json`
-     rules must be split manually (narrow → `~/.claude/settings.json`;
-     blanket → central `settings.local.json`; one-offs → drop).
+**The project decides what it publishes.** Two generic patterns in its
+tracked `.gitignore`:
 
-Disable with `CHECK_CLAUDE_SETUP=0` in the config.
+```gitignore
+*.local        # a local-only DIRECTORY (memory.local/) or file (notes.local)
+*.local.*      # settings.local.json, notes.local.md, anything.local.yaml
+```
+
+Nothing names a tool, so nothing about your setup is visible in the
+published repo — not even the ignore rule. And because a directory whose
+contents are *all* ignored is itself invisible to git, a directory holding
+only `*.local.*` files never appears in `git status` and needs no rule of
+its own.
+
+Deliberately two patterns, not one `*.local*`: the single-glob form also
+swallows `config.locale` and `app.localhost.conf`.
+
+**The container decides what it carries.** A container repo (the outer repo
+that mirrors your project repos — `/LINKS/src` here) HONOURS every child's
+`.gitignore`, because a file the child ignores is regenerable by definition:
+`.venv`, `node_modules`, `build/`. Mirroring those once put two complete
+virtualenvs — 14,327 files — into the container in a single command.
+
+The exception is named explicitly, in `.git.force-add-patterns` **at the
+container root**:
+
+```
+# What this container CARRIES despite a child repo ignoring it.
+*.local
+*.local.*
+```
+
+`mc` and `shadow` force-add exactly the ignored paths matching those globs,
+one file at a time. Never `git add -f -- <directory>`, which would override
+every `.gitignore` in the tree and sweep in the junk sitting beside them.
+
+The file lives at the container root **only**. A copy inside a child would
+be tracked by that child and pushed, publishing the very list that says what
+stays unpublished.
+
+The pass runs in `mc` as well as in `shadow`. Shadow-time alone is not
+enough: a file written afterwards is ignored by the container, so a plain
+`git add -A` never sees it, and it would sit there untravelled until someone
+happened to re-run `shadow go`.
+
+Under `mc` without `go` it reports (`WOULD carry N file(s)`) and stages
+nothing — analyze mode leaves the index exactly as it found it.
+
+**The failure modes, and why this one was chosen.** Force-adding everything
+a child ignores gives you "junk or secrets arrived", which needs a history
+rewrite — and it would sweep in `.env` and `*.pem`, ignored precisely
+because they are secrets. Honouring every child `.gitignore` with no
+exception gives you "a file I wanted did not travel", which is visible and
+fixed by adding one pattern. The second is the better failure.
+
+An src-side *exclusion* list was considered and rejected: it would have to
+enumerate the junk of every ecosystem, and missing one absorbs it silently —
+whereas each child's `.gitignore` already lists exactly that, maintained by
+whoever knows the project.
 
 ## Extending
 

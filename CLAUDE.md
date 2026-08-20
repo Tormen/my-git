@@ -76,7 +76,12 @@ remote (publishable), blank = n/a (zipped/stale). The Summary shows counts:
   is refused.
 - `unflatten|unfl` → `cmd_unflatten` (reverse; auto-detects; self-commits teardown).
 - `shadow|sh` / `unshadow|unsh` → content-mirror keep-.git-live / reverse.
-- `remote|rem`, `pull`, `fetch`, `sync`, `audit`, `repair`, `claude-check`.
+- `container_force_add` (no subcommand) → the ONE exception to "honour the
+  child's .gitignore": the globs in `<container>/.git.force-add-patterns`
+  (`*.local`, `*.local.*`) are force-added file-by-file, from BOTH `mc` and
+  `_shadow_one`. Never `add -f` a DIRECTORY — that overrides every
+  .gitignore in the tree and is how two .venvs once landed in src.
+- `remote|rem`, `pull`, `fetch`, `sync`, `audit`, `repair`.
 - `gz`/`gu` — zip/unzip a live `.git` in place, **parent-neutral** (no commit).
 
 ## Key mechanisms / gotchas
@@ -114,10 +119,9 @@ remote (publishable), blank = n/a (zipped/stale). The Summary shows counts:
   `chown -R us:` it — a safe, us-owned, writable copy for testing/validation.
   (It may be a *pre-merge* snapshot — e.g. it still holds the full `src/.git`.)
 - Ownership policy: `/syst/global` = root, `/syst/global/src` = us.
-- Claude memory: `/Users/us/.claude/projects/-Users-MINE-system-global/memory/`
-  (`MEMORY.md` index + `feedback_no_backward_compat.md`,
-  `feedback_success_fail_pairing.md`). Update it when you learn a durable
-  preference/fact.
+- Per-project memory lives in `<project>/.claude/memory.local/` (the
+  `.local` suffix is what keeps it out of the published repo while src still
+  carries it). Update it when you learn a durable preference/fact.
 
 ## Right now (see HANDOVER.md §3 for detail)
 
