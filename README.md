@@ -168,7 +168,6 @@ config file.
 | Variable                              | Default                                  | Meaning                                                                     |
 |---------------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | `GIT_REPOS`                           | see default config                       | Fallback super-repo list (used only when no repo is scoped via CWD or args) |
-| `FORCE_ADD_PATTERNS_FILE`             | `.git.force-add-patterns`                | Container-root file listing globs this repo carries despite a child ignoring them |
 | `COMMIT_MSG_LAST_N`                   | `3`                                      | Number of recent log entries in auto-commit body                            |
 | `COMMIT_MSG_DIFF_MAX_FILES`           | `10`                                     | Above this count, commit body shows file list instead of diffs              |
 | `PRIV_POLICY_USER_TO_ROOT`            | `warn`                                   | Non-root caller vs. a root-owned repo — see [Privilege](#privilege-sudo--su--policy) |
@@ -1127,6 +1126,11 @@ every `.gitignore` in the tree and sweep in the junk sitting beside them.
 The file lives at the container root **only**. A copy inside a child would
 be tracked by that child and pushed, publishing the very list that says what
 stays unpublished.
+
+Its name is a constant, not a config setting — like `.git.shadow.status`,
+`.git.merged` and `.git.zip`. It is a name two machines have to agree on, and
+as a setting it would be one more thing that must land before the tree works:
+a machine that pulled the repos but not the config would carry nothing.
 
 The pass runs in `mc` as well as in `shadow`. Shadow-time alone is not
 enough: a file written afterwards is ignored by the container, so a plain
