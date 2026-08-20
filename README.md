@@ -564,17 +564,21 @@ my-git flatten go <path> --sidecar   # scope to just ONE repo/sidecar (also --me
 nested repo's files become tracked content in the parent — and differ
 only in what happens to its git dir:
 
-- **`--merge`** — ⚠️ **the `.git` is permanently DELETED and its history is
-  NOT preserved.** A `.git.merged` *text* snapshot is written first (branch,
-  commit, remote, full config, and any `.git*` convention files like
-  `.gitignore`/`.gitattributes`/`.gitmodules`, captured then removed) — but there
-  is **no object database** behind it. `unflatten --merge` can only *partly*
-  rebuild history via `git subtree split` (forward from the merge, out of the
-  parent's own commits) — it cannot resurrect pre-merge history, and for some
-  repos it reconstructs nothing. If the repo has a remote its history still lives
-  on origin; otherwise **`--merge` is destructive and irreversible**. Prefer
-  `--sidecar` (keeps full history) or `--zip` unless you truly want the history
-  gone.
+- **`--merge`** — the nested history is **TRANSPLANTED into the parent's
+  object database** under `refs/my-git/merged/<path>/`, and only then is the
+  nested `.git` removed. A `.git.merged` *text* snapshot is written alongside
+  it (branch, commit, remote, full config, and any `.git*` convention files
+  like `.gitignore`/`.gitattributes`/`.gitmodules`, captured then removed) so
+  `unflatten --merge` knows what to restore. **The deletion is gated on the
+  transplant**: `preserve_merged_history` verifies the tip is readable from
+  the parent afterwards, and every caller leaves the nested `.git` alone if it
+  is not — so merge never destroys anything. One caveat worth knowing: those
+  refs live outside `refs/heads` and `refs/tags`, so a **default clone does
+  not fetch them**; `--merge` adds the refspecs to the parent's remote so the
+  parent carries them.
+
+  The one deliberately destructive operation is **`flatten --rm-git`**, which
+  deletes nested `.git` dirs outright behind a typed `I am sure`.
 - **`--sidecar`** — the `.git` is RELOCATED (not deleted) into a
   self-contained `.git.real` capsule that keeps its FULL history, plus a
   `.git.real.status` snapshot so `unflatten --sidecar` restores the exact

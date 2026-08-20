@@ -7753,6 +7753,22 @@ _shadow_one() {
   # disk. Doing it per-repo here would only ever add, never retire.
   shadow_sync_excludes "$PWD" >/dev/null || true   # stderr carries the warnings
 
+  # Ask the CHILD which paths it considers real, while its .git is still
+  # live. Tracked files plus untracked-but-not-ignored ones: exactly what the
+  # child would commit, which is exactly what the mirror should hold. This has
+  # to happen BEFORE the gitdir moves aside -- afterwards there is nothing
+  # left to ask.
+  _sho_keep=$(mktemp "${TMPDIR:-/tmp}/${US}.shokeep.XXXXXX") || { log_error "shadow: mktemp failed"; return 1; }
+  { run_as_owner_capture "$_sho_p" git ls-files
+    run_as_owner_capture "$_sho_p" git ls-files -o --exclude-standard
+  } | sort -u | while IFS= read -r _sho_f; do
+      [ -n "$_sho_f" ] || continue
+      # An index entry whose file is gone would abort the whole add; the
+      # deletion is staged by 'add -u' below instead.
+      [ -e "$_sho_p/$_sho_f" ] || continue
+      printf '%s/%s\n' "$_sho_p" "$_sho_f"
+    done > "$_sho_keep"
+
   ( _sho_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.shadow.XXXXXX") || { log_error "shadow: mktemp -d failed"; exit 1; }
     # restore .git on interrupt (contained to this subshell)
     trap 'mv -- "$_sho_tmp/gitdir" "$_sho_gd" 2>/dev/null' INT TERM HUP
@@ -7774,16 +7790,28 @@ _shadow_one() {
       run git update-index --force-remove -- "$_sho_p" 2>/dev/null \
         || log_warn "shadow: $_sho_p — could not clear the gitlink; the mirror may not be created"
     fi
-    # NOT 'add -f' for the content. -f overrides every .gitignore in the
-    # tree -- including the CHILD's own -- so a project carrying .venv,
-    # node_modules or build/ had all of it mirrored into the parent. That
-    # put two complete virtualenvs (14,327 files, 2.9M lines) into this
-    # container in one command, and 2,273 such paths were already in its
-    # history from earlier shadow runs.
+    # Two steps, and neither is a bare 'add -f -- <dir>'. -f on a DIRECTORY
+    # overrides every .gitignore in the tree, the CHILD's included, which is
+    # how two complete virtualenvs (14,327 files, 2.9M lines) reached this
+    # container in a single command.
     #
-    # A file the child ignores is regenerable by definition, and the child's
-    # .gitignore is the authoritative statement of that. Honour it.
-    run git -c advice.addEmbeddedRepo=false add -- "$_sho_p"; _sho_rc=$?
+    # (1) Already-tracked paths: 'add -u' picks up edits AND deletions. Ignore
+    #     rules have no say over a tracked path, so this works even though
+    #     shadow's own managed block in this repo's .git/info/exclude names
+    #     this very directory.
+    run git add -u -- "$_sho_p" >/dev/null 2>&1 || true
+    # (2) Everything the child itself would commit, named explicitly. Plain
+    #     'add -- <dir>' was used here once and FAILED on every already-
+    #     shadowed repo: the exclusion shadow wrote for this path blocks it,
+    #     so 're-shadow to refresh the marker' -- the fix 'st' tells you to
+    #     run -- reported "nothing shadowed (1 failed)" while having done
+    #     half the job. Forcing an explicit list built from the child's OWN
+    #     ls-files honours its .gitignore exactly and cannot be blocked.
+    _sho_rc=0
+    if [ -s "$_sho_keep" ]; then
+      run git -c advice.addEmbeddedRepo=false add -f --pathspec-from-file="$_sho_keep"
+      _sho_rc=$?
+    fi
     # The marker is ours and must be tracked by the parent regardless of what
     # any .gitignore says, so it keeps the force.
     run git add -f -- "$_sho_p/.git.shadow.status" >/dev/null 2>&1 || true
@@ -7794,6 +7822,7 @@ _shadow_one() {
     exit $_sho_rc
   )
   _sho_rc=$?
+  rm -f "$_sho_keep"
   # The plain add above honours the child's .gitignore, which is what
   # keeps .venv and node_modules out of the mirror. The files the child
   # hides from GitHub but wants on every machine are the exception, and
@@ -9005,7 +9034,17 @@ ${_rc_p}
 # blank lines dropped. Returns 1 when the repo declares no such file, which
 # is the normal case -- only a container carries one.
 _force_add_patterns() {
-  [ -n "${FORCE_ADD_PATTERNS_FILE:-}" ] || return 1
+  if [ -z "${FORCE_ADD_PATTERNS_FILE:-}" ]; then
+    # A pattern file on disk with no knob to name it means an out-of-date
+    # config -- typically a machine that pulled the tree but not the config
+    # file. Silence here would carry nothing and say nothing, and "nothing
+    # travelled" is exactly the failure this whole mechanism exists to
+    # prevent.
+    if [ -f "$1/.git.force-add-patterns" ]; then
+      log_warn "$1 carries a '.git.force-add-patterns' but FORCE_ADD_PATTERNS_FILE is not set in your config — nothing listed in it will travel. Update the config (my-git --create-config shows the current one)."
+    fi
+    return 1
+  fi
   [ -f "$1/$FORCE_ADD_PATTERNS_FILE" ] || return 1
   sed -e 's/[[:space:]]*$//' "$1/$FORCE_ADD_PATTERNS_FILE" \
     | grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$'
@@ -9744,12 +9783,17 @@ content; --zip does NOT — it commits ONLY the .git.zip archive and leaves the
 worktree files exactly as they were (track them later with 'mc' if you want).
 Every item is handled by exactly ONE mode:
 
-  --merge     the git dir stays LIVE in place, or is DELETED. my-git does
-              NOT preserve the pre-merge history (only what the parent's
-              own commits captured survives; 'unflatten --merge' can
-              reconstruct that much, best-effort). The historical default
-              for embedded repos and the 'flatten'/'delete' choices for
-              registered submodules.
+  --merge     the nested history is TRANSPLANTED into the parent's object
+              DB under $MERGED_REFS_ROOT/<path>/, then the nested git dir is
+              removed. FULL history preserved, and 'unflatten --merge'
+              restores it exactly. The deletion is GATED on the transplant
+              verifying: if the tip is not readable from the parent
+              afterwards, the nested .git is left untouched, so merge never
+              destroys anything. (Those refs are outside refs/heads and
+              refs/tags, so a default clone does NOT fetch them -- the
+              parent's own remote does, via the refspecs merge adds.)
+              The default for embedded repos and the 'flatten'/'delete'
+              choices for registered submodules.
   --sidecar   the git dir is RELOCATED (not deleted) into a self-contained
               GIT_SIDECAR_DIRNAME capsule beside the files — FULL history
               preserved, usable via 'git --git-dir=<path>/.git.real', just
@@ -16190,6 +16234,24 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_a_stale_config_says_why_nothing_travels() {
+    # The transition case: a machine pulls the tree (so the pattern file is
+    # there) but not the config that names it. Carrying nothing AND saying
+    # nothing is the exact failure this mechanism exists to prevent -- a
+    # config that existed on one machine only, for weeks, unnoticed.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    # a config from before the knob existed
+    grep -v '^FORCE_ADD_PATTERNS_FILE=' "$_rt_conf_path" > "$_rt_conf_path.old"
+    mv "$_rt_conf_path.old" "$_rt_conf_path"
+    cd container || return 1
+    printf '*.local\n' > .git.force-add-patterns
+    _rt_ok "mc on a container with a stale config" _rt_my_git mc || return 1
+    _rt_contains "says the knob is missing" "$_rt_err" "FORCE_ADD_PATTERNS_FILE is not set" || return 1
+    _rt_contains "and what it costs" "$_rt_err" "will travel" || return 1
+    return 0
+  }
+
   test_force_add_reports_under_analyze_and_stages_nothing() {
     # Analyze mode promises the index is left exactly as it was found. A
     # force-add that ran unconditionally would break that promise silently
@@ -17908,6 +17970,55 @@ PYDRV
     return 0
   }
 
+  test_shadow_go_refreshes_an_already_shadowed_repo() {
+    # Re-shadowing is the documented fix for a stale marker -- 'st' prints
+    # "to do it now: my-git shadow go <path>". It used to FAIL there: shadow
+    # writes '/<path>/' into the container's .git/info/exclude to hide the
+    # nested repo, and that exclusion then blocked shadow's own 'git add'.
+    # The run reported "nothing shadowed (1 failed)" after updating the
+    # marker -- half done, and loudly wrong about which half.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    printf '.venv/\n' > proj/.gitignore
+    printf 'real\n' > proj/keep.py
+    mkdir -p proj/.venv && printf 'junk\n' > proj/.venv/activate
+    ( cd proj && git add .gitignore keep.py \
+      && git -c user.name=T -c user.email=t@t commit -qm base ) >/dev/null 2>&1
+    _rt_ok "first shadow" _rt_my_git shadow go proj || return 1
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+    # The exclusion, exactly as it sits in the live tree. Written here by
+    # hand on purpose: the test is about surviving it, not about which code
+    # path put it there.
+    printf '/proj/\n' >> .git/info/exclude
+    _rt_ok "the container excludes the shadowed path" true || return 1
+
+    # The child gains a file and loses one; re-shadow must carry both.
+    printf 'second\n' > proj/also.py
+    rm -f proj/keep.py
+    printf 'more junk\n' > proj/.venv/lib
+
+    _rt_ok "SECOND shadow on the same repo" _rt_my_git shadow go proj || return 1
+    _rt_not_contains "does not claim it failed" "$_rt_out" "nothing shadowed" || return 1
+    [ -n "$(git ls-files -- proj/also.py)" ] \
+      || { _rt_fail "a new file was not mirrored on re-shadow"; return 1; }
+    _rt_ok "the new file is mirrored" true || return 1
+    if [ -n "$(git diff --cached --name-only --diff-filter=D -- proj/keep.py)" ] \
+       || [ -z "$(git ls-files -- proj/keep.py)" ]; then
+      _rt_ok "the deletion is staged too" true
+    else
+      _rt_fail "a deleted file was left in the mirror"; return 1
+    fi
+    if [ -n "$(git ls-files -- 'proj/.venv/*')" ]; then
+      _rt_fail "re-shadow force-added what the child ignores"; return 1
+    fi
+    _rt_ok "still honours the child .gitignore" true || return 1
+    return 0
+  }
+
   test_shadow_status_preserves_first_bumps_last() {
     # Re-shadowing the same repo must PRESERVE first-shadowed and only move
     # last-shadowed forward (the 'ga' alias bumps last-shadowed the same way).
@@ -18082,7 +18193,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_a_stale_config_says_why_nothing_travels test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
