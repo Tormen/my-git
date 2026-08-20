@@ -3274,6 +3274,36 @@ commit_one() {
     fi
   fi
 
+  # BEHIND its remote, checked BEFORE the analyze branch: analyze is what you
+  # run first, and it used to answer "would-commit" for a repo whose commit
+  # could not possibly land. Committing here builds on a base the remote has already
+  # moved past, so the push that follows is rejected non-fast-forward and the
+  # user is left holding a commit and git's raw hint. mc knows this BEFORE it
+  # commits -- the porcelain '-b' line it already read says so -- so say it
+  # while it is still cheap to act on.
+  _cb_behind=0
+  # $_bline_mc, not $_porc: the branch line carries ahead/behind and is split
+  # off from the porcelain above.
+  case "$_bline_mc" in
+    *"behind "*) _cb_behind=${_bline_mc#*"behind "}; _cb_behind=${_cb_behind%%[!0-9]*} ;;
+  esac
+  [ -n "$_cb_behind" ] || _cb_behind=0
+  if [ "$_cb_behind" -gt 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      printf ' >>> %-60s %-32s -> %s\n' "$_r" "$_state_desc" \
+        "SKIP ($_cb_behind behind — pull first)"
+    else
+      log_major "$_r: [SKIPPED — $_cb_behind commit(s) behind its remote; commit here and the push is rejected]"
+    fi
+    [ "$DRY_RUN" = 1 ] || printf '    > pull first, then commit:  %s pull go && %s mc go\n' "$US" "$US"
+    [ "$DRY_RUN" = 1 ] || printf '    > if this repo is a CONTAINER and the pull refuses because its mirror\n'
+    [ "$DRY_RUN" = 1 ] || printf '    > is stale, the mirror is derived from the children and can always be\n'
+    [ "$DRY_RUN" = 1 ] || printf '    > rebuilt -- take the remote history and re-record it:\n'
+    [ "$DRY_RUN" = 1 ] || printf '    >     git -C %s fetch && git -C %s reset --mixed origin/<branch> && %s mc go\n' "$_r" "$_r" "$US"
+    MC_N_SKIPPED=$((MC_N_SKIPPED + 1))
+    return 0
+  fi
+
   # ── Analyze mode: print a single concise line per repo and bail ───────
   if [ "$DRY_RUN" = 1 ]; then
     printf ' >>> %-60s %-32s -> %s\n' "$_r" "$_state_desc" "$_action"
@@ -3327,29 +3357,6 @@ commit_one() {
       return 0
       ;;
   esac
-
-  # BEHIND its remote: committing here builds on a base the remote has already
-  # moved past, so the push that follows is rejected non-fast-forward and the
-  # user is left holding a commit and git's raw hint. mc knows this BEFORE it
-  # commits -- the porcelain '-b' line it already read says so -- so say it
-  # while it is still cheap to act on.
-  _cb_behind=0
-  # $_bline_mc, not $_porc: the branch line carries ahead/behind and is split
-  # off from the porcelain above.
-  case "$_bline_mc" in
-    *"behind "*) _cb_behind=${_bline_mc#*"behind "}; _cb_behind=${_cb_behind%%[!0-9]*} ;;
-  esac
-  [ -n "$_cb_behind" ] || _cb_behind=0
-  if [ "$_cb_behind" -gt 0 ]; then
-    log_major "$_r: [SKIPPED — $_cb_behind commit(s) behind its remote; commit here and the push is rejected]"
-    printf '    > pull first, then commit:  %s pull go && %s mc go\n' "$US" "$US"
-    printf '    > if this repo is a CONTAINER and the pull refuses because its mirror\n'
-    printf '    > is stale, the mirror is derived from the children and can always be\n'
-    printf '    > rebuilt -- take the remote history and re-record it:\n'
-    printf '    >     git -C %s fetch && git -C %s reset --mixed origin/<branch> && %s mc go\n' "$_r" "$_r" "$US"
-    MC_N_SKIPPED=$((MC_N_SKIPPED + 1))
-    return 0
-  fi
 
   # Someone else's commits, delivered through the container's checkout, are
   # not this machine's work to commit. Committing them duplicates upstream as
