@@ -8998,10 +8998,30 @@ cmd_rehydrate() {
   # reset, not a re-clone.
   _rh_fix=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydfix.XXXXXX") || fatal "rehydrate: mktemp failed" 1
   : > "$_rh_fix"
+  # A repo that EXISTS but does not match what the marker records. rehydrate
+  # used to look at the commit only, and fetch from whatever remote the repo
+  # happened to have -- so a machine sitting on the wrong branch, or pointed
+  # at upstream instead of the fork, could never be repaired: the commit its
+  # files are was on a remote nobody fetched. The marker records the remote
+  # AND the branch precisely so this is answerable; it just was not asked.
+  _rh_align=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydaln.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  : > "$_rh_align"
   while IFS= read -r _rh_p; do
     [ -n "$_rh_p" ] || continue
     [ -n "$_rh_scope" ] && [ "$_rh_p" != "$_rh_scope" ] && continue
     if [ -e "$_rh_p/.git" ]; then
+      _rh_wurl=$(sed -n 's|^remote\.origin\.url: ||p' "$_rh_p/.git.shadow.status" 2>/dev/null | head -n 1)
+      _rh_wbr=$(sed -n 's|^branch: ||p' "$_rh_p/.git.shadow.status" 2>/dev/null | head -n 1)
+      case "$_rh_wbr" in '(detached)'*) _rh_wbr="" ;; esac
+      _rh_aurl=$(git -C "$_rh_p" config --get remote.origin.url 2>/dev/null </dev/null)
+      _rh_abr=$(git -C "$_rh_p" symbolic-ref --short -q HEAD 2>/dev/null </dev/null)
+      _rh_need=0
+      [ -n "$_rh_wurl" ] && [ -n "$_rh_aurl" ] && ! _remote_urls_equal "$_rh_wurl" "$_rh_aurl" && _rh_need=1
+      [ -n "$_rh_wbr" ]  && [ -n "$_rh_abr" ]  && [ "$_rh_wbr" != "$_rh_abr" ] && _rh_need=1
+      if [ "$_rh_need" = 1 ]; then
+        printf '%s\t%s\t%s\n' "$_rh_p" "$_rh_wurl" "$_rh_wbr" >> "$_rh_align"
+        continue
+      fi
       # Only fires when the worktree hashes to a commit exactly -- a repo
       # with genuine local edits matches nothing and is never touched.
       _rh_m=$(wt_matches_commit "$_rh_p" 2>/dev/null </dev/null) || _rh_m=""
@@ -9045,10 +9065,59 @@ _RH_EOF
 
   _rh_n=$(grep -c . "$_rh_tmp" 2>/dev/null)
   _rh_nfix=$(grep -c . "$_rh_fix" 2>/dev/null)
-  if [ "${_rh_n:-0}" -eq 0 ] && [ "${_rh_nfix:-0}" -eq 0 ]; then
-    rm -f "$_rh_tmp" "$_rh_fix"
+  _rh_naln=$(grep -c . "$_rh_align" 2>/dev/null)
+  if [ "${_rh_n:-0}" -eq 0 ] && [ "${_rh_nfix:-0}" -eq 0 ] && [ "${_rh_naln:-0}" -eq 0 ]; then
+    rm -f "$_rh_tmp" "$_rh_fix" "$_rh_align"
     log_major "$_rh_top: nothing to rehydrate — every shadowed repo has its own .git, at the commit its files are"
     exit 0
+  fi
+
+  if [ "${_rh_naln:-0}" -gt 0 ]; then
+    log_major "$_rh_top: $_rh_naln project(s) do not match the branch/remote the marker records"
+    while IFS="$(printf '\t')" read -r _al_p _al_u _al_b <&8; do
+      [ -n "$_al_p" ] || continue
+      printf '  %s>> %-42s -> %s  @ %s%s\n' "$C_BLUE" "$_al_p" "${_al_b:-<branch unrecorded>}" "$_al_u" "$C_RESET"
+    done 8< "$_rh_align"
+    if [ "$_rh_mode" = go ]; then
+      while IFS="$(printf '\t')" read -r _al_p _al_u _al_b <&8; do
+        [ -n "$_al_p" ] || continue
+        # Point at the recorded remote FIRST: the commit these files are may
+        # live only there (a fork branch upstream has never heard of), which
+        # is why fetching from whatever the repo already had found nothing.
+        if [ -n "$_al_u" ]; then
+          run git -C "$_al_p" remote set-url origin "$_al_u" >/dev/null 2>&1 </dev/null \
+            || log_warn "rehydrate: $_al_p — could not point origin at $_al_u"
+        fi
+        if ! _al_err=$(run git -C "$_al_p" fetch -q --all --prune </dev/null 2>&1); then
+          log_warn "rehydrate: $_al_p — fetch FAILED, so the recorded branch may exist but be unreachable from here: $(printf '%s' "$_al_err" | tail -n 2 | tr '\n' ' ')"
+          continue
+        fi
+        # Only ever move HEAD to a commit whose tree IS these files. A repo
+        # with genuine local edits matches nothing and is left exactly alone.
+        _al_c=$(wt_matches_commit "$_al_p" 2>/dev/null </dev/null) || _al_c=""
+        if [ -z "$_al_c" ]; then
+          log_warn "rehydrate: $_al_p — its files match no commit on ${_al_b:-the recorded branch}; NOT touching it. Either they are local edits, or this machine holds a state no remote has."
+          continue
+        fi
+        # symbolic-ref then reset --mixed: switches which BRANCH is checked
+        # out and where it points, without writing a single working file --
+        # the same primitive the wrong-commit repair uses, which is what makes
+        # this safe on a worktree the container also tracks.
+        if [ -n "$_al_b" ]; then
+          run git -C "$_al_p" symbolic-ref HEAD "refs/heads/$_al_b" >/dev/null 2>&1 </dev/null \
+            || { log_fail "rehydrate: $_al_p — could not switch to branch $_al_b"; continue; }
+        fi
+        if run git -C "$_al_p" reset -q --mixed "$_al_c" >/dev/null 2>&1 </dev/null; then
+          run git -C "$_al_p" branch --set-upstream-to="origin/$_al_b" "$_al_b" >/dev/null 2>&1 </dev/null || true
+          log_ok "rehydrate: $_al_p — now on ${_al_b:-its recorded branch} at the commit its files are ($(printf '%s' "$_al_c" | cut -c1-9))"
+          _rh_naligned=$((${_rh_naligned:-0}+1))
+        else
+          log_fail "rehydrate: $_al_p — could not point ${_al_b:-HEAD} at $_al_c"
+        fi
+      done 8< "$_rh_align"
+      [ "${_rh_naligned:-0}" -gt 0 ] \
+        && log_ok "rehydrate: ${_rh_naligned} project(s) realigned to what the marker records"
+    fi
   fi
 
   if [ "${_rh_nfix:-0}" -gt 0 ]; then
@@ -16321,6 +16390,61 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records() {
+    # A second machine sitting on the wrong branch, pointed at upstream rather
+    # than the fork holding the work. rehydrate repaired a MISSING repo and a
+    # wrong COMMIT, but never the branch or the remote -- even though the
+    # marker records both. So it fetched from whatever the repo already had,
+    # never saw the commit its files actually are, and reported nothing to do
+    # while 451 paths read as modified. setup.sh runs 'rehydrate go', so this
+    # is what makes a fresh machine converge without hand-editing remotes.
+    _rt_repo_file up_fork a.md
+    # Do NOT hardcode 'master': the default branch name comes from whichever
+    # git config is in play, and assuming it made this test fail its own setup.
+    _rt_def=$(git -C up_fork symbolic-ref --short HEAD)
+    ( cd up_fork && git checkout -q -b feature \
+      && printf 'work only on the fork branch\n' >> a.md && git add a.md \
+      && git -c user.name=T -c user.email=t@t commit -qm "fork-only work" \
+      && git checkout -q "$_rt_def" ) >/dev/null 2>&1
+    _rt_repo_file up_stream b.md          # a DIFFERENT repo: no 'feature' here
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_fork proj >/dev/null 2>&1 \
+      && cd proj && git checkout -q feature ) >/dev/null 2>&1
+    cd container || return 1
+    _rt_ok "shadow it on the fork branch" _rt_my_git shadow go proj || return 1
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+    _rt_contains "marker records the branch" proj/.git.shadow.status "branch: feature" || return 1
+
+    # Now put the repo in the state the second machine was in: on master, and
+    # pointed at a remote that has never heard of 'feature'. Each step is
+    # CHECKED -- an earlier version chained these with && behind a
+    # >/dev/null 2>&1 and, when the chain broke, the test "passed setup" with
+    # the repo still in the right state and proved nothing.
+    _rt_upstream=$(cd ../up_stream && pwd -P)
+    ( cd proj && git checkout -q "$_rt_def" ) || { _rt_fail "setup: could not check out $_rt_def"; return 1; }
+    ( cd proj && git branch -q -D feature ) || { _rt_fail "setup: could not delete feature"; return 1; }
+    ( cd proj && git remote set-url origin "$_rt_upstream" ) || { _rt_fail "setup: could not repoint origin"; return 1; }
+    ( cd proj && git fetch -q --all 2>/dev/null; true )
+    [ "$(git -C proj symbolic-ref --short HEAD)" = "$_rt_def" ] \
+      || { _rt_fail "setup: expected to be on $_rt_def"; return 1; }
+    git -C proj rev-parse --verify -q feature >/dev/null \
+      && { _rt_fail "setup: 'feature' still exists locally"; return 1; }
+    _rt_ok "the repo is on the wrong branch and remote" true || return 1
+
+    _rt_ok "rehydrate go" _rt_my_git rehydrate go || return 1
+    _rt_contains "reports the mismatch" "$_rt_out" "branch/remote the marker records" || return 1
+    [ "$(git -C proj symbolic-ref --short HEAD)" = feature ] \
+      || { _rt_fail "still on $(git -C proj symbolic-ref --short HEAD), not the recorded branch"; return 1; }
+    _rt_ok "back on the recorded branch" true || return 1
+    if [ -n "$(git -C proj status --porcelain)" ]; then
+      _rt_fail "left dirty: $(git -C proj status --porcelain | head -3 | tr '\n' ' ')"; return 1
+    fi
+    _rt_ok "and plain git calls it CLEAN" true || return 1
+    return 0
+  }
+
   test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit() {
     # A machine rehydrated BEFORE the tree-match existed has its projects at
     # the remote's tip while the files are an older checkout -- every one
@@ -18737,7 +18861,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
