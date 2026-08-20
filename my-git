@@ -749,6 +749,34 @@ _xuser_exec() {
   fi
 }
 
+# _rm_user <path>...
+#   Remove USER data recoverably. Uses 'trash' when it is on PATH -- NOT an
+#   absolute path, so /LINKS/bin/trash wins over /usr/bin/trash -- falling
+#   back to rm only when trash is absent or refuses.
+#
+#   Only for things a person would miss: a .git, a .git.real, a saved
+#   original, a .gitmodules. Temp files keep using rm on purpose; routing
+#   mktemp scratch through the trash would bury the one thing you actually
+#   wanted to recover.
+#
+#   Note trash takes paths only -- it rejects -f/-r ("Un-recognized argument
+#   -f"), so callers pass bare paths.
+_rm_user() {
+  [ $# -gt 0 ] || return 0
+  # No fallback to rm, deliberately. A fallback would mean the one case that
+  # most needs recoverability -- trash missing or refusing -- is exactly the
+  # case that deletes permanently. Fail loudly and let the caller decide.
+  if ! command -v trash >/dev/null 2>&1; then
+    log_error "_rm_user: 'trash' not on PATH — REFUSING to delete $*. Install it, or remove by hand if you are sure."
+    return 1
+  fi
+  if ! trash "$@" >/dev/null 2>&1; then
+    log_error "_rm_user: 'trash' refused $* — nothing was deleted."
+    return 1
+  fi
+  return 0
+}
+
 run_as_owner() {
   # run_as_owner <repo_worktree> <cmd> [args...]
   #   Runs cmd in $repo as the .git owner. Dispatch:
@@ -1368,7 +1396,8 @@ _zip_gitdir() {
     if run zip -qr "$_zg_zip" "$_zg_src" $_zg_extra && run unzip -tqq "$_zg_zip"; then
       if [ "$_zg_keep" != 1 ]; then
         # shellcheck disable=SC2086
-        run rm -rf "$_zg_src" $_zg_extra
+        # shellcheck disable=SC2086  # _zg_extra is a deliberate word list
+    run _rm_user "$_zg_src" $_zg_extra
       fi
     else
       log_error "zip: $_zg_p: zip failed (archive left untouched, originals kept)"
@@ -4116,7 +4145,7 @@ _FL_ADD_EOF
       printf -- '--- %s content at this time ---\n' "$_cgf_base"
       cat "$_cgf_f" 2>/dev/null
       printf '\n'
-      run rm -f -- "$_cgf_f"
+      run _rm_user "$_cgf_f"
     done
   }
 
@@ -4246,7 +4275,7 @@ _FL_ADD_EOF
     _fos_url=$(_sm_safe_git . config -f "$_fos_gitmodules" --get "submodule.$_fos_name.url" 2>/dev/null)
     log_dbg_med "sub-submodule $_fos_sub: AT RISK — gitdir '$_fos_real' lives inside the doomed parent gitdir; relocating to '$_fos_dst' (url=$_fos_url)"
     log_medium "transfer $_fos_sub  (sub-submodule of a path about to lose its own .git — realizing it first so its history survives)"
-    run rm -f -- "$_fos_sub/.git" || { log_warn "sub-submodule $_fos_sub: rm of old .git pointer failed — leaving untouched"; return 0; }
+    run _rm_user "$_fos_sub/.git" || { log_warn "sub-submodule $_fos_sub: removing the old .git pointer failed — leaving untouched"; return 0; }
     run mv -- "$_fos_real" "$_fos_dst" || { log_warn "sub-submodule $_fos_sub: mv of gitdir '$_fos_real' -> '$_fos_dst' failed — history NOT relocated"; return 0; }
     run git config --file "$_fos_dst/config" core.worktree ".." || { log_warn "sub-submodule $_fos_sub: could not set core.worktree on the new sidecar"; return 0; }
     run git config --file "$_fos_dst/config" --unset core.bare 2>/dev/null || true
@@ -4446,7 +4475,7 @@ _FL_ADD_EOF
       log_warn "$_fms_path: left as a sidecar ($GIT_SIDECAR_DIRNAME kept) — nothing was deleted"
       return 1
     }
-    run rm -rf -- "$_fms_gitreal" || { log_error "$_fms_path: rm -rf $_fms_gitreal failed"; return 1; }
+    run _rm_user "$_fms_gitreal" || { log_error "$_fms_path: removing $_fms_gitreal failed"; return 1; }
     [ -f "$_fms_status" ] && { run git rm -q -- "$_fms_status" >/dev/null 2>&1 || run rm -f -- "$_fms_status"; }
     return 0
   }
@@ -4505,7 +4534,7 @@ _FL_ADD_EOF
     awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_usd_manifest" \
       | while IFS="$(printf '\t')" read -r _usd_orig _usd_saved; do
           [ -e "$_usd_saved" ] || continue
-          [ -e "$_usd_orig" ] && run rm -rf -- "$_usd_orig" 2>/dev/null
+          [ -e "$_usd_orig" ] && run _rm_user "$_usd_orig" 2>/dev/null
           run mv -- "$_usd_saved" "$_usd_orig" 2>/dev/null \
             || log_warn "unshield: restore failed: $_usd_saved -> $_usd_orig (nested repo left in the save dir — recover it by hand)"
         done
@@ -4727,7 +4756,7 @@ _FL_ADD_EOF
         log_medium "sidecar  $_rze_path  (pointer's enclosing repo was already sidecared — resolved via $GIT_SIDECAR_DIRNAME instead)"
       log_medium "sidecar  $_rze_path  (gitfile pointer -> $_rze_real -> $_rze_dst)"
       log_warn "$_rze_path: this was a submodule of its OWN enclosing repo (not this scope) — that enclosing repo's own .gitmodules/index entry for it will now be inconsistent (its git history moved out from under it) unless the enclosing repo is also flattened/sidecared"
-      run rm -f -- "$_rze_src" || { log_error "sidecar: $_rze_path: removing gitfile pointer failed"; return 1; }
+      run _rm_user "$_rze_src" || { log_error "sidecar: $_rze_path: removing gitfile pointer failed"; return 1; }
       if ! run mv -- "$_rze_real" "$_rze_dst"; then
         log_error "sidecar: $_rze_path: mv $_rze_real -> $_rze_dst failed"
         return 1
@@ -5407,7 +5436,7 @@ _FL_EMB_REALIZE_EOF
       # No submodule sections remain → remove .gitmodules entirely.
       run git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
         log_warn ".gitmodules: update-index --force-remove failed"
-      run rm -f -- .gitmodules
+      run _rm_user .gitmodules
     elif [ -f .gitmodules ]; then
       # Some sections remain → stage the modified .gitmodules.
       run git add -- .gitmodules >/dev/null 2>&1 || \
@@ -6204,7 +6233,7 @@ _FL_AUTO_EOF
            --get-regexp '^submodule\..*\.path$' >/dev/null 2>&1; then
         run git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
           log_warn ".gitmodules: update-index --force-remove failed"
-        run rm -f -- .gitmodules
+        run _rm_user .gitmodules
       elif [ -f .gitmodules ]; then
         run git add -- .gitmodules >/dev/null 2>&1 || log_warn ".gitmodules: git add failed"
       fi
@@ -6378,7 +6407,7 @@ _FL_AUTO_EMB_EOF
     awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_fl_manifest" \
       | while IFS="$(printf '\t')" read -r _orig _saved; do
           [ -e "$_saved" ] || continue
-          [ -e "$_orig" ] && run rm -rf -- "$_orig" 2>/dev/null
+          [ -e "$_orig" ] && run _rm_user "$_orig" 2>/dev/null
           run mv -- "$_saved" "$_orig" 2>/dev/null || \
             log_warn "restore failed: $_saved -> $_orig"
         done
@@ -6558,7 +6587,7 @@ _FL_ZIP_EOF
     while IFS= read -r _n; do
       [ -n "$_n" ] || continue
       log_medium "delete   $_n"
-      run rm -rf -- "$_n" || log_warn "rm failed for $_n"
+      run _rm_user "$_n" || log_warn "removal failed for $_n"
     done <<_FL_EOF
 $_fl_nested
 _FL_EOF
@@ -7363,7 +7392,6 @@ if [ -n "$_mgs_top" ]; then
     # staged content under this repo, OTHER than the marker itself? (capture +
     # test -n: robust to BSD grep returning 0 on empty input)
     _mgs_chg=$(git -C "$_mgs_top" diff --cached --name-only -- "$_mgs_kid" 2>/dev/null | grep -v '/\.git\.shadow\.status$')
-    [ -n "$_mgs_chg" ] || continue
     # Refresh the fields 'rehydrate' RESTORES FROM, not just the timestamp.
     # The marker is written once at shadow time, so a remote that changes
     # afterwards (upstream renamed, url switched to ssh) leaves the marker
@@ -7379,9 +7407,25 @@ if [ -n "$_mgs_top" ]; then
     # anything, which is not worth feeding through awk on every commit.
     _mgs_br=$(git -C "$_mgs_kid" symbolic-ref --short -q HEAD 2>/dev/null)
     _mgs_url=$(git -C "$_mgs_kid" config --get remote.origin.url 2>/dev/null)
+    # Staged content is the right gate for the TIMESTAMP -- it records when
+    # this mirror was last taken. It is the wrong gate for branch/url, which
+    # is what the previous version used it for: a remote added after
+    # shadowing, in a project whose files then never change, stayed stale
+    # FOREVER. Seen for real: py/my-boox gained a GitHub remote, three
+    # container commits went by, and the marker still recorded none at all --
+    # so rehydrate on another machine would have refused to restore it.
+    # So: rewrite when content changed OR when a restore-field has drifted.
+    _mgs_rb=$(sed -n 's/^branch: //p' "$_mgs_f" 2>/dev/null | head -n 1)
+    _mgs_ru=$(sed -n 's/^remote\.origin\.url: //p' "$_mgs_f" 2>/dev/null | head -n 1)
+    _mgs_drift=0
+    [ -n "$_mgs_br" ]  && [ "$_mgs_br"  != "$_mgs_rb" ] && _mgs_drift=1
+    [ -n "$_mgs_url" ] && [ "$_mgs_url" != "$_mgs_ru" ] && _mgs_drift=1
+    [ -n "$_mgs_chg" ] || [ "$_mgs_drift" = 1 ] || continue
+    # Only bump the timestamp when this mirror was actually re-taken.
+    _mgs_bump=$_mgs_now; [ -n "$_mgs_chg" ] || _mgs_bump=""
     _mgs_tmp="$_mgs_f.mgs.$$"
-    awk -v now="$_mgs_now" -v br="$_mgs_br" -v url="$_mgs_url" '
-      /^last-shadowed: /                    { print "last-shadowed: " now; next }
+    awk -v now="$_mgs_bump" -v br="$_mgs_br" -v url="$_mgs_url" '
+      now != "" && /^last-shadowed: /       { print "last-shadowed: " now; next }
       br  != "" && /^branch: /              { print "branch: " br;        next }
       url != "" && /^remote\.origin\.url: / { print "remote.origin.url: " url; next }
       { print }
@@ -9129,6 +9173,30 @@ ensure_claude_setup() {
     _moved=$((_moved + 1))
   done
   log_medium "moved $_moved item(s)"
+
+  # A .gitignore that travelled along from .claude/ can INVERT its meaning
+  # here. Inside a project, a rule like '*' correctly hides assistant state
+  # from that project's published repo. Inside the central store -- whose
+  # entire purpose is to BE tracked, so the config reaches every machine --
+  # the same line hides it from the repo meant to carry it. It is then never
+  # committed, never pushed, and exists on exactly one machine.
+  #
+  # Seen for real: ,github/my-booking-tool's config carried a .gitignore
+  # containing '*'. The move preserved it, the central store could not track
+  # a single file, and the config sat on one machine while every other
+  # machine showed no trace of it having existed.
+  #
+  # Ask git rather than pattern-match: if the store cannot track what was
+  # just moved, whatever came with it has to go. Recoverable -- _rm_user
+  # puts it in the trash.
+  if [ -f "$_dest/.gitignore" ]; then
+    _cc_probe=$(ls -1 "$_dest" 2>/dev/null | grep -v '^\.gitignore$' | head -n 1)
+    if [ -n "$_cc_probe" ] \
+       && git -C "$_dest" check-ignore -q -- "$_dest/$_cc_probe" 2>/dev/null; then
+      log_warn "claude-check: $_dest/.gitignore came from .claude/ and would keep this config UNTRACKED here — removing it (recoverable: it goes to the trash). Without this the config never leaves this machine."
+      _rm_user "$_dest/.gitignore"
+    fi
+  fi
 
   rmdir "$_cl" || { log_error "rmdir $_cl failed (not empty?)"; return 1; }
 
@@ -11793,7 +11861,7 @@ _unsm_one() {
       || run git update-index --force-remove -- "$_uso_sub" >/dev/null 2>&1 || true
     # If no submodule sections remain, the .gitmodules file itself is cruft.
     if [ -f .gitmodules ] && ! git config -f .gitmodules --get-regexp '^submodule\.' >/dev/null 2>&1; then
-      run git rm -f -q -- .gitmodules >/dev/null 2>&1 || run rm -f -- .gitmodules
+      run git rm -f -q -- .gitmodules >/dev/null 2>&1 || run _rm_user .gitmodules
     else
       run git add -- .gitmodules >/dev/null 2>&1 || true
     fi
@@ -12174,7 +12242,7 @@ _CS_EOF
     if [ "$_cs_removed" -gt 0 ]; then
       if [ -f .gitmodules ] && ! git config -f .gitmodules --get-regexp '^submodule\..*\.path$' >/dev/null 2>&1; then
         run git update-index --force-remove -- .gitmodules 2>/dev/null || true
-        run rm -f -- .gitmodules
+        run _rm_user .gitmodules
       else
         run git add -- .gitmodules 2>/dev/null || true
       fi
