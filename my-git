@@ -9,7 +9,7 @@
 # See:  my-git --help   (or: my-git --help <subcommand>)
 
 US=${0##*/}
-VERSION=1.3
+VERSION=1.4
 ME=$(id -un 2>/dev/null || echo "$USER")
 
 # ─── Dedicated trace channel (fd 3) ──────────────────────────────────────
@@ -317,6 +317,25 @@ AUTOHEAL_UPSTREAM=1
 # read-only and only reports. A field that HAS a value is never touched --
 # that is drift, and which side is right is not my-git's to decide.
 AUTOHEAL_SHADOW_MARKER=1
+
+# ─── What 'mc go' does with a NEW nested repo ────────────────────────────
+# A nested git repo whose relationship to its parent is NOT recorded (not a
+# registered submodule, not shadowed, not sidecar/merged/zipped, no
+# my-git.ignore marker) is never swept into a commit: 'git add -A' would
+# record it as a GITLINK pinning a commit nobody can fetch. What mc does
+# with it instead:
+#   warn    print the warning, leave it untracked, classify only with 'mc -i'
+#   shadow  mirror its files into the parent, keep its .git live
+#   ignore  run 'my-git ignore' on it, so it is never carried
+# 'warn' is exactly the behaviour of a my-git that has never heard of this
+# knob, so upgrading changes nothing until someone opts in.
+# Under '-i', 'warn' ASKS per repo (shadow / submodule / ignore / leave)
+# instead of only warning, and an auto value confirms each repo first.
+# Not values, deliberately: 'flatten' DELETES the child's .git -- far too
+# destructive as a side effect of mc -- and 'sm' needs a URL, which a repo
+# with no origin has nobody to ask for in a non-interactive run (it IS in
+# the '-i' menu, where a human exists).
+MC_NEW_NESTED_REPO=warn        # warn | shadow | ignore
 
 
 # ─── Running git as the repo owner ───────────────────────────────────────
@@ -3273,19 +3292,191 @@ $_mnu_porc
 _MNU_EOF
 }
 
-# _mc_report_new_nested <repo> <newline-separated paths>
-#   One warning + one pointer per undecided repo. Counted for the summary.
-_mc_report_new_nested() {
+# _mc_warn_new_nested <repo> <relpath>
+#   One warning + one pointer for a repo nobody has decided about. Counted
+#   for the summary.
+_mc_warn_new_nested() {
+  log_warn "$1: '$2' is a NEW nested repo — left untracked, NOT swept into this commit (as a gitlink it would pin a commit nobody can fetch)"
+  printf '    > decide once:  %s shadow|sm|flatten go %s/%s   (or %s ignore %s/%s)\n' \
+    "$US" "$1" "$2" "$US" "$1" "$2"
+  MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1))
+}
+
+# _mc_new_nested_policy
+#   Normalize MC_NEW_NESTED_REPO into MC_NEW_NESTED_POLICY, once per run. An
+#   unknown word is a typo in the config, not a new mode: say so and fall
+#   back to 'warn', the one value that writes nothing.
+_mc_new_nested_policy() {
+  case "${MC_NEW_NESTED_REPO-warn}" in
+    ''|warn) MC_NEW_NESTED_POLICY=warn ;;
+    shadow)  MC_NEW_NESTED_POLICY=shadow ;;
+    ignore)  MC_NEW_NESTED_POLICY=ignore ;;
+    *)
+      log_warn "MC_NEW_NESTED_REPO='$MC_NEW_NESTED_REPO' is not warn|shadow|ignore — using 'warn' (nothing is classified automatically)"
+      MC_NEW_NESTED_POLICY=warn ;;
+  esac
+}
+
+# _mc_classify_shadow <repo> <relpath>
+#   Shadow <relpath> into <repo>: its .git stays LIVE, its files become the
+#   parent's ordinary content. Staged, not committed -- the commit this run
+#   is already about to make carries them, which is exactly why the
+#   classification has to happen BEFORE the add.
+#   The path STAYS excluded from 'git add -A': shadow named every file it
+#   staged, while an 'add -A' that reached the directory would see the live
+#   .git and replace that content with the 160000 pointer this whole gate
+#   exists to prevent.
+_mc_classify_shadow() {
+  _mcs_r=$1; _mcs_p=$2
+  if ! ( cd "$_mcs_r" 2>/dev/null && _shadow_one "$_mcs_p" ); then
+    log_error "$_mcs_r: '$_mcs_p' — shadow FAILED; left untracked"
+    return 1
+  fi
+  # Record the FILES shadow staged, not the directory: mc classifies dirt
+  # path by path, and a directory name matches none of those paths.
+  _mcs_staged=$(run_as_owner_capture "$_mcs_r" git diff --cached --name-only -- "$_mcs_p" 2>/dev/null)
+  while IFS= read -r _mcs_f; do
+    [ -n "$_mcs_f" ] && _mc_record_change "$_mcs_r/$_mcs_f"
+  done <<_MCS_EOF
+$_mcs_staged
+_MCS_EOF
+  log_ok "$_mcs_r: '$_mcs_p' — NEW nested repo SHADOWED (its .git stays live; its files are now this repo's content)"
+  printf '    > undo:  %s unshadow go %s/%s\n' "$US" "$_mcs_r" "$_mcs_p"
+  return 0
+}
+
+# _mc_classify_ignore <repo> <relpath>
+#   Write the generic ignore marker into the nested repo's OWN gitdir. No
+#   repo is committed to: the marker is a file nothing tracks.
+_mc_classify_ignore() {
+  _mci_r=$1; _mci_p=$2
+  if ! _sm_mark_ignored "$_mci_r/$_mci_p/.git" "$_mci_r/$_mci_p" >/dev/null; then
+    log_error "$_mci_r: '$_mci_p' — could not write the ignore marker; left untracked"
+    return 1
+  fi
+  log_ok "$_mci_r: '$_mci_p' — NEW nested repo marked IGNORED (my-git leaves it alone; it is never carried)"
+  printf '    > undo:  %s unignore go %s/%s\n' "$US" "$_mci_r" "$_mci_p"
+  return 0
+}
+
+# _mc_classify_sm <repo> <relpath>
+#   Register the nested repo as a real submodule. Offered from the '-i' menu
+#   ONLY, never as a config value: it needs a URL, and the existing sm path
+#   is the thing that knows how to ask for one. Returns 77 if sm aborted.
+_mc_classify_sm() {
+  _mcm_r=$1; _mcm_p=$2
+  ( cd "$_mcm_r" 2>/dev/null && cmd_submodules go "$_mcm_p" )
+  _mcm_rc=$?
+  [ "$_mcm_rc" = 77 ] && return 77
+  if [ "$_mcm_rc" != 0 ]; then
+    log_error "$_mcm_r: '$_mcm_p' — sm FAILED; left untracked"
+    return 1
+  fi
+  log_ok "$_mcm_r: '$_mcm_p' — NEW nested repo REGISTERED as a submodule"
+  printf '    > undo:  %s unsm go %s/%s\n' "$US" "$_mcm_r" "$_mcm_p"
+  return 0
+}
+
+# _mc_ask_new_nested <repo> <relpath>
+#   The '-i' menu for MC_NEW_NESTED_REPO=warn: nothing is scheduled to
+#   happen, so the useful prompt is a CHOICE (the way 'flatten -i' offers
+#   one), not a confirmation. Echoes one of: shadow | sm | ignore | leave |
+#   abort. Prompts go to the tty, so the choice alone reaches the caller.
+_mc_ask_new_nested() {
+  _man_r=$1; _man_p=$2
+  while :; do
+    printf ' %s>>> %s: "%s" is a NEW nested repo — nothing records what it is to this repo%s\n' \
+      "$C_BOLD$C_CYAN" "$_man_r" "$_man_p" "$C_RESET" >/dev/tty
+    printf '     %s[s]hadow%s     mirror its files here; its own .git stays live\n' "$C_GREEN" "$C_RESET" >/dev/tty
+    printf '     %ssub[m]odule%s  register it with a URL (asks for one if it has no origin)\n' "$C_GREEN" "$C_RESET" >/dev/tty
+    printf '     %s[i]gnore%s     mark it, so my-git leaves it alone for good\n' "$C_GREEN" "$C_RESET" >/dev/tty
+    printf '     %s[L]eave%s      untracked, decide later    %s[a]bort%s  stop mc entirely\n' \
+      "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET" >/dev/tty
+    _man_a=$(_sm_ask "     choice? [s/m/i/L/a]: ")
+    case "$_man_a" in
+      s|S)    printf 'shadow\n'; return 0 ;;
+      m|M)    printf 'sm\n';     return 0 ;;
+      i|I)    printf 'ignore\n'; return 0 ;;
+      ''|l|L) printf 'leave\n';  return 0 ;;
+      a|A)    printf 'abort\n';  return 0 ;;
+      *) printf '     %s? please answer  s=shadow  m=submodule  i=ignore  L=leave  a=abort%s\n' \
+           "$C_YELLOW" "$C_RESET" >/dev/tty ;;
+    esac
+  done
+}
+
+# _mc_handle_new_nested <repo> <newline-separated paths>
+#   The ONE place mc decides what becomes of a nested repo it has no
+#   relationship recorded for. MC_NEW_NESTED_REPO names the verb (or none);
+#   '-i' asks either way. Returns 77 when the user aborts.
+_mc_handle_new_nested() {
   [ -n "$2" ] || return 0
-  while IFS= read -r _mrn_p; do
-    [ -n "$_mrn_p" ] || continue
-    log_warn "$1: '$_mrn_p' is a NEW nested repo — left untracked, NOT swept into this commit (as a gitlink it would pin a commit nobody can fetch)"
-    printf '    > decide once:  %s shadow|sm|flatten go %s/%s   (or %s ignore %s/%s)\n' \
-      "$US" "$1" "$_mrn_p" "$US" "$1" "$_mrn_p"
-    MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1))
-  done <<_MRN_EOF
+  _mhn_r=$1
+  _mhn_pol=${MC_NEW_NESTED_POLICY:-warn}
+  while IFS= read -r _mhn_p; do
+    [ -n "$_mhn_p" ] || continue
+
+    # Analyze writes NOTHING, ever -- it only says what 'go' would do, so
+    # 'mc' keeps predicting 'mc go' exactly.
+    if [ "$DRY_RUN" = 1 ]; then
+      if [ "$_mhn_pol" = warn ]; then
+        _mc_warn_new_nested "$_mhn_r" "$_mhn_p"
+      else
+        log_major "$_mhn_r: '$_mhn_p' is a NEW nested repo — 'mc go' would $_mhn_pol it (MC_NEW_NESTED_REPO=$_mhn_pol)"
+        MC_N_WOULD_CLASSIFY=$((${MC_N_WOULD_CLASSIFY:-0} + 1))
+      fi
+      continue
+    fi
+
+    _mhn_do=$_mhn_pol
+    if [ "$INTERACTIVE" = 1 ]; then
+      if [ "$_mhn_pol" = warn ]; then
+        _mhn_do=$(_mc_ask_new_nested "$_mhn_r" "$_mhn_p")
+      else
+        # '-i' means "confirm everything with me" everywhere else in my-git,
+        # so it keeps meaning that here. [S]kip leaves this one untracked,
+        # i.e. falls back to 'warn' for it.
+        _mhn_a=$(_sm_ask "    $_mhn_r: '$_mhn_p' is a NEW nested repo — $_mhn_pol it? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+        case "$_mhn_a" in
+          a|A)     _mhn_do=abort ;;
+          s|S|n|N) _mhn_do=leave ;;
+        esac
+      fi
+    fi
+
+    case "$_mhn_do" in
+      abort)
+        log_major "$_mhn_r: [ABORT requested]"
+        return 77 ;;
+      warn)
+        _mc_warn_new_nested "$_mhn_r" "$_mhn_p" ;;
+      leave)
+        log_major "$_mhn_r: '$_mhn_p' left untracked — decide later:  $US shadow|sm|flatten|ignore go $_mhn_r/$_mhn_p"
+        MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1)) ;;
+      shadow)
+        if _mc_classify_shadow "$_mhn_r" "$_mhn_p"; then
+          MC_N_CLASSIFIED=$((${MC_N_CLASSIFIED:-0} + 1))
+        else
+          MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1))
+        fi ;;
+      ignore)
+        if _mc_classify_ignore "$_mhn_r" "$_mhn_p"; then
+          MC_N_CLASSIFIED=$((${MC_N_CLASSIFIED:-0} + 1))
+        else
+          MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1))
+        fi ;;
+      sm)
+        _mc_classify_sm "$_mhn_r" "$_mhn_p"
+        case $? in
+          0)  MC_N_CLASSIFIED=$((${MC_N_CLASSIFIED:-0} + 1)) ;;
+          77) return 77 ;;
+          *)  MC_N_UNCLASSIFIED=$((${MC_N_UNCLASSIFIED:-0} + 1)) ;;
+        esac ;;
+    esac
+  done <<_MHN_EOF
 $2
-_MRN_EOF
+_MHN_EOF
+  return 0
 }
 
 # commit_one <repo>  — if dirty, add -A + commit + push; if ahead, push.
@@ -3473,7 +3664,9 @@ commit_one() {
     done <<_MC_NEST_EOF
 $_mc_nested
 _MC_NEST_EOF
-    _mc_report_new_nested "$_r" "$_mc_newnested"
+    _mc_hnn_rc=0
+    _mc_handle_new_nested "$_r" "$_mc_newnested" || _mc_hnn_rc=$?
+    [ "$_mc_hnn_rc" = 77 ] && return 77
   fi
 
   # BEHIND its remote, checked BEFORE the analyze branch: analyze is what you
@@ -3711,6 +3904,12 @@ cmd_masscommits() {
   MC_N_WOULD_PUSH=0     # analyze: would push
   MC_N_WOULD_COMMIT=0   # analyze: would mass-commit
   MC_N_UNCLASSIFIED=0   # new nested repos left untracked pending a decision
+  MC_N_CLASSIFIED=0     # new nested repos classified for you (MC_NEW_NESTED_REPO)
+  MC_N_WOULD_CLASSIFY=0 # analyze: would classify
+
+  # Which verb a new nested repo gets, resolved once so a typo in the config
+  # is reported once and not per repo.
+  _mc_new_nested_policy
 
   # mc is the one command that writes to MANY repos: each repo commits to
   # ITS OWN .git (and pushes to ITS OWN remote). Name the roots and the
@@ -3793,6 +3992,7 @@ cmd_masscommits() {
     [ "$MC_N_COMMITTED" -gt 0 ]      && _parts="$_parts committed=$MC_N_COMMITTED"
     [ "$MC_N_SKIPPED" -gt 0 ]        && _parts="$_parts skipped=$MC_N_SKIPPED"
     [ "$MC_N_IGNORED" -gt 0 ]        && _parts="$_parts ignored=$MC_N_IGNORED"
+    [ "$MC_N_CLASSIFIED" -gt 0 ]     && _parts="$_parts classified(new)=$MC_N_CLASSIFIED"
     [ "$MC_N_UNCLASSIFIED" -gt 0 ]   && _parts="$_parts $(c_red "unclassified(new)=$MC_N_UNCLASSIFIED")"
     [ "$MC_N_ERROR" -gt 0 ]          && _parts="$_parts $(c_red "errors=$MC_N_ERROR")"
     [ -z "$_parts" ] && _parts=" (nothing to do)"
@@ -3823,6 +4023,7 @@ cmd_masscommits() {
     [ "$MC_N_WOULD_PUSH" -gt 0 ] && _wparts="$_wparts would-push=$MC_N_WOULD_PUSH"
     [ "$MC_N_WOULD_COMMIT" -gt 0 ] && _wparts="$_wparts would-commit=$MC_N_WOULD_COMMIT"
     [ "$MC_N_IGNORED" -gt 0 ]    && _wparts="$_wparts ignored=$MC_N_IGNORED"
+    [ "$MC_N_WOULD_CLASSIFY" -gt 0 ] && _wparts="$_wparts would-classify(new)=$MC_N_WOULD_CLASSIFY"
     [ "$MC_N_UNCLASSIFIED" -gt 0 ] && _wparts="$_wparts $(c_red "unclassified(new)=$MC_N_UNCLASSIFIED")"
     [ -z "$_wparts" ] && _wparts=" (nothing to do)"
     printf '  %s>> total=%s:%s%s\n' "$C_BLUE" "$MC_N_TOTAL" "$_wparts" "$C_RESET"
@@ -10379,6 +10580,25 @@ NEW nested repos are NEVER swept in:
   submodule with a URL, 'flatten' folds it into this repo, 'ignore' leaves
   it out for good.
 
+  Deciding it FOR you — MC_NEW_NESTED_REPO (config):
+      warn    (default) exactly the above: warn, leave it untracked
+      shadow  'mc go' shadows it, in time for THIS commit to carry its files
+      ignore  'mc go' marks it ignored, so it is never carried
+  Whatever the value, every classified repo prints what was done and how to
+  undo it, and the summary counts them as 'classified(new)=N'. Analyze mode
+  writes nothing: it reports 'would-classify(new)=N' instead.
+  'flatten' and 'sm' are deliberately NOT values — flatten DELETES the
+  child's .git, and sm needs a URL nobody can be asked for in a
+  non-interactive run.
+
+  Under -i:
+      warn            you get a CHOICE per repo:
+                        [s]hadow / sub[m]odule / [i]gnore / [L]eave / [a]bort
+                      sub[m]odule delegates to 'sm', which prompts for a URL
+                      when the repo has no origin.
+      shadow/ignore   each action is confirmed first: [Y]es / [S]kip /
+                      [A]bort. [S]kip leaves that one repo untracked.
+
 Auto-commit of my-git-caused changes (phase 1):
   my-git must never ASK the user to confirm a change my-git itself made.
   Two categories qualify as my-git-caused:
@@ -11378,6 +11598,17 @@ values come from the user's config):
                               merge (default) | rebase | ff-only.
                               Empty / no / off disables the healing.
                               Never overrides a strategy already set.
+  MC_NEW_NESTED_REPO          What 'mc go' does with a NESTED REPO whose
+                              relationship to its parent is not recorded:
+                                warn   (default) warn, leave it untracked --
+                                       exactly the behaviour without this knob
+                                shadow mirror its files into the parent, its
+                                       own .git stays live
+                                ignore write the my-git.ignore marker, so it
+                                       is never carried
+                              Never 'flatten' (it DELETES the child's .git)
+                              and never 'sm' (it needs a URL); sm IS offered
+                              in the '-i' menu, where a human can be asked.
   COMMIT_MSG_LAST_N           # of recent log entries in auto-commit body.
   COMMIT_MSG_DIFF_MAX_FILES   Switch to file-list block above this count.
   PRIV_POLICY_USER_TO_ROOT    non-root caller, root-owned repo (default warn)
@@ -16558,6 +16789,177 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_mc_shadows_a_new_nested_repo_when_told_to() {
+    # MC_NEW_NESTED_REPO=shadow: the answer in this tree is almost always
+    # 'shadow', so the gate's warning is friction rather than a decision.
+    # The repo must land as CONTENT in the very commit mc was already about
+    # to make -- never as a 160000 pointer, which is the whole reason the
+    # gate exists.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'MC_NEW_NESTED_REPO=shadow\n' >> "$_rt_conf_path"
+    cd container || return 1
+    printf 'baseline\n' > kept.txt
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+
+    mkdir -p newproj
+    ( cd newproj && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'v1\n' > tool.sh && git add -A && git commit -qm one ) >/dev/null 2>&1
+    printf 'edited\n' >> kept.txt
+
+    _rt_ok "mc go" _rt_my_git mc go || return 1
+    _rt_contains "says it shadowed the new repo" "$_rt_out" "SHADOWED" || return 1
+    _rt_contains "says how to undo it" "$_rt_out" "unshadow go" || return 1
+    _rt_contains "counts it in the summary" "$_rt_out" "classified(new)=1" || return 1
+    _rt_not_contains "no nag about a repo it just decided" "$_rt_err" "NEW nested repo —" || return 1
+
+    if git ls-files -s -- newproj 2>/dev/null | awk '{print $1}' | grep -qx 160000; then
+      _rt_fail "auto-shadow recorded the new repo as a gitlink"; return 1
+    fi
+    _rt_ok "no gitlink was created" true || return 1
+
+    # In THIS commit, as ordinary content -- not merely staged for the next run.
+    git ls-tree -r HEAD --name-only | grep -qx newproj/tool.sh \
+      || { _rt_fail "the shadowed files did not land in the commit mc made"; return 1; }
+    _rt_ok "its files are in the same commit, as content" true || return 1
+    git ls-tree -r HEAD --name-only | grep -qx newproj/.git.shadow.status \
+      || { _rt_fail "the shadow marker was not committed"; return 1; }
+    _rt_ok "the shadow marker is committed too" true || return 1
+
+    # Its own history is untouched: shadow keeps the .git live.
+    _rt_isdir "the nested repo keeps its own live .git" newproj/.git || return 1
+    [ -z "$(git status --porcelain)" ] \
+      || { _rt_fail "the container was left dirty: $(git status --porcelain | tr '\n' ' ')"; return 1; }
+    _rt_ok "nothing left dirty" true || return 1
+    return 0
+  }
+
+  test_mc_marks_a_new_nested_repo_ignored_when_told_to() {
+    # MC_NEW_NESTED_REPO=ignore means "run the ignore COMMAND on it" -- the
+    # marker, one repo, reversible with 'unignore' -- and never "stop warning
+    # about undecided repos in general", which would reinstate the blind spot
+    # the gate was built to close.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'MC_NEW_NESTED_REPO=ignore\n' >> "$_rt_conf_path"
+    cd container || return 1
+    printf 'baseline\n' > kept.txt
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+    mkdir -p vendored
+    ( cd vendored && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'x\n' > f.txt && git add -A && git commit -qm one ) >/dev/null 2>&1
+    printf 'edited\n' >> kept.txt
+
+    _rt_ok "mc go" _rt_my_git mc go || return 1
+    _rt_contains "says it marked the repo ignored" "$_rt_out" "IGNORED" || return 1
+    _rt_contains "says how to undo it" "$_rt_out" "unignore go" || return 1
+    _rt_contains "counts it in the summary" "$_rt_out" "classified(new)=1" || return 1
+    _rt_exists "the marker is in the nested repo's own gitdir" vendored/.git/my-git.ignore || return 1
+
+    if git ls-files -s -- vendored 2>/dev/null | awk '{print $1}' | grep -qx 160000; then
+      _rt_fail "an auto-ignored repo was still recorded as a gitlink"; return 1
+    fi
+    _rt_ok "no gitlink for the ignored repo" true || return 1
+    [ -z "$(git ls-files -- vendored)" ] \
+      || { _rt_fail "mc tracked something under an ignored repo"; return 1; }
+    _rt_ok "nothing under it is carried" true || return 1
+    git diff --quiet HEAD -- kept.txt \
+      || { _rt_fail "mc failed to commit the unrelated dirt"; return 1; }
+    _rt_ok "everything else still committed" true || return 1
+
+    # Decided once: the next run neither warns nor re-decides.
+    printf 'more\n' >> kept.txt
+    _rt_ok "mc go again" _rt_my_git mc go || return 1
+    _rt_not_contains "no warning on the next run" "$_rt_err" "NEW nested repo" || return 1
+    _rt_not_contains "and nothing left to classify" "$_rt_out" "classified(new)=" || return 1
+    return 0
+  }
+
+  test_mc_new_nested_repo_defaults_to_warn() {
+    # The shipped default must stay 'warn': installing a my-git that knows
+    # this knob may not restructure anyone's tree on its first 'mc go'.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    "$_rt_self" --create-config "$PWD/newconf.ini" >/dev/null 2>&1 \
+      || { _rt_fail "--create-config failed"; return 1; }
+    _rt_contains "the shipped default is warn" "$PWD/newconf.ini" "MC_NEW_NESTED_REPO=warn" || return 1
+
+    # And an unreadable value is a typo, not a new mode: report it, then do
+    # the thing that writes nothing.
+    printf 'MC_NEW_NESTED_REPO=flatten\n' >> "$_rt_conf_path"
+    cd container || return 1
+    printf 'baseline\n' > kept.txt
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+    printf 'edited\n' >> kept.txt
+    mkdir -p newproj
+    ( cd newproj && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'v1\n' > tool.sh && git add -A && git commit -qm one ) >/dev/null 2>&1
+    _rt_ok "mc go with a bogus value" _rt_my_git mc go || return 1
+    _rt_contains "names the bad value" "$_rt_err" "MC_NEW_NESTED_REPO='flatten'" || return 1
+    _rt_contains "falls back to warn" "$_rt_err" "NEW nested repo" || return 1
+    _rt_absent "and classified nothing" newproj/.git.shadow.status || return 1
+    return 0
+  }
+
+  test_mc_analyze_classifies_nothing_even_when_told_to_shadow() {
+    # Analyze predicts 'go'; it never performs it. With an auto value set,
+    # that prediction has to name the verb -- and the index must come out
+    # byte-identical.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'MC_NEW_NESTED_REPO=shadow\n' >> "$_rt_conf_path"
+    cd container || return 1
+    printf 'baseline\n' > kept.txt
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+    mkdir -p newproj
+    ( cd newproj && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'v1\n' > tool.sh && git add -A && git commit -qm one ) >/dev/null 2>&1
+
+    _rt_before=$(git ls-files -s)
+    _rt_ok "mc (analyze)" _rt_my_git mc || return 1
+    _rt_contains "says what go would do" "$_rt_out" "would shadow it" || return 1
+    _rt_contains "counts it as would-classify" "$_rt_out" "would-classify(new)=1" || return 1
+    [ "$_rt_before" = "$(git ls-files -s)" ] \
+      || { _rt_fail "analyze changed the index"; return 1; }
+    _rt_ok "the index is untouched" true || return 1
+    _rt_absent "no marker was written" newproj/.git.shadow.status || return 1
+    return 0
+  }
+
+  test_mc_leaves_an_already_classified_nested_repo_alone() {
+    # A repo that already HAS a relationship is not 'new', whatever the knob
+    # says: a shadowed repo must not be re-decided, and an ignored one must
+    # never be shadowed behind the user's back.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'MC_NEW_NESTED_REPO=shadow\n' >> "$_rt_conf_path"
+    cd container || return 1
+    mkdir -p shad kept_out
+    ( cd shad && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'a\n' > a.txt && git add -A && git commit -qm one ) >/dev/null 2>&1
+    ( cd kept_out && git init -q . && git config user.name T && git config user.email t@t \
+        && printf 'b\n' > b.txt && git add -A && git commit -qm one ) >/dev/null 2>&1
+    _rt_ok "shadow go shad" _rt_my_git shadow go shad || return 1
+    _rt_ok "ignore go kept_out" _rt_my_git ignore go kept_out || return 1
+
+    printf 'dirt\n' > kept.txt
+    _rt_ok "mc go" _rt_my_git mc go || return 1
+    _rt_not_contains "nothing was re-classified" "$_rt_out" "classified(new)=" || return 1
+    _rt_absent "the ignored repo was not shadowed" kept_out/.git.shadow.status || return 1
+    _rt_exists "and keeps its marker" kept_out/.git/my-git.ignore || return 1
+    [ -z "$(git ls-files -- kept_out)" ] \
+      || { _rt_fail "the ignored repo was carried anyway"; return 1; }
+    _rt_ok "the ignored repo is still carried by nobody" true || return 1
+    git ls-tree -r HEAD --name-only | grep -qx shad/a.txt \
+      || { _rt_fail "the already-shadowed repo lost its mirror"; return 1; }
+    _rt_ok "the shadowed repo is still mirrored as content" true || return 1
+    return 0
+  }
+
   test_mc_refuses_to_commit_what_the_mirror_delivered() {
     # The two-machine failure, reproduced. Machine A pulls a shadowed repo,
     # advancing its history AND its files, and commits the container's mirror.
@@ -19355,7 +19757,7 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
