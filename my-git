@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.4
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="fa9d910"
+SCRIPT_COMMIT="b278923"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -18407,7 +18407,7 @@ _RT_STALE_CONF_EOF
     ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
       > "$_rt_out" 2> "$_rt_err" \
       || { _rt_fail "second run failed: $(tail -c 200 "$_rt_err")"; return 1; }
-    _rt_contains "second run is a no-op" "$_rt_out" "already carries its release stamp" || return 1
+    _rt_contains "second run is a no-op" "$_rt_out" "unchanged since it was stamped" || return 1
     return 0
   }
 
