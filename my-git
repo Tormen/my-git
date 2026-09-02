@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.4
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT=""
+SCRIPT_COMMIT="fa9d910"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -18168,8 +18168,10 @@ _RT_STALE_CONF_EOF
     _rt_v1=$(sed -n 's/.*build \([0-9a-f]*\).*/\1/p' "$_rt_out" | head -n 1)
     [ -n "$_rt_v1" ] || { _rt_fail "no build id in: $(cat "$_rt_out")"; return 1; }
 
-    cp "$_rt_self" ./mg2 2>/dev/null && chmod +x ./mg2 2>/dev/null \
-      || { _rt_fail "setup: could not copy the script"; return 1; }
+    if ! cp "$_rt_self" ./mg2 2>/dev/null || ! chmod +x ./mg2 2>/dev/null; then
+      _rt_fail "setup: could not copy the script"
+      return 1
+    fi
     printf '\n# one byte of difference\n' >> ./mg2
     MY_GIT_SELFTEST=1 ./mg2 --config "$_rt_conf_path" --version > "$_rt_out" 2>"$_rt_err" \
       || { _rt_fail "the copy could not run --version: $(tail -c 200 "$_rt_err")"; return 1; }
@@ -18185,8 +18187,10 @@ _RT_STALE_CONF_EOF
     # release commit without being asked for.
     _rt_repo proj
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    cp "$_rt_self" proj/mg 2>/dev/null && chmod +x proj/mg 2>/dev/null \
-      || { _rt_fail "setup: could not copy the script"; return 1; }
+    if ! cp "$_rt_self" proj/mg 2>/dev/null || ! chmod +x proj/mg 2>/dev/null; then
+      _rt_fail "setup: could not copy the script"
+      return 1
+    fi
     printf 'someone elses work\n' > proj/other.txt
     git -C proj config user.name T 2>/dev/null
     git -C proj config user.email t@t 2>/dev/null

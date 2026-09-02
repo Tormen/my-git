@@ -148,6 +148,29 @@ which is both `/bin/bash` and `/bin/sh` on every macOS system; see
 [Extending](#extending) for the specific parser gotcha that requires
 this).
 
+## Version and builds
+
+`--version` identifies the exact bytes you are running, not just a number:
+
+```
+my-git 1.4 (commit 1a2b3c4, build 9f86d081884c)
+my-git 1.4 (build 9f86d081884c, unstamped)
+```
+
+The **build id** is the first 12 hex of the file's own SHA-256, so two copies
+that differ by one byte report different versions — comparing installs is
+`--version` on each and a diff. The **commit** is a literal in the file,
+written by `my-git stamp-version go`, which rewrites that line and amends the
+release commit; a deployed copy therefore needs neither git nor a repository
+to say where it came from. Both are printed so a stale stamp shows up as a
+disagreement.
+
+`stamp-version` refuses when any other file is dirty (the amend would fold
+that work in), is a no-op once the stamp on disk is the one in HEAD, and
+renames the rewritten file into place rather than editing it — it is the file
+the running process is reading. The stamp lags HEAD by exactly one amend,
+because a commit cannot contain its own sha.
+
 ## Configuration
 
 Search order (first existing wins):
