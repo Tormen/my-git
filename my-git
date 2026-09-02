@@ -298,11 +298,12 @@ GIT_REPOS="/LINKS/global /LINKS/local /learn /LINKS/appData /LINKS/archive"
 #
 # Hide a nested SHADOWED repo from the repo that physically contains it.
 AUTOHEAL_SHADOW_EXCLUDES=1
-# Give a repo a pull strategy when it has none, so 'pull' on a diverged
-# branch does not die with "Need to specify how to reconcile divergent
-# branches". Only ever set when UNSET -- an existing choice is yours.
-# The value IS the strategy; empty/no/off disables the healing entirely.
-AUTOHEAL_PULL_STRATEGY=merge   # merge | rebase | ff-only | "" / no / off
+# Record PULL_STRATEGY in the repo owner's GLOBAL git config, so a 'git pull'
+# they run by hand in any of these repos reconciles the way my-git does --
+# and does not die with "Need to specify how to reconcile divergent
+# branches". Written only when that config states NO preference; a
+# preference that CONFLICTS is warned about, never overwritten.
+AUTOHEAL_PULL_CONFIG=1
 # Give a branch its upstream when origin ALREADY has a branch of the same
 # name -- purely local config recording something already true. my-git never
 # creates a branch on a remote to satisfy this: that is publishing, and on
@@ -348,6 +349,18 @@ MC_NEW_NESTED_REPO=warn        # warn | shadow | ignore
 # session (ssh-only host, logged out, cron).
 #   1 = use launchctl asuser when possible (default)   0 = always plain su
 XUSER_LAUNCHCTL=1
+
+# ─── How 'pull' reconciles with origin ───────────────────────────────────
+# What my-git runs once a fetch shows the branch is behind, or has diverged
+# (both ahead AND behind).
+#   merge   fast-forward when that is possible, otherwise a real merge
+#           commit. A merge that CONFLICTS is left in the worktree for you
+#           to resolve and commit -- my-git names the paths and moves on to
+#           the rest of the tree. (default)
+#   rebase  replay your local commits on top of origin's.
+# There is deliberately no fast-forward-only value: refusing to reconcile a
+# diverged branch is not a strategy, it is a tree that silently never pulls.
+PULL_STRATEGY=merge            # merge | rebase
 
 # ─── Which remotes 'push' will publish to ────────────────────────────────
 # A tree can hold repos you cloned to READ (upstreams like winetricks or
@@ -781,6 +794,16 @@ _xuser_exec() {
   _tgt=$1; _repo=$2; shift 2
   _cmdstr=$(shell_escape "$@")
   _repo_q=$(shell_escape "$_repo")
+  # Every branch below runs from '/' (a subshell, so my-git's own cwd is
+  # untouched). su/sudo hand the target user a shell that starts in the
+  # CALLER's cwd, and the caller here is often root sitting in /var/root
+  # (mode 0700) -- which the target user cannot stat. The shell then prints
+  #   shell-init: error retrieving current directory: getcwd: ...
+  #   chdir: error retrieving current directory: getcwd: ...
+  # on stderr BEFORE it ever reads '-c', so those two lines prefixed the
+  # stderr of every git command my-git ran cross-user, and got reprinted
+  # under each repo as if git had said them. '/' is stat-able by everyone
+  # and the '-c' string cd's to the repo anyway.
   if [ "$ME" = "root" ]; then
     _xu_uid=$(_xu_session_uid "$_tgt")
     if [ -n "$_xu_uid" ]; then
@@ -790,14 +813,14 @@ _xuser_exec() {
       # with "Author identity unknown". 'su' set HOME for free, which is why
       # this only appeared once the launchctl path replaced it.
       log_dbg_med "launchctl asuser $_xu_uid sudo -H -u $_tgt sh -c \"cd $_repo && $_cmdstr\"  # joins $_tgt's session (keychain) with $_tgt's HOME (gitconfig)"
-      run launchctl asuser "$_xu_uid" sudo -H -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr"
+      ( cd / && run launchctl asuser "$_xu_uid" sudo -H -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr" )
       return $?
     fi
     log_dbg_med "su $_tgt -c \"cd $_repo && $_cmdstr\"  # no console session for $_tgt: no keychain"
-    run su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+    ( cd / && run su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
   else
     log_dbg_med "sudo su $_tgt -c \"cd $_repo && $_cmdstr\""
-    run sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr"
+    ( cd / && run sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
   fi
 }
 
@@ -1891,13 +1914,37 @@ resolve_scope() {
   fi
   # Fallback to GIT_REPOS list — only when genuinely not inside any repo.
   log_dbg_med "scope: config fallback \$GIT_REPOS"
+  _rs_list=""
   for _r in $GIT_REPOS; do
     [ -d "$_r" ] || { log_warn "skipping missing repo from GIT_REPOS: $_r"; continue; }
     is_git_repo "$_r" || { log_warn "skipping non-git path from GIT_REPOS: $_r"; continue; }
     # Logical path: preserve the form written in GIT_REPOS (e.g. /LINKS/src).
     _abs=$(cd "$_r" 2>/dev/null && printf '%s' "$PWD")
-    printf '%s\n' "$_abs"
+    _rs_list="$_rs_list$_abs
+"
   done
+  # Collapse to top-most, the same rule walk_tree_lines uses inside a tree.
+  # Every root here is walked RECURSIVELY, so a root that sits under another
+  # root is visited twice: once by its own entry and once by its parent's
+  # walk. GIT_REPOS naming both /LINKS/global and /LINKS/global/src meant the
+  # whole src subtree was fetched, merged and counted twice, and every error
+  # in it was printed twice -- a config that reads perfectly reasonably, and
+  # is one my-git should absorb rather than blame. Order is preserved (no
+  # sort): each entry is tested against all the OTHERS, not just the ones
+  # kept so far, and an exact duplicate keeps its first occurrence.
+  printf '%s' "$_rs_list" | awk '
+    { a[++n] = $0 }
+    END {
+      for (i = 1; i <= n; i++) {
+        drop = 0
+        for (j = 1; j <= n; j++) {
+          if (i == j) continue
+          if (a[j] == a[i]) { if (j < i) { drop = 1; break } ; continue }
+          if (index(a[i], a[j] "/") == 1) { drop = 1; break }
+        }
+        if (!drop) print a[i]
+      }
+    }'
 }
 
 # ─── Status subcommand ──────────────────────────────────────────────────
@@ -2781,13 +2828,7 @@ cmd_status() {
               "CLEAN :))"*)         echo C ;;
               "CLEAN, ahead"*)      echo A ;;
               "CLEAN, behind"*)     echo B ;;
-              "DIVERGED"*)          echo V
-                                  # A diverged branch is the ONLY state where a missing
-                                  # pull strategy actually bites ("Need to specify how to
-                                  # reconcile divergent branches"). Healing every repo cost
-                                  # 0.3s per st to fix something almost none of them had;
-                                  # healing here is free and lands exactly where it matters.
-                                  autoheal_pull_strategy "$_node" >/dev/null 2>&1 || true ;;
+              "DIVERGED"*)          echo V ;;
               "OLD CHECKOUT"*)      echo O ;;
               "DIRTY"*)             echo D ;;
               "CLEAN (no upstream"*) echo C ;;
@@ -2977,13 +3018,7 @@ cmd_status() {
           "CLEAN :))"*)         echo C ;;
           "CLEAN, ahead"*)      echo A ;;
           "CLEAN, behind"*)     echo B ;;
-          "DIVERGED"*)          echo V
-                              # A diverged branch is the ONLY state where a missing
-                              # pull strategy actually bites ("Need to specify how to
-                              # reconcile divergent branches"). Healing every repo cost
-                              # 0.3s per st to fix something almost none of them had;
-                              # healing here is free and lands exactly where it matters.
-                              autoheal_pull_strategy "$_abs" >/dev/null 2>&1 || true ;;
+          "DIVERGED"*)          echo V ;;
           "OLD CHECKOUT"*)      echo O ;;
           "DIRTY"*)             echo D ;;
           "CLEAN (no upstream"*) echo C ;;
@@ -4463,16 +4498,48 @@ cmd_push() {
   return $_rc_total
 }
 
+# _pl_name_list <file>
+#   Comma-joined path list for a one-line report: the first three, then
+#   "(+N more)". Under -V the whole list -- the count is what you act on,
+#   the names are what you act with, and sixty of them is not a report.
+_pl_name_list() {
+  awk -v vrb="${VRB:-0}" '
+    { n++; a[n] = $0 }
+    END {
+      lim = (vrb == 1 ? n : (n < 3 ? n : 3))
+      out = ""
+      for (i = 1; i <= lim; i++) out = out (i > 1 ? ", " : "") a[i]
+      if (lim < n) out = out sprintf(" … (+%d more)", n - lim)
+      print out
+    }' "$1"
+}
+
+# _pl_blocked_paths <git-stderr-file> local|untracked
+#   The paths git named as standing in the way of a merge it refused to
+#   start. git lists them tab-indented under two distinct headings, and the
+#   headings matter: "local changes" are commitable, untracked files are
+#   not -- they have to move.
+_pl_blocked_paths() {
+  awk -v kind="$2" '
+    /would be overwritten by merge:$/ {
+      m = (kind == "local")     && ($0 ~ /local changes/) ? 1 : \
+          (kind == "untracked") && ($0 ~ /untracked/)     ? 1 : 0
+      next
+    }
+    /^[^\t]/ { m = 0 }
+    m && /^\t/ { sub(/^\t/, ""); print }
+  ' "$1"
+}
+
 pull_one() {
   _r=$1
   PL_N_TOTAL=$((PL_N_TOTAL + 1))
 
-  # Before pulling, make sure this repo CAN pull: since git 2.27 a diverged
-  # branch aborts with "Need to specify how to reconcile divergent
-  # branches" unless a strategy is configured. Only fills the gap when
-  # there is one -- an existing preference is an answer, and is left alone.
-  _pl_healed=$(autoheal_pull_strategy "$_r")
-  [ -n "$_pl_healed" ] && log_medium "$_r: set pull strategy to ${AUTOHEAL_PULL_STRATEGY-merge} (none was configured)"
+  # Record the strategy in the owner's global git config, so a 'git pull'
+  # they run by hand here reconciles the way my-git just did. Once per
+  # owner per run; never overwrites a stated preference.
+  _pl_healed=$(autoheal_pull_config "$_r")
+  [ -n "$_pl_healed" ] && log_medium "$_r: recorded pull.rebase in the owner's ~/.gitconfig (PULL_STRATEGY=${PL_STRATEGY:-merge}; none was stated)"
 
   # Honor the ignore marker.
   _gd_for_marker=$(_sm_resolve_gitdir "$_r/.git" "$_r" 2>/dev/null)
@@ -4544,24 +4611,26 @@ pull_one() {
     esac
     [ -n "$_ahead" ] || _ahead=0
     [ -n "$_behind" ] || _behind=0
-    # A dirty worktree is REPORTED, never a reason to skip. The pull below
-    # is 'git merge --ff-only', which cannot lose uncommitted or untracked
-    # work: it refuses, and changes nothing, when a path it must write is
-    # locally modified or shadowed by an untracked file. Only the paths the
-    # incoming diff touches matter, and git is the one that knows them.
-    # A blanket "is anything dirty?" gate answers a different question, and
-    # in a container that mirrors its children -- where untracked files are
-    # the resting state -- it meant the container never pulled at all, and
-    # reported itself clean while doing it. /LINKS/src sat 11 commits behind
-    # on one machine that way.
+    # A dirty worktree is REPORTED, never a reason to skip. The merge below
+    # cannot lose uncommitted or untracked work: git refuses, and changes
+    # nothing, when a path it must write is locally modified or shadowed by
+    # an untracked file. Only the paths the incoming diff touches matter,
+    # and git is the one that knows them. A blanket "is anything dirty?"
+    # gate answers a different question, and in a container that mirrors its
+    # children -- where untracked files are the resting state -- it meant
+    # the container never pulled at all, and reported itself clean while
+    # doing it. /LINKS/src sat 11 commits behind on one machine that way.
     _dirt=""
     [ -n "$_porc" ] && _dirt=", dirty"
     if [ "${_behind:-0}" -gt 0 ] && [ "${_ahead:-0}" -gt 0 ]; then
-      _desc="DIVERGED (ahead=$_ahead behind=$_behind)"
-      _action="skip (manual merge needed)"
+      # DIVERGED is not a skip. Reconciling it is exactly what a strategy
+      # is FOR -- refusing left whole trees permanently behind, which is
+      # the failure this replaced.
+      _desc="DIVERGED (ahead=$_ahead behind=$_behind)$_dirt"
+      _action="${PL_STRATEGY:-merge}"
     elif [ "${_behind:-0}" -gt 0 ]; then
       _desc="behind=$_behind$_dirt"
-      _action="ff-merge"
+      _action="${PL_STRATEGY:-merge}"
     elif [ "${_ahead:-0}" -gt 0 ]; then
       _desc="ahead=$_ahead$_dirt"
       _action="noop (nothing to pull)"
@@ -4582,8 +4651,8 @@ pull_one() {
         PL_N_CLEAN=$((PL_N_CLEAN + 1)) ;;
       skip*)
         PL_N_SKIPPED=$((PL_N_SKIPPED + 1)) ;;
-      ff-merge)
-        PL_N_WOULD_FF=$((PL_N_WOULD_FF + 1)) ;;
+      merge|rebase)
+        PL_N_WOULD_MERGE=$((PL_N_WOULD_MERGE + 1)) ;;
     esac
     return 0
   fi
@@ -4608,34 +4677,98 @@ pull_one() {
     PL_N_CLEAN=$((PL_N_CLEAN + 1))
     return 0
   fi
+  _pl_strat=${PL_STRATEGY:-merge}
+  # ahead=0 is exactly the condition for a fast-forward, and we already
+  # asked git for it -- no second round trip to find out what kind of
+  # merge this will be.
+  _pl_isff=0
+  [ "${_ahead:-0}" -eq 0 ] && _pl_isff=1
   if [ "$INTERACTIVE" = 1 ]; then
-    _ans=$(_sm_ask "    $_r: fast-forward $_behind commit(s)? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
+    _pl_what="$_pl_strat $_behind commit(s)"
+    [ "$_pl_isff" = 1 ] && _pl_what="fast-forward $_behind commit(s)"
+    _ans=$(_sm_ask "    $_r: $_pl_what? [Y]es / [S]kip / [A]bort [Y/s/a]: ")
     case "$_ans" in
       a|A) log_major "$_r: [ABORT requested]"; return 77 ;;
-      s|S|n|N) log_major "$_r: skipped (ff-merge)"; PL_N_SKIPPED=$((PL_N_SKIPPED + 1)); return 0 ;;
+      s|S|n|N) log_major "$_r: skipped ($_pl_strat)"; PL_N_SKIPPED=$((PL_N_SKIPPED + 1)); return 0 ;;
     esac
   fi
   # git's stderr is the ONLY place the reason lives -- it names the exact
-  # paths that made the fast-forward impossible. Discarding it leaves
-  # "ff-merge failed" and a tree nobody can diagnose without re-running by
-  # hand. Keep it and reprint it under the repo it belongs to.
-  _pl_err=$(mktemp "${TMPDIR:-/tmp}/${US}.ffmerge.XXXXXX")
-  if run_as_owner "$_r" git merge --ff-only --quiet "$_rem_ref" 2>"$_pl_err"; then
+  # paths that stopped the merge. Discarding it leaves "merge failed" and a
+  # tree nobody can diagnose without re-running by hand.
+  _pl_err=$(mktemp "${TMPDIR:-/tmp}/${US}.merge.XXXXXX")
+  _pl_ok=0
+  case "$_pl_strat" in
+    rebase) run_as_owner "$_r" git rebase "$_rem_ref" >/dev/null 2>"$_pl_err" && _pl_ok=1 ;;
+    *)      run_as_owner "$_r" git merge --quiet "$_rem_ref"  2>"$_pl_err" && _pl_ok=1 ;;
+  esac
+  if [ "$_pl_ok" = 1 ]; then
     rm -f "$_pl_err"
-    log_major "$_r: $(c_green 'DONE :))') (fast-forwarded $_behind commit(s))"
-    PL_N_FFD=$((PL_N_FFD + 1))
+    if [ "$_pl_isff" = 1 ]; then
+      log_major "$_r: $(c_green 'DONE :))') (fast-forwarded $_behind commit(s))"
+      PL_N_FFD=$((PL_N_FFD + 1))
+    else
+      log_major "$_r: $(c_green 'DONE :))') (${_pl_strat}d $_behind commit(s) onto $_ahead of your own)"
+      PL_N_MERGED=$((PL_N_MERGED + 1))
+    fi
     return 0
-  else
-    log_error "$_r: ff-merge failed"
-    # Unconditional, not log_minor: that is -VV-gated, and the detail of an
-    # error is not a verbosity level. Stderr, like the error it belongs to.
-    while IFS= read -r _pl_l; do
-      [ -n "$_pl_l" ] && printf '    > %s\n' "$_pl_l" >&2
-    done < "$_pl_err"
-    rm -f "$_pl_err"
-    PL_N_ERROR=$((PL_N_ERROR + 1))
+  fi
+
+  # It stopped. Which of the two ways, and which paths need the user? Both
+  # are answerable, and answering them is the difference between "resolve
+  # these two files" and sixty lines of raw git nobody reads.
+  _pl_lst=$(mktemp "${TMPDIR:-/tmp}/${US}.paths.XXXXXX")
+
+  # CONFLICT -- the merge STARTED and left unmerged stages behind. Ask the
+  # index, not the message. Deliberately NOT aborted: the merge my-git
+  # started is the one the user finishes, in place.
+  run_as_owner_capture "$_r" git diff --name-only --diff-filter=U > "$_pl_lst" 2>/dev/null
+  _pl_n=$(awk 'END { print NR + 0 }' "$_pl_lst")
+  if [ "$_pl_n" -gt 0 ]; then
+    _pl_fix="resolve + git commit"
+    [ "$_pl_strat" = rebase ] && _pl_fix="resolve + git rebase --continue"
+    log_warn "$_r: $_desc — $(printf '%s' "$_pl_strat" | tr '[:lower:]' '[:upper:]') CONFLICT in $_pl_n path(s), left in place"
+    printf '    > %s\n' "$(_pl_name_list "$_pl_lst")" >&2
+    printf '    > %s, then: %s pull go\n' "$_pl_fix" "$US" >&2
+    PL_NEEDS="$PL_NEEDS$_r|CONFLICT|$_pl_n path(s): $_pl_fix
+"
+    PL_N_CONFLICT=$((PL_N_CONFLICT + 1))
+    rm -f "$_pl_err" "$_pl_lst"
     return 1
   fi
+
+  # BLOCKED -- the merge never started: git found paths it would have to
+  # write that hold uncommitted or untracked work. Nothing was touched.
+  # The two lists are kept apart because the fix differs: commit the first
+  # (that is what 'mc go' is for), move the second out of the way.
+  _pl_lst2=$(mktemp "${TMPDIR:-/tmp}/${US}.paths.XXXXXX")
+  _pl_blocked_paths "$_pl_err" local     > "$_pl_lst"
+  _pl_blocked_paths "$_pl_err" untracked > "$_pl_lst2"
+  _pl_nm=$(awk 'END { print NR + 0 }' "$_pl_lst")
+  _pl_nu=$(awk 'END { print NR + 0 }' "$_pl_lst2")
+  _pl_n=$((_pl_nm + _pl_nu))
+  if [ "$_pl_n" -gt 0 ]; then
+    log_warn "$_r: $_desc — $_pl_strat BLOCKED, $_pl_n path(s) in the way"
+    [ "$_pl_nm" -gt 0 ] && printf '    > modified:  %s\n' "$(_pl_name_list "$_pl_lst")"  >&2
+    [ "$_pl_nu" -gt 0 ] && printf '    > untracked: %s\n' "$(_pl_name_list "$_pl_lst2")" >&2
+    printf '    > commit them (%s mc go) or move them, then: %s pull go\n' "$US" "$US" >&2
+    PL_NEEDS="$PL_NEEDS$_r|BLOCKED|$_pl_n path(s): commit or move, then re-run
+"
+    PL_N_BLOCKED=$((PL_N_BLOCKED + 1))
+    rm -f "$_pl_err" "$_pl_lst" "$_pl_lst2"
+    return 1
+  fi
+
+  # Anything else is a genuine failure my-git did not anticipate -- keep
+  # every word git said.
+  log_error "$_r: $_pl_strat failed"
+  # Unconditional, not log_minor: that is -VV-gated, and the detail of an
+  # error is not a verbosity level. Stderr, like the error it belongs to.
+  while IFS= read -r _pl_l; do
+    [ -n "$_pl_l" ] && printf '    > %s\n' "$_pl_l" >&2
+  done < "$_pl_err"
+  rm -f "$_pl_err" "$_pl_lst" "$_pl_lst2"
+  PL_N_ERROR=$((PL_N_ERROR + 1))
+  return 1
 }
 
 cmd_pull() {
@@ -4675,8 +4808,24 @@ cmd_pull() {
   for _mdr_r in $_roots; do _marker_drift_warn_once "$_mdr_r"; done
   [ -z "$_roots" ] && { log_error "no repositories to pull"; exit 1; }
 
-  PL_N_TOTAL=0; PL_N_CLEAN=0; PL_N_FFD=0; PL_N_WOULD_FF=0
+  # Resolve the strategy ONCE, here, so pull_one never has to re-validate
+  # and a bad value is named once instead of per repo.
+  PL_STRATEGY=${PULL_STRATEGY:-merge}
+  case "$PL_STRATEGY" in
+    merge|rebase) : ;;
+    *) log_warn "PULL_STRATEGY='$PL_STRATEGY' is not merge or rebase — using merge"
+       PL_STRATEGY=merge ;;
+  esac
+  # A config file from before the split still names the retired knob. Say so
+  # once, and name its replacements -- silently ignoring it would leave a
+  # stated preference unhonoured with no way to notice.
+  if [ -n "${AUTOHEAL_PULL_STRATEGY:-}" ]; then
+    log_warn "AUTOHEAL_PULL_STRATEGY is retired — set PULL_STRATEGY (merge|rebase) for what pull does, and AUTOHEAL_PULL_CONFIG (0|1) for whether it is recorded in ~/.gitconfig"
+  fi
+
+  PL_N_TOTAL=0; PL_N_CLEAN=0; PL_N_FFD=0; PL_N_MERGED=0; PL_N_WOULD_MERGE=0
   PL_N_SKIPPED=0; PL_N_IGNORED=0; PL_N_NOREMOTE=0; PL_N_ERROR=0
+  PL_N_CONFLICT=0; PL_N_BLOCKED=0; PL_NEEDS=""
 
   _rc_total=0
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
@@ -4727,10 +4876,26 @@ cmd_pull() {
   # Summary.
   echo
   if [ "$_pl_mode" = "go" ]; then
+    # Everything that stopped on a repo, repeated once at the end: on a tree
+    # of forty the per-repo warning is a screen and a half up by the time
+    # the run finishes, and a list you have to scroll back for is a list you
+    # do not act on.
+    if [ -n "$PL_NEEDS" ]; then
+      _pl_needs_n=$(printf '%s' "$PL_NEEDS" | awk 'END { print NR + 0 }')
+      log_major "pull: needs you ($_pl_needs_n)"
+      printf '%s' "$PL_NEEDS" | while IFS='|' read -r _pn_r _pn_k _pn_h; do
+        [ -n "$_pn_r" ] || continue
+        printf '  %s>> %-58s %-9s %s%s\n' "$C_BLUE" "$_pn_r" "$_pn_k" "$_pn_h" "$C_RESET"
+      done
+      echo
+    fi
     log_major "pull: summary"
     _p=""
     [ "$PL_N_CLEAN" -gt 0 ]    && _p="$_p clean=$PL_N_CLEAN"
     [ "$PL_N_FFD" -gt 0 ]      && _p="$_p fast-forwarded=$PL_N_FFD"
+    [ "$PL_N_MERGED" -gt 0 ]   && _p="$_p ${PL_STRATEGY}d=$PL_N_MERGED"
+    [ "$PL_N_CONFLICT" -gt 0 ] && _p="$_p $(c_red "conflicted=$PL_N_CONFLICT")"
+    [ "$PL_N_BLOCKED" -gt 0 ]  && _p="$_p blocked=$PL_N_BLOCKED"
     [ "$PL_N_SKIPPED" -gt 0 ]  && _p="$_p skipped=$PL_N_SKIPPED"
     [ "$PL_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$PL_N_IGNORED"
     [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
@@ -4741,7 +4906,7 @@ cmd_pull() {
     log_major "pull: analyze summary"
     _p=""
     [ "$PL_N_CLEAN" -gt 0 ]    && _p="$_p clean=$PL_N_CLEAN"
-    [ "$PL_N_WOULD_FF" -gt 0 ] && _p="$_p would-ff=$PL_N_WOULD_FF"
+    [ "$PL_N_WOULD_MERGE" -gt 0 ] && _p="$_p would-$PL_STRATEGY=$PL_N_WOULD_MERGE"
     [ "$PL_N_SKIPPED" -gt 0 ]  && _p="$_p skipped=$PL_N_SKIPPED"
     [ "$PL_N_IGNORED" -gt 0 ]  && _p="$_p ignored=$PL_N_IGNORED"
     [ "$PL_N_NOREMOTE" -gt 0 ] && _p="$_p no-remote=$PL_N_NOREMOTE"
@@ -8394,59 +8559,72 @@ autoheal_off() {
   case "$1" in ''|0|no|No|NO|off|Off|OFF|false|False|FALSE) return 0 ;; *) return 1 ;; esac
 }
 
-# autoheal_pull_strategy <repo>
-#   Give <repo> a pull strategy when it has NONE. Prints the repo path if it
-#   set one.
+# autoheal_pull_config <repo>
+#   Record PULL_STRATEGY in the GLOBAL git config of the user who owns
+#   <repo>, so a 'git pull' that person runs by hand reconciles the way
+#   my-git does. Prints the repo path if it wrote one.
 #
 #   Since git 2.27 a 'git pull' on a DIVERGED branch aborts outright:
 #     fatal: Need to specify how to reconcile divergent branches.
-#   That is a configuration gap, not a conflict -- git simply refuses to
-#   guess. Every repo in a tree hits it independently, and the fix is the
-#   same each time, so 'pull' healing it beats a person pasting the same
-#   'git config' into repo after repo.
+#   That is a configuration gap, not a conflict -- git refuses to guess.
+#   Every repo in the tree hits it independently and the fix is identical,
+#   so it is stated ONCE, in the one place that covers all of them.
 #
-#   Only ever set when UNSET. pull.rebase / pull.ff are a real preference:
-#   if the repo (or the user's global config) already states one, that is an
-#   answer, and overwriting it would be exactly the kind of "my-git decided
-#   for you" damage this session spent its time undoing. Writes .git/config,
-#   which is local and never cloned.
-autoheal_pull_strategy() {
-  _aps_r=$1
-  _aps_want=${AUTOHEAL_PULL_STRATEGY-merge}
-  if autoheal_off "$_aps_want"; then
-    log_dbg_med "autoheal: pull strategy disabled (AUTOHEAL_PULL_STRATEGY='$_aps_want')"
+#   Global, not per-repo, deliberately: the old per-repo healing wrote
+#   .git/config in repo after repo to say the same thing, and said it in
+#   repos the user may never pull by hand. One line in ~/.gitconfig is the
+#   same answer, given once, where the user can see and change it.
+#
+#   Only ever written when that config states NOTHING. A preference that
+#   AGREES is a silent no-op; one that CONFLICTS is warned about and left
+#   exactly as it is -- an existing choice is an answer, and overwriting it
+#   is precisely the "my-git decided for you" damage this tool avoids.
+#
+#   Once per OWNER per run: the whole tree usually has one, and each check
+#   costs an su round-trip.
+autoheal_pull_config() {
+  _apc_r=$1
+  if [ "${AUTOHEAL_PULL_CONFIG:-1}" != 1 ]; then
+    log_dbg_med "autoheal: pull config disabled (AUTOHEAL_PULL_CONFIG=${AUTOHEAL_PULL_CONFIG-})"
     return 0
   fi
-  [ -e "$_aps_r/.git" ] || return 0
-  # An inherited preference counts as already answered -- but the global and
-  # system chain is the SAME for every repo, so resolve it once per run
-  # instead of per repo. Two run_as_owner_capture calls per repo cost 0.55s
-  # on a 41-repo tree; the ownership machinery is only needed for the WRITE.
-  if [ -z "${_APS_GLOBAL_CHECKED:-}" ]; then
-    _APS_GLOBAL_CHECKED=1
-    _APS_GLOBAL_SET=""
-    [ -n "$(git config --global --get pull.rebase 2>/dev/null)$(git config --global --get pull.ff 2>/dev/null)$(git config --system --get pull.rebase 2>/dev/null)$(git config --system --get pull.ff 2>/dev/null)" ] \
-      && _APS_GLOBAL_SET=1
-  fi
-  [ -z "$_APS_GLOBAL_SET" ] || return 0
-  # Local config only: plain git, no ownership detection needed to READ --
-  # that is only wanted for the WRITE. Two targeted --get calls beat one
-  # --list: measured, --list was SLOWER, because it dumps the whole config
-  # and the match then scans it, while --get exits at the first hit.
-  [ -z "$(git -c safe.directory='*' -C "$_aps_r" config --local --get pull.rebase 2>/dev/null)" ] || return 0
-  [ -z "$(git -c safe.directory='*' -C "$_aps_r" config --local --get pull.ff 2>/dev/null)" ] || return 0
-  case "$_aps_want" in
-    merge)   _aps_k=pull.rebase; _aps_v=false ;;
-    rebase)  _aps_k=pull.rebase; _aps_v=true ;;
-    ff-only) _aps_k=pull.ff;     _aps_v=only ;;
-    *) log_warn "autoheal: AUTOHEAL_PULL_STRATEGY='$_aps_want' is not merge/rebase/ff-only (or empty/no/off to disable) — skipping"; return 0 ;;
+  [ -e "$_apc_r/.git" ] || return 0
+  _apc_want=${PL_STRATEGY:-merge}
+  case "$_apc_want" in
+    merge)  _apc_val=false ;;
+    rebase) _apc_val=true ;;
+    *)      return 0 ;;
   esac
-  trace "git -C $_aps_r config $_aps_k $_aps_v   # autoheal: no pull strategy was set"
-  if run_as_owner "$_aps_r" git config "$_aps_k" "$_aps_v" 2>/dev/null; then
-    printf '%s\n' "$_aps_r"
-  else
-    log_dbg_med "autoheal: could not set $_aps_k in $_aps_r (cosmetic)"
+  _apc_owner=$(file_owner "$_apc_r/.git")
+  [ -n "$_apc_owner" ] || _apc_owner=$ME
+  case " ${_APC_SEEN:-} " in
+    *" $_apc_owner "*) return 0 ;;
+  esac
+  _APC_SEEN="${_APC_SEEN:-} $_apc_owner"
+
+  _apc_reb=$(run_as_owner_capture "$_apc_r" git config --global --get pull.rebase 2>/dev/null)
+  _apc_ff=$(run_as_owner_capture  "$_apc_r" git config --global --get pull.ff     2>/dev/null)
+  if [ -z "$_apc_reb" ] && [ -z "$_apc_ff" ]; then
+    trace "git config --global pull.rebase $_apc_val   # autoheal: $_apc_owner stated no pull preference"
+    if run_as_owner "$_apc_r" git config --global pull.rebase "$_apc_val" 2>/dev/null; then
+      printf '%s\n' "$_apc_r"
+    else
+      log_dbg_med "autoheal: could not set pull.rebase in $_apc_owner's global config (cosmetic)"
+    fi
+    return 0
   fi
+  # Something is stated. Agreeing is a no-op; disagreeing is the user's
+  # call, so say so once and leave it alone. pull.ff=only forbids the merge
+  # commit PULL_STRATEGY=merge exists to make, so it conflicts either way.
+  if [ -z "$_apc_ff" ] && [ "$_apc_reb" = "$_apc_val" ]; then
+    log_dbg_med "autoheal: $_apc_owner's global pull.rebase already $_apc_val"
+    return 0
+  fi
+  _apc_has="pull.rebase=$_apc_reb"
+  [ -n "$_apc_ff" ] && _apc_has="$_apc_has pull.ff=$_apc_ff"
+  [ -z "$_apc_reb" ] && _apc_has="pull.ff=$_apc_ff"
+  log_warn "$_apc_owner's ~/.gitconfig says $_apc_has, my-git uses PULL_STRATEGY=$_apc_want — leaving it alone; 'git pull' by hand there will not match my-git"
+  return 0
 }
 
 _SHADOW_EXCL_BEGIN='# >>> my-git shadow (managed block — nested repos mirrored elsewhere) >>>'
@@ -9917,7 +10095,7 @@ cmd_remote() {
 # Composite "settle the tree" pipeline: sm → pull → mc.
 #   Phase 1: sm     — register new nested repos, rebind moved ones,
 #                     clean stale .gitmodules entries.
-#   Phase 2: pull   — fetch + fast-forward.
+#   Phase 2: pull   — fetch + merge.
 #   Phase 3: mc     — commit (auto + user-dirt) + push where allowed.
 # Same flags apply uniformly to all three phases. Analyze by default.
 cmd_sync() {
@@ -9977,7 +10155,7 @@ cmd_sync() {
     [ "$_rc1" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in sm phase."; return 77; }
 
     echo
-    log_major "sync: phase 2/3 — pull (fetch + fast-forward)"
+    log_major "sync: phase 2/3 — pull (fetch + merge)"
     echo
     # shellcheck disable=SC2086
     cmd_pull $_phase_flags "$_sy_root"
@@ -10481,7 +10659,7 @@ Subcommands:
   status | st | s          List status of repo(s) + submodules (always recursive — overview)
   masscommits | mc | c     Analyze (default) / add + commit + push with 'go'
                            (single level; -R = full bottom-up walk)
-  pull | pl                Fetch + fast-forward merge (analyze / 'go'; whole tree)
+  pull | pl                Fetch + merge (analyze / 'go'; whole tree)
   push | ps                Publish what is ahead (analyze / 'go'; whole tree)
   pp                       pull then push, in that order (the 'gpp' alias, tree-wide)
   fetch                    Fetch only (alias: pull --fetch-only)
@@ -10819,21 +10997,20 @@ my-git pull  (aliases: pl;  'fetch' = pull --fetch-only)
 
 usage: $US [-V|-D] pull [go] [-R|-i|--force|--fetch-only] [paths...]
 
-Fetch origin on every scoped repo; with 'go', fast-forward clean+behind
-repos. Diverged or dirty repos are SKIPPED — my-git does not auto-
-rebase or merge-commit (that's a manual decision).
+Fetch origin on every scoped repo; with 'go', reconcile every repo that is
+behind or diverged, using PULL_STRATEGY (merge, the default, or rebase).
+A merge fast-forwards whenever it can.
 
 Modes:
   default (no 'go')   ANALYZE — fetch + print one concise line per repo
                       (CLEAN, behind=N, ahead=N, DIVERGED, DIRTY).
-                      No ff-merge performed.
-  go                  APPLY — same fetch, PLUS fast-forward merge for
-                      clean+behind repos.
+                      Nothing is merged.
+  go                  APPLY — same fetch, PLUS the merge/rebase.
 
 Options:
-  go                   Actually fast-forward; otherwise analyze only.
+  go                   Actually merge; otherwise analyze only.
   --fetch-only         Stop after fetch, never merge (safe to run always).
-  -i, --interactive    Prompt [Y]es / [s]kip / [a]bort before each ff-merge under -R walks.
+  -i, --interactive    Prompt [Y]es / [s]kip / [a]bort before each merge under -R walks.
   -R, --recursive      Walk full submodule tree TOP-DOWN (parents fetch
                        first so submodule refs resolve).
   --force              Bypass per-repo my-git.ignore markers
@@ -10844,11 +11021,23 @@ Options:
 Decisions per repo:
   no remote                           -> skipped (no-remote=N in summary)
   marker + no --force                 -> skipped (ignored=N)
-  DIRTY worktree                      -> skipped (user must commit/stash)
-  DIVERGED (ahead + behind)           -> skipped (manual merge/rebase)
-  clean + ahead only                  -> noop (nothing to pull)
-  clean + behind                      -> fast-forward (go) / would-ff (analyze)
-  clean + matched                     -> noop
+  ahead only                          -> noop (nothing to pull)
+  matched                             -> noop
+  behind                              -> merge; a fast-forward when your
+                                         branch has no commits of its own
+  DIVERGED (ahead + behind)           -> merge commit (or rebase)
+
+A dirty worktree is never a reason to skip: git refuses to overwrite
+uncommitted work by itself, so my-git lets it decide, per path.
+
+When the merge cannot finish, my-git stops on THAT repo, names the paths,
+and carries on with the tree — then repeats them all in a 'needs you' block
+at the end:
+  CONFLICT   the merge started and is LEFT IN PLACE: resolve + git commit
+             (conflicted=N in the summary)
+  BLOCKED    the merge never started — uncommitted or untracked files
+             would have been overwritten. Nothing was touched: commit them
+             ('$US mc go') or move them.  (blocked=N)
 
 Analyze always fetches (read-only) so the output reflects real upstream
 state. Set '--fetch-only' for a repeatable "update refs, don't touch
@@ -11421,7 +11610,7 @@ phase receives the flags you passed to sync.
 
   Phase 1: sm    register new nested repos, rebind moved ones, clean
                  stale .gitmodules entries.
-  Phase 2: pull  fetch origin everywhere; fast-forward clean+behind.
+  Phase 2: pull  fetch origin everywhere; merge what is behind/diverged.
   Phase 3: mc    auto-commit my-git-caused dirt (gitlink bumps from
                  phases 1+2, .gitignore fixes), then prompt-
                  gate user-dirt under -i; push where allowed.
@@ -11737,11 +11926,18 @@ values come from the user's config):
                               origin is set). 'mc go' only -- the marker is
                               a tracked file, so 'st' stays read-only. A
                               field that HAS a value is never overwritten.
-  AUTOHEAL_PULL_STRATEGY      The strategy to give a repo that has NONE, so
-                              'pull' on a diverged branch does not abort:
-                              merge (default) | rebase | ff-only.
-                              Empty / no / off disables the healing.
-                              Never overrides a strategy already set.
+  PULL_STRATEGY               How 'pull go' reconciles a repo that is
+                              behind or diverged: merge (default; it
+                              fast-forwards whenever it can) | rebase.
+                              A merge that conflicts is LEFT IN PLACE for
+                              you to resolve and commit.
+  AUTOHEAL_PULL_CONFIG        Record PULL_STRATEGY in the repo owner's
+                              GLOBAL git config (1 = yes, default), so a
+                              'git pull' they run by hand reconciles the
+                              same way and does not abort on a diverged
+                              branch. Written only when that config states
+                              NOTHING; one that CONFLICTS is warned about
+                              and left alone.
   MC_NEW_NESTED_REPO          What 'mc go' does with a NESTED REPO whose
                               relationship to its parent is not recorded:
                                 warn   (default) warn, leave it untracked --
@@ -14715,6 +14911,15 @@ cmd_run_tests() {
   GIT_ALLOW_PROTOCOL="file:git:https:ssh:http"
   export GIT_ALLOW_PROTOCOL
 
+  # Sandbox the GLOBAL git config: 'pull' records PULL_STRATEGY in the repo
+  # owner's ~/.gitconfig, and a self-test that edits the developer's own git
+  # config would break the "touches nothing of yours" promise the banner
+  # just made. Seeded with an identity so a clone that never sets a local
+  # one can still commit.
+  GIT_CONFIG_GLOBAL="$_rt_workdir/gitconfig.global"
+  export GIT_CONFIG_GLOBAL
+  printf '[user]\n\tname = my-git selftest\n\temail = selftest@localhost\n' > "$GIT_CONFIG_GLOBAL"
+
   _rt_conf() {
     cat > "$1" <<'_RT_CONF_EOF'
 GIT_REPOS=""
@@ -16400,79 +16605,183 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  test_pull_heals_a_missing_strategy_but_never_overrides_one() {
+  test_pull_records_the_strategy_globally_but_never_overrides_one() {
     # Since git 2.27, 'git pull' on a DIVERGED branch aborts outright with
-    # "Need to specify how to reconcile divergent branches". That is a
-    # configuration gap, not a conflict, and every repo hits it separately.
-    # pull fills the gap -- but ONLY when there is one: pull.rebase/pull.ff
-    # is a real preference, and overwriting a stated one is exactly the
+    # "Need to specify how to reconcile divergent branches". Every repo hits
+    # it separately and the fix is identical, so my-git states it ONCE, in
+    # the owner's global config -- and only when that config states nothing.
+    # A stated preference is an answer; overwriting one is exactly the
     # "my-git decided for you" damage this tool has caused before.
     _rt_repo up_o
     ( cd up_o && echo a > a.md && git add -A && git commit -q -m one )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'AUTOHEAL_PULL_CONFIG=1\n' >> "$_rt_conf_path"
     git clone -q up_o work >/dev/null 2>&1
     ( cd up_o && echo b > b.md && git add -A && git commit -q -m theirs )
     cd work || return 1
     git config user.email t@t.com; git config user.name t
-    echo c > c.md && git add -A && git commit -q -m mine        # diverged
-    git config --unset pull.rebase 2>/dev/null
-    git config --unset pull.ff 2>/dev/null
+    git config --global --unset pull.rebase 2>/dev/null
+    git config --global --unset pull.ff 2>/dev/null
 
-    _rt_ok "pull go heals the gap" _rt_my_git pull go || return 1
-    [ "$(git config --get pull.rebase)" = false ] \
-      || { _rt_fail "no strategy was set (got '$(git config --get pull.rebase)')"; return 1; }
+    _rt_ok "pull go states the strategy" _rt_my_git pull go || return 1
+    [ "$(git config --global --get pull.rebase)" = false ] \
+      || { _rt_fail "nothing was recorded (got '$(git config --global --get pull.rebase)')"; return 1; }
+    # ...and in the OWNER's config, not the repo's.
+    [ -z "$(git config --local --get pull.rebase)" ] \
+      || { _rt_fail "wrote the repo's own config, not the owner's"; return 1; }
 
-    # A stated preference must survive untouched.
-    git config pull.rebase true
-    _rt_ok "pull go again" _rt_my_git pull go || return 1
-    [ "$(git config --get pull.rebase)" = true ] \
-      || { _rt_fail "overwrote an existing preference"; return 1; }
+    # PULL_STRATEGY is the value, so it must be able to choose the other one.
+    git config --global --unset pull.rebase
+    printf 'PULL_STRATEGY=rebase\n' >> "$_rt_conf_path"
+    _rt_my_git pull go >/dev/null 2>&1
+    [ "$(git config --global --get pull.rebase)" = true ] \
+      || { _rt_fail "PULL_STRATEGY=rebase did not record rebase"; return 1; }
 
-    # The knob IS the strategy, so it must also be able to choose one...
-    git config --unset pull.rebase
-    AUTOHEAL_PULL_STRATEGY=rebase _rt_my_git pull go >/dev/null 2>&1
-    [ "$(git config --get pull.rebase)" = true ] \
-      || { _rt_fail "AUTOHEAL_PULL_STRATEGY=rebase did not choose rebase"; return 1; }
-    git config --unset pull.rebase
-    AUTOHEAL_PULL_STRATEGY=ff-only _rt_my_git pull go >/dev/null 2>&1
-    [ "$(git config --get pull.ff)" = only ] \
-      || { _rt_fail "AUTOHEAL_PULL_STRATEGY=ff-only did not set pull.ff"; return 1; }
-    git config --unset pull.ff
+    # A CONFLICTING preference is warned about and left exactly as it is.
+    git config --global pull.rebase true
+    printf 'PULL_STRATEGY=merge\n' >> "$_rt_conf_path"
+    _rt_my_git pull go > "$_rt_out" 2>&1
+    [ "$(git config --global --get pull.rebase)" = true ] \
+      || { _rt_fail "overwrote a stated preference"; return 1; }
+    _rt_contains "and says so" "$_rt_out" "PULL_STRATEGY=merge" || return 1
 
-    # ...and every off-word must disable it.
-    for _rt_off in "" no off 0; do
-      git config --unset pull.rebase 2>/dev/null
-      AUTOHEAL_PULL_STRATEGY="$_rt_off" _rt_my_git pull go >/dev/null 2>&1
-      [ -z "$(git config --get pull.rebase)" ] \
-        || { _rt_fail "healed despite AUTOHEAL_PULL_STRATEGY='$_rt_off'"; return 1; }
-    done
+    # AUTOHEAL_PULL_CONFIG=0 writes nothing at all.
+    git config --global --unset pull.rebase
+    printf 'AUTOHEAL_PULL_CONFIG=0\n' >> "$_rt_conf_path"
+    _rt_my_git pull go >/dev/null 2>&1
+    [ -z "$(git config --global --get pull.rebase)" ] \
+      || { _rt_fail "recorded despite AUTOHEAL_PULL_CONFIG=0"; return 1; }
     return 0
   }
 
-  test_st_heals_pull_strategy_only_where_the_branch_diverged() {
-    # 'st' heals the missing pull strategy, because 'st' is what people run
-    # -- wiring it only into 'my-git pull' meant a plain 'my-git' left the
-    # repo still unable to pull. But it heals ONLY on a DIVERGED row: that
-    # is the sole state where the gap actually bites, and healing every repo
-    # cost 0.3s per st to fix something almost none of them had.
+  test_st_never_writes_the_owners_git_config() {
+    # 'st' used to heal a missing pull strategy into every DIVERGED repo's
+    # own .git/config. Now the strategy is stated once in the OWNER's
+    # ~/.gitconfig -- and st, which people run constantly and expect to be
+    # read-only, is not the command that should be editing a user's home.
     _rt_repo up_o
     ( cd up_o && echo a > a.md && git add -A && git commit -q -m one )
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'AUTOHEAL_PULL_CONFIG=1\n' >> "$_rt_conf_path"
     git clone -q up_o diverged >/dev/null 2>&1
-    git clone -q up_o insync   >/dev/null 2>&1
     ( cd up_o && echo b > b.md && git add -A && git commit -q -m theirs )
     ( cd diverged && git config user.email t@t.com && git config user.name t \
         && echo c > c.md && git add -A && git commit -q -m mine && git fetch -q )
-    ( cd insync && git fetch -q )
-    git -C diverged config --unset pull.rebase 2>/dev/null
-    git -C insync   config --unset pull.rebase 2>/dev/null
+    git config --global --unset pull.rebase 2>/dev/null
 
-    _rt_ok "st" _rt_my_git st diverged insync || return 1
-    [ "$(git -C diverged config --local --get pull.rebase)" = false ] \
-      || { _rt_fail "the DIVERGED repo was not healed"; return 1; }
-    # The in-sync repo has no problem to fix, so it must be left alone.
-    [ -z "$(git -C insync config --local --get pull.rebase)" ] \
-      || { _rt_fail "healed a repo that was not diverged"; return 1; }
+    _rt_ok "st on a diverged repo" _rt_my_git st diverged || return 1
+    [ -z "$(git config --global --get pull.rebase)" ] \
+      || { _rt_fail "st wrote the owner's global config"; return 1; }
+    [ -z "$(git -C diverged config --local --get pull.rebase)" ] \
+      || { _rt_fail "st wrote the repo's config"; return 1; }
+    return 0
+  }
+
+  test_pull_merges_a_diverged_branch_instead_of_skipping_it() {
+    # A diverged branch used to be skipped outright ("manual merge
+    # needed"), which left whole trees permanently behind: nothing my-git
+    # ran would ever reconcile them. Reconciling is what a strategy is FOR.
+    _rt_repo up_o
+    ( cd up_o && echo a > a.md && git add -A && git commit -q -m one )
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git clone -q up_o work >/dev/null 2>&1
+    ( cd up_o && echo b > theirs.md && git add -A && git commit -q -m theirs )
+    cd work || return 1
+    git config user.email t@t.com; git config user.name t
+    echo c > mine.md && git add -A && git commit -q -m mine      # diverged
+
+    _rt_ok "pull go" _rt_my_git pull go || return 1
+    [ -f theirs.md ] && [ -f mine.md ] \
+      || { _rt_fail "the diverged branch was not merged"; return 1; }
+    [ "$(git rev-list --count --merges HEAD)" -ge 1 ] \
+      || { _rt_fail "no merge commit was created"; return 1; }
+    _rt_ok "both sides are present, on a merge commit" true || return 1
+
+    # ...and 'rebase' replays instead, leaving no merge commit.
+    cd .. || return 1
+    git clone -q up_o reb >/dev/null 2>&1
+    ( cd up_o && echo d > more.md && git add -A && git commit -q -m more )
+    cd reb || return 1
+    git config user.email t@t.com; git config user.name t
+    echo e > alsomine.md && git add -A && git commit -q -m alsomine
+    PULL_STRATEGY=rebase _rt_my_git pull go > "$_rt_out" 2>&1
+    [ -f more.md ] && [ -f alsomine.md ] \
+      || { _rt_fail "PULL_STRATEGY=rebase did not reconcile"; return 1; }
+    [ "$(git rev-list --count --merges HEAD)" = 0 ] \
+      || { _rt_fail "rebase produced a merge commit"; return 1; }
+    _rt_ok "rebase replays without a merge commit" true || return 1
+    return 0
+  }
+
+  test_pull_leaves_a_conflict_in_place_and_names_the_paths() {
+    # The merge my-git starts is the one the user finishes: a conflict is
+    # NOT aborted, so 'resolve + git commit' works right there. And the
+    # report names the conflicted paths -- that is what you act on; sixty
+    # lines of raw git output is what nobody reads.
+    _rt_repo up_o
+    ( cd up_o && echo a > both.md && git add -A && git commit -q -m one )
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git clone -q up_o work >/dev/null 2>&1
+    ( cd up_o && echo theirs > both.md && git add -A && git commit -q -m theirs )
+    cd work || return 1
+    git config user.email t@t.com; git config user.name t
+    echo mine > both.md && git add -A && git commit -q -m mine   # same path
+
+    _rt_my_git pull go > "$_rt_out" 2>&1
+    _rt_contains "reports a CONFLICT"        "$_rt_out" "CONFLICT" || return 1
+    _rt_contains "names the conflicted path" "$_rt_out" "both.md"  || return 1
+    _rt_contains "and repeats it at the end" "$_rt_out" "needs you" || return 1
+    [ -n "$(git diff --name-only --diff-filter=U)" ] \
+      || { _rt_fail "the conflict was aborted instead of left in place"; return 1; }
+    _rt_ok "the conflict is left in the worktree" true || return 1
+    # It really is resolvable on the spot.
+    echo resolved > both.md && git add both.md && git commit -q -m resolved
+    _rt_ok "resolve + commit finishes it" _rt_my_git pull go || return 1
+    return 0
+  }
+
+  test_pull_reports_a_blocked_merge_without_the_wall_of_git() {
+    # git refuses to START a merge over uncommitted or untracked work, and
+    # names every path in the way -- sixty of them on a real repo. The count
+    # is what you act on; the names are what you act with, and only the
+    # first few belong on the line. Nothing was touched, so this is not an
+    # error: it is a repo that needs you.
+    _rt_repo up_o
+    ( cd up_o && echo a > tracked.md && git add -A && git commit -q -m one )
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git clone -q up_o work >/dev/null 2>&1
+    ( cd up_o && echo theirs > tracked.md && echo n > newfile.md \
+        && git add -A && git commit -q -m theirs )
+    cd work || return 1
+    git config user.email t@t.com; git config user.name t
+    echo mine > tracked.md                 # modified, uncommitted
+    echo mine > newfile.md                 # untracked, same path as incoming
+
+    _rt_my_git pull go > "$_rt_out" 2>&1
+    _rt_contains "reports it BLOCKED"    "$_rt_out" "BLOCKED"     || return 1
+    _rt_contains "names the modified path"  "$_rt_out" "tracked.md" || return 1
+    _rt_contains "names the untracked path" "$_rt_out" "newfile.md" || return 1
+    _rt_contains "counts it apart from errors" "$_rt_out" "blocked=1" || return 1
+    _rt_not_contains "and does not call it an error" "$_rt_out" "errors=" || return 1
+    [ "$(cat tracked.md)" = mine ] && [ "$(cat newfile.md)" = mine ] \
+      || { _rt_fail "local work was overwritten"; return 1; }
+    _rt_ok "nothing local was touched" true || return 1
+    return 0
+  }
+
+  test_git_repos_roots_that_nest_are_walked_once() {
+    # Every GIT_REPOS entry is walked RECURSIVELY, so an entry that sits
+    # UNDER another entry is visited twice -- fetched, merged, counted and
+    # errored twice. A config naming both a tree and a subtree of it reads
+    # perfectly reasonably, and is one my-git should absorb rather than
+    # blame. (Seen on ada: /LINKS/global and /LINKS/global/src.)
+    _rt_repo outer
+    _rt_repo outer/inner
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    printf 'GIT_REPOS="%s/outer %s/outer/inner"\n' "$PWD" "$PWD" >> "$_rt_conf_path"
+
+    _rt_my_git pull > "$_rt_out" 2>&1
+    _rt_contains "each repo is walked exactly once" "$_rt_out" "total=2" || return 1
     return 0
   }
 
@@ -20035,7 +20344,11 @@ PYDRV
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_heals_a_missing_strategy_but_never_overrides_one test_st_heals_pull_strategy_only_where_the_branch_diverged test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  test_pull_merges_a_diverged_branch_instead_of_skipping_it
+  test_pull_leaves_a_conflict_in_place_and_names_the_paths
+  test_pull_reports_a_blocked_merge_without_the_wall_of_git
+  test_git_repos_roots_that_nest_are_walked_once test_st_never_writes_the_owners_git_config test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -20245,7 +20558,7 @@ _my-git() {
   commands=(
     'status:Recursive overview of every repo in a tree (alias: st, s)'
     'masscommits:Analyze / go = add+commit+push (alias: mc, c)'
-    'pull:Fetch + fast-forward clean/behind repos (alias: pl)'
+    'pull:Fetch + merge behind/diverged repos (alias: pl)'
     'fetch:Refs-only update, never merges'
     'sync:Composite sm -> pull -> mc (alias: syn)'
     'remote:List / audit git remotes (alias: rem)'
