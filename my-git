@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.4
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="bac23df"
+SCRIPT_COMMIT="c7e3263"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -359,6 +359,18 @@ AUTOHEAL_SHADOW_MARKER=1
 # container dirty and ahead of what it records, which is the drift the
 # arrangement exists to prevent.
 AUTOHEAL_PULL_REALIGN_IN_SHADOWED_REPOS=1
+
+# How many repos 'pull' fetches at once.
+#
+# Fetching is nearly all of pull's wall time and none of its CPU -- 33 repos
+# at ~1.1s each is 38 seconds of waiting, one machine at a time, on work
+# with no ordering constraint. Only the fetch runs in parallel; every line
+# pull prints still comes from the sequential walk, in tree order.
+#
+# 8 is measured, not guessed, on a 33-repo tree: 4 -> 16.9s, 8 -> 11.8s,
+# 16 -> 14.9s. More is not better -- concurrent handshakes to the same host
+# race the ssh ControlMaster instead of sharing it.
+PULL_FETCH_JOBS=8
 
 # ─── What 'mc go' does with a NEW nested repo ────────────────────────────
 # A nested git repo whose relationship to its parent is NOT recorded (not a
@@ -4668,6 +4680,48 @@ _pl_blocked_paths() {
   ' "$1"
 }
 
+# _pl_fetch_key <repo> — a filename that survives a path: '/' is the one
+# character a filename cannot hold, and these paths carry ',' and spaces.
+_pl_fetch_key() { printf '%s' "$1" | tr '/' '%'; }
+
+# _pl_fetch_rc <repo> — the exit status _pl_prefetch recorded, or nothing
+# when this repo was never prefetched.
+_pl_fetch_rc() {
+  [ -n "${PL_FETCHDIR:-}" ] || return 0
+  cat "$PL_FETCHDIR/$(_pl_fetch_key "$1")" 2>/dev/null
+}
+
+# _pl_prefetch <nodes-file> — fetch every listed repo, PULL_FETCH_JOBS at a
+# time, recording each exit status for pull_one to read.
+#
+# Fetching is nearly all of pull's wall time and none of its CPU: 33 repos
+# at ~1.1s each is 38 seconds spent waiting on other machines, one after
+# another, for work with no ordering constraint at all. ONLY the fetch is
+# parallel -- every line printed afterwards still comes from the sequential
+# walk, in tree order, so the output still says what happened and when.
+#
+# </dev/null on the child: run_as_owner may go through su/sudo, and a
+# backgrounded one holding a terminal can stop at a prompt nobody sees.
+_pl_prefetch() {
+  _pf_list=$1
+  _pf_max=${PULL_FETCH_JOBS:-8}
+  case "$_pf_max" in ''|*[!0-9]*|0) _pf_max=8 ;; esac
+  PL_FETCHDIR=$(mktemp -d "${TMPDIR:-/tmp}/${US}.fetch.XXXXXX") || { PL_FETCHDIR=""; return 0; }
+  _pf_n=0
+  while IFS= read -r _pf_r; do
+    [ -n "$_pf_r" ] || continue
+    [ -n "$(run_as_owner_capture "$_pf_r" git remote 2>/dev/null)" ] || continue
+    _pf_f="$PL_FETCHDIR/$(_pl_fetch_key "$_pf_r")"
+    ( run_as_owner "$_pf_r" git fetch --quiet --all --prune >/dev/null 2>&1 </dev/null
+      printf '%s' "$?" > "$_pf_f" ) &
+    _pf_n=$((_pf_n + 1))
+    [ "$((_pf_n % _pf_max))" -eq 0 ] && wait
+  done < "$_pf_list"
+  wait
+  [ "$_pf_n" -gt 0 ] && log_major "pull: fetched $_pf_n repo(s), $_pf_max at a time"
+  return 0
+}
+
 pull_one() {
   _r=$1
   PL_N_TOTAL=$((PL_N_TOTAL + 1))
@@ -4698,17 +4752,26 @@ pull_one() {
     return 0
   fi
 
-  # Fetch (always runs — read-only).
-  if [ "$_pl_mode" = "go" ] || [ "${PL_FETCH_ONLY:-0}" = 1 ] || [ "$DRY_RUN" != 1 ]; then
-    # In analyze mode we also fetch so the ff/diverged/behind status
-    # reflects the real upstream — otherwise analyze is meaningless
-    # when stale. Only skipped when user asks for pure no-network mode
-    # (not currently exposed; all modes fetch).
-    if ! run_as_owner "$_r" git fetch --quiet --all --prune 2>/dev/null; then
-      log_error "$_r: git fetch failed"
-      PL_N_ERROR=$((PL_N_ERROR + 1))
-      return 1
-    fi
+  # Fetch — in EVERY mode, analyze included. 'behind=N' computed from
+  # remote-tracking refs nobody refreshed looks like an answer and is not
+  # one: analyze reported CLEAN on repos that were days behind. The guard
+  # here used to be
+  #   [ mode = go ] || [ fetch-only ] || [ DRY_RUN != 1 ]
+  # and under analyze all three are false, so analyze never fetched at all
+  # -- while its own --help and the comment above it both promised it did.
+  #
+  # The work itself is done up front and in parallel by _pl_prefetch; what
+  # arrives here is that fetch's exit status. A repo reached by some path
+  # that skipped the prefetch still fetches inline.
+  _pl_rc=$(_pl_fetch_rc "$_r")
+  if [ -z "$_pl_rc" ]; then
+    run_as_owner "$_r" git fetch --quiet --all --prune >/dev/null 2>&1
+    _pl_rc=$?
+  fi
+  if [ "$_pl_rc" != 0 ]; then
+    log_error "$_r: git fetch failed"
+    PL_N_ERROR=$((PL_N_ERROR + 1))
+    return 1
   fi
 
   # ONE call for all four questions -- branch, does an upstream exist, how
@@ -5003,6 +5066,7 @@ cmd_pull() {
     _nodes=$(select_tree_nodes "$_root" "$PL_SM_ONLY" "$PL_SH_ONLY")
     _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
     printf '%s\n' "$_nodes" > "$_ntmp"
+    _pl_prefetch "$_ntmp"
     _abort_requested=0
     # Read the node list on fd 9, not stdin. pull_one runs git through
     # run_as_owner_capture -- su/sudo -- which read stdin; on stdin they
@@ -5020,6 +5084,8 @@ cmd_pull() {
       esac
     done 9< "$_ntmp"
     rm -f "$_ntmp"
+    [ -n "${PL_FETCHDIR:-}" ] && rm -rf "$PL_FETCHDIR"
+    PL_FETCHDIR=""
     if [ "$_abort_requested" = 1 ]; then
       rm -f "$_rtmp"
       log_major "pull: ABORT requested — stopping."
@@ -12292,6 +12358,10 @@ values come from the user's config):
                               origin is set). 'mc go' only -- the marker is
                               a tracked file, so 'st' stays read-only. A
                               field that HAS a value is never overwritten.
+  PULL_FETCH_JOBS             How many repos 'pull' fetches at once (8).
+                              Only the fetch is parallel; the report stays
+                              in tree order. Measured on 33 repos: 4=16.9s,
+                              8=11.8s, 16=14.9s -- more is not better.
   PULL_STRATEGY               How 'pull go' reconciles a repo that is
                               behind or diverged: merge (default; it
                               fast-forwards whenever it can) | rebase.
@@ -18323,6 +18393,44 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
+  test_pull_analyze_fetches_so_behind_is_not_stale() {
+    # ANALYZE never fetched: its guard was
+    #   [ mode = go ] || [ fetch-only ] || [ DRY_RUN != 1 ]
+    # and under analyze all three are false. So 'behind=N' came from
+    # remote-tracking refs nobody had refreshed -- a repo days behind
+    # reported CLEAN, which is worse than reporting nothing.
+    _rt_repo_file up_f a.md
+    git clone -q up_f work >/dev/null 2>&1
+    ( cd up_f && printf 'v2\n' >> a.md \
+      && git add a.md && git -c user.name=T -c user.email=t@t commit -qm "upstream moves on" ) >/dev/null 2>&1
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd work || return 1
+    # The clone's remote-tracking ref still says it is up to date.
+    _rt_ok "pull analyze" _rt_my_git pull || return 1
+    _rt_contains "analyze saw the new upstream commit" "$_rt_out" "behind" || return 1
+    _rt_not_contains "and did not call it clean" "$_rt_out" "CLEAN" || return 1
+    # ...and it is ANALYZE: nothing was merged.
+    [ "$(git rev-list --count HEAD)" = 1 ] \
+      || { _rt_fail "analyze merged something"; return 1; }
+    _rt_ok "analyze fetched but merged nothing" true || return 1
+    return 0
+  }
+
+  test_pull_reports_a_fetch_that_failed() {
+    # The prefetch records each fetch's exit status for the walk to read.
+    # If that plumbing breaks, a dead remote would read as success and the
+    # repo would be reported on stale refs -- silently.
+    _rt_repo_file up_h a.md
+    git clone -q up_h work >/dev/null 2>&1
+    git -C work remote set-url origin "$PWD/nowhere-at-all.git" 2>/dev/null
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd work || return 1
+    _rt_my_git pull > "$_rt_out" 2> "$_rt_err"
+    _rt_contains "says the fetch failed" "$_rt_err" "git fetch failed" || return 1
+    _rt_contains "and counts it as an error" "$_rt_out" "errors=1" || return 1
+    return 0
+  }
+
   test_pull_realigns_a_shadowed_child_instead_of_blocking() {
     # The container's pull UPDATES a shadowed project's files -- it tracks
     # them -- and leaves the project's own HEAD behind. git then refuses to
@@ -21144,7 +21252,7 @@ PYDRV
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
