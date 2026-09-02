@@ -18306,7 +18306,11 @@ _RT_STALE_CONF_EOF
     # release commit without being asked for.
     _rt_repo proj
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
-    if ! cp "$_rt_self" proj/mg 2>/dev/null || ! chmod +x proj/mg 2>/dev/null; then
+    # An UNSTAMPED copy, whatever the build running this suite carries: a
+    # copy that is already stamped is a no-op by design, and would never
+    # reach the dirty check this test is about.
+    if ! sed 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=""/' "$_rt_self" > proj/mg 2>/dev/null \
+       || ! chmod +x proj/mg 2>/dev/null; then
       _rt_fail "setup: could not copy the script"
       return 1
     fi
