@@ -3228,14 +3228,18 @@ cmd_status() {
     # behind (pull realigns it, writing no file) from a real local edit (mc
     # commits it), and finding out means hashing the worktree, which is 'st'
     # paying for something only 'pull go' acts on.
+    #
+    # Every part carries the separator and the FIRST one loses it again, so
+    # a line with one command on it cannot start with a dangling '·'.
     _cparts=""
     if [ "$_n_dirty" -gt 0 ] || [ "$_n_oldco" -gt 0 ] || [ "$_n_behind" -gt 0 ] || [ "$_n_div" -gt 0 ]; then
-      _cparts="$_cparts  $US pull go"
+      _cparts="$_cparts  ·  $US pull go"
       { [ "$_n_dirty" -gt 0 ] || [ "$_n_oldco" -gt 0 ]; } && _cparts="$_cparts (a HEAD left behind)"
     fi
     [ "$_n_dirty" -gt 0 ]        && _cparts="$_cparts  ·  $US mc go (real edits)"
     [ "$_n_ahead" -gt 0 ]        && _cparts="$_cparts  ·  $US push go"
     [ "${_n_norepo:-0}" -gt 0 ]  && _cparts="$_cparts  ·  $US rehydrate go (no repo)"
+    _cparts=${_cparts#"  ·"}
     [ -n "$_cparts" ] && printf '  %s>> to clean:%s%s\n' "$C_BLUE" "$_cparts" "$C_RESET"
   fi
   # LAST, after the summary: a warning printed before a 43-row tree is a
@@ -18271,6 +18275,7 @@ _RT_STALE_CONF_EOF
     _rt_contains "names what settles it" "$_rt_out" "to clean:" || return 1
     _rt_contains "mc commits a real edit" "$_rt_out" "mc go" || return 1
     _rt_contains "pull realigns a HEAD left behind" "$_rt_out" "pull go" || return 1
+    _rt_not_contains "no separator with nothing before it" "$_rt_out" "to clean:  ·" || return 1
     return 0
   }
 
