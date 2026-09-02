@@ -10096,16 +10096,19 @@ _RH_EOF
     # lookup were not there at all.
     _shadow_exclude_marker "$_rh_p" "$_rh_top" || true   # 1 just means "already there"
 
-    # Put HEAD where the FILES actually are, not where the marker remembers.
+    # Put HEAD where the FILES actually are.
     #
-    # The marker's 'commit:' is deliberately point-in-time (see the shadow
-    # hook: it refreshes branch and remote, never commit), so it goes stale
-    # the moment you commit in the project without re-shadowing -- restoring
-    # it would be wrong in a quieter way than not restoring anything.
+    # The marker records the commit the mirror was taken from, and the shadow
+    # pre-commit hook stamps it at exactly that moment -- blanking it instead
+    # of guessing when the child was dirty. wt_matches_commit asks the marker
+    # first and VERIFIES the answer (the recorded commit's tree against a
+    # re-hash of this worktree seeded from it), then falls back to hashing
+    # and hunting a matching tree through 'log --all' for a marker written
+    # before the stamp existed.
     #
-    # wt_matches_commit answers the real question: hash the worktree and find
-    # the commit with that tree. If one exists, nothing was hand-edited and
-    # that commit IS this checkout -- so the restored repo comes up CLEAN
+    # Either way the answer is a commit whose tree IS these files, so nothing
+    # was hand-edited and that commit IS this checkout -- the restored repo
+    # comes up CLEAN
     # under plain git instead of showing an entire upstream's worth of
     # phantom changes. Observed on ada: 10 of 25 projects restored dirty,
     # pulseaudio alone reporting 451 differences that were purely a 2019
