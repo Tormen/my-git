@@ -178,6 +178,9 @@ config file.
 | `GIT_SIDECAR_DIRNAME`                 | `.git.real`                              | `flatten`/`unflatten`: dirname used for a sidecared submodule/embedded repo |
 | `AUTO_SIDECAR_SUBMODULES`             | `0`                                      | `flatten`: `1` = bare `go` auto-sidecars every registered submodule, no prompt |
 | `AUTO_SIDECAR_EMBEDDED`               | `0`                                      | `flatten`: `1` = bare `go` auto-sidecars every embedded nested repo, no prompt |
+| `PULL_STRATEGY`                       | `merge`                                  | How `pull go` reconciles a repo that is behind or diverged: `merge` (fast-forwards when it can) or `rebase` |
+| `AUTOHEAL_PULL_CONFIG`                | `1`                                      | `st`/`pull` record `PULL_STRATEGY` in the repo owner's **global** gitconfig — only when it states nothing |
+| `MC_NEW_NESTED_REPO`                  | `warn`                                   | What `mc go` does with a nested repo whose relationship to its parent is unrecorded: `warn` / `shadow` / `ignore` |
 
 ## Quick start
 
@@ -190,7 +193,7 @@ my-git mc go --sm              # ...only the submodule tree
 my-git push                    # analyze: what is ahead, and where it would go
 my-git push go --sh            # publish the shadowed projects
 my-git pull                    # analyze: fetch + report who's behind (no merge)
-my-git pull go                 # fetch + fast-forward everywhere
+my-git pull go                 # fetch + merge everywhere (ff when it can)
 my-git fetch                   # refs-only update across the tree (never merges)
 my-git sm                      # analyze nested unregistered repos (THIS level)
 my-git sm go                   # register them (THIS level only)
@@ -214,7 +217,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
 | `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
 | `masscommits`   | `mc`, `c`      | whole tree  | Analyze (default) / `go` = add+commit+push, deepest first; `--sm`/`--sh` narrow |
-| `pull`          | `pl`, `fetch`  | whole tree  | Fetch origin + fast-forward clean+behind repos; `fetch` = `pull --fetch-only`   |
+| `pull`          | `pl`, `fetch`  | whole tree  | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only` |
 | `push`          | `ps`           | whole tree  | Analyze (default) / `go` = publish what is ahead. Never invents an upstream, never pushes a diverged branch, skips local-only |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos as submodules; `-R` = top-down walk. A PATH registers into the repo that **directly encloses** it (its immediate parent), not the toplevel you run from |
 | `unsm`          | `unsub`        | whole-tree | Reverse of `sm`: de-register a submodule back to a `raw-nested-git` — drops `.gitmodules`+gitlink, **de-absorbs** its gitdir (`.git/modules/<name>` → `<path>/.git`); the repo stays live, history intact |
@@ -421,6 +424,82 @@ summary of what was done / what's left:
 
 Analyze mode prints an equivalent "would-do" summary. The detailed tree
 is intentionally left to `my-git st`.
+
+### `pull` — how it reconciles
+
+`pull go` fetches, then reconciles every repo that is **behind** or
+**diverged** (ahead *and* behind), using `PULL_STRATEGY`:
+
+- **`merge`** (default) — `git merge origin/<branch>`. Fast-forwards
+  whenever your branch has no commits of its own; otherwise a real merge
+  commit.
+- **`rebase`** — replays your local commits on top of origin's.
+
+There is no fast-forward-only mode. Refusing to reconcile a diverged branch
+is not a strategy — it is a tree that silently never pulls.
+
+A dirty worktree is never a reason to skip: git itself refuses to overwrite
+uncommitted work, per path, and it is the one that knows which paths the
+incoming diff touches.
+
+When the merge cannot finish, `pull` stops on **that** repo, names the paths
+that need you, and carries on with the rest of the tree:
+
+| | what happened | what you do |
+|---|---|---|
+| `CONFLICT` | the merge started and is **left in the worktree** — never aborted | resolve + `git commit` (or `git rebase --continue`), then re-run |
+| `BLOCKED` | the merge never started: uncommitted or untracked files would have been overwritten. Nothing was touched | commit them (`my-git mc go`) or move them, then re-run |
+
+Both are counted separately from `errors=`, list the first three paths
+(`-V` for all), and are repeated per repo in a `needs you` block at the end
+— on a tree of forty repos the per-repo line is long gone by then.
+
+```text
+WARN:  ,github/my-booking-tool: behind=3 — merge BLOCKED, 75 path(s) in the way
+    > modified:  .gitignore, README.md, app/atomic_io.py … (+57 more)
+    > untracked: app/backup.py, app/macros.py … (+13 more)
+    > commit them (my-git mc go) or move them, then: my-git pull go
+
+ >>> pull: needs you (2)
+  >> ,github/my-booking-tool     BLOCKED   75 path(s): commit or move, then re-run
+  >> py/my-boox                  CONFLICT   2 path(s): resolve + git commit
+```
+
+With `AUTOHEAL_PULL_CONFIG=1` (the default), `st` and `pull` also record
+`PULL_STRATEGY` in the **repo owner's global** gitconfig, once per owner per
+run, so a `git pull` you run by hand reconciles the same way instead of
+dying with *"Need to specify how to reconcile divergent branches"*. Written
+only when that config states nothing; one that **conflicts** is warned about
+and left exactly as it is.
+
+### New nested repos in `mc go`
+
+A nested git repo whose relationship to its parent is **not recorded** (not a
+registered submodule, not shadowed, not sidecar/merged/zipped, no ignore
+marker) is never swept into a commit — `git add -A` would record it as a
+**gitlink** pinning a commit nobody can fetch, and the damage is silent: the
+path becomes tracked, so `git status` reads clean while a clone gets an empty
+directory.
+
+`MC_NEW_NESTED_REPO` says what happens instead:
+
+| value | what `mc go` does |
+|---|---|
+| `warn` (default) | warn, leave it untracked; classify it yourself, or with `mc -i` |
+| `shadow` | mirror its files into the parent, keep its `.git` live |
+| `ignore` | run `my-git ignore` on it, so it is never carried |
+
+`warn` is what a my-git that had never heard of the knob did, so upgrading
+changes nothing until you opt in. Under `-i`, `warn` **asks** per repo
+(shadow / submodule / ignore / leave) instead of only warning, and an auto
+value confirms each repo first.
+
+`flatten` and `sm` are deliberately not values: `flatten` deletes the child's
+`.git` (far too destructive as a side effect of `mc`), and `sm` needs a URL,
+which a repo with no origin has nobody to ask for in a non-interactive run —
+it *is* in the `-i` menu, where a human exists.
+
+Analyze mode classifies nothing, ever; it reports what `go` would do.
 
 ## Verbosity & debug
 
