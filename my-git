@@ -1290,10 +1290,17 @@ ensure_preserved_refspec() {
              git config --add "remote.$_epr_r.fetch" "$_epr_spec" 2>/dev/null; }
       # Setting ANY push refspec replaces git's default 'push the current
       # branch', so the heads spec has to be restated alongside ours.
+      #
+      # UNFORCED, unlike ours. '+' is right for $MERGED_REFS_ROOT -- my-git
+      # owns that namespace and moves it deliberately -- and catastrophic for
+      # refs/heads: it turns a plain 'git push' from a machine that is BEHIND
+      # into a silent rewind of every branch on the shared remote. That is not
+      # hypothetical; it cost /LINKS/gits/src.git 12 commits from a checkout
+      # that was 11 behind. Unforced, the same push is simply rejected.
       if ! git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF "$_epr_spec"; then
         log_dbg_med "ensure_preserved_refspec: $_epr_repo — adding push refspecs to remote '$_epr_r'"
-        git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF '+refs/heads/*:refs/heads/*' \
-          || git config --add "remote.$_epr_r.push" '+refs/heads/*:refs/heads/*' 2>/dev/null
+        git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF 'refs/heads/*:refs/heads/*' \
+          || git config --add "remote.$_epr_r.push" 'refs/heads/*:refs/heads/*' 2>/dev/null
         git config --add "remote.$_epr_r.push" "$_epr_spec" 2>/dev/null
       fi
     done
@@ -16132,8 +16139,13 @@ _RT_STALE_CONF_EOF
     git config --get-all remote.origin.push | grep -qxF '+refs/my-git/merged/*:refs/my-git/merged/*' \
       || { _rt_fail "remote.origin.push is missing the preserved-history refspec"; return 1; }
     # Setting a push refspec replaces git's default, so heads must be restated.
-    git config --get-all remote.origin.push | grep -qxF '+refs/heads/*:refs/heads/*' \
+    git config --get-all remote.origin.push | grep -qxF 'refs/heads/*:refs/heads/*' \
       || { _rt_fail "remote.origin.push must still carry refs/heads/* alongside"; return 1; }
+    # ...UNFORCED. A '+' here makes every plain push from a behind checkout
+    # rewind the shared remote; only $MERGED_REFS_ROOT may be forced.
+    if git config --get-all remote.origin.push | grep -qxF '+refs/heads/*:refs/heads/*'; then
+      _rt_fail "remote.origin.push force-pushes refs/heads/* -- a behind checkout would rewind the remote"; return 1
+    fi
     return 0
   }
 
