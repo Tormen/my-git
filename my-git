@@ -2088,7 +2088,12 @@ _marker_remote_drift() {
   while IFS= read -r _mrd_p; do
     [ -n "$_mrd_p" ] || continue
     _mrd_rec=$(sed -n 's|^remote\.origin\.url: ||p' "$_mrd_root/$_mrd_p/.git.shadow.status" 2>/dev/null | head -n 1)
-    _mrd_act=$(git -C "$_mrd_root/$_mrd_p" config --get remote.origin.url 2>/dev/null)
+    # run_as_owner_capture, never a plain 'git -C': run as root over a
+    # user-owned repo, plain git refuses it as dubiously-owned and returns
+    # EMPTY -- and every warning below is guarded on a non-empty value, so
+    # drift detection would switch itself off in exactly the run that has
+    # the most authority to act on it, saying nothing about why.
+    _mrd_act=$(run_as_owner_capture "$_mrd_root/$_mrd_p" git config --get remote.origin.url 2>/dev/null)
     # BRANCH first: it is the one that silently rewrites file CONTENT. The
     # marker records which branch the container's mirror holds. Two machines
     # sitting on different branches of the same shadowed repo means whichever
@@ -2098,7 +2103,7 @@ _marker_remote_drift() {
     # said 'ticket_#678', 451 paths apart, and on 'main' where the marker said
     # 'with-progress-bar'.
     _mrd_recb=$(sed -n 's|^branch: ||p' "$_mrd_root/$_mrd_p/.git.shadow.status" 2>/dev/null | head -n 1)
-    _mrd_actb=$(git -C "$_mrd_root/$_mrd_p" symbolic-ref --short -q HEAD 2>/dev/null)
+    _mrd_actb=$(run_as_owner_capture "$_mrd_root/$_mrd_p" git symbolic-ref --short -q HEAD 2>/dev/null)
     if [ -n "$_mrd_recb" ] && [ -n "$_mrd_actb" ] && [ "$_mrd_recb" != "$_mrd_actb" ]; then
       printf '%s: the marker records branch %s but this machine is on %s. The container mirrors whichever branch is checked out, so committing here would REPLACE the recorded branch'"'"'s files in the mirror for every machine -- silently, because to the container it is only changed content. Check out the recorded one with "git -C %s checkout %s", or record this one with "%s shadow go %s".\n' \
         "$_mrd_p" "'$_mrd_recb'" "'$_mrd_actb'" "$_mrd_p" "'$_mrd_recb'" "$US" "$_mrd_p"
