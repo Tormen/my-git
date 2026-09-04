@@ -9,13 +9,13 @@
 # See:  my-git --help   (or: my-git --help <subcommand>)
 
 US=${0##*/}
-SCRIPT_VERSION=1.5
+SCRIPT_VERSION=1.6
 # The commit this file was released from, written by 'my-git stamp-version'
 # just before the release commit is amended -- so it lags HEAD by exactly one
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="03d4b7d"
+SCRIPT_COMMIT="e89525c"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -337,8 +337,11 @@ AUTOHEAL_UPSTREAM=1
 # empty remote while origin is set. That is a marker written by a run that
 # could not READ the repo (my-git invoked as root over a user-owned tree
 # used to do exactly this), not two machines disagreeing. Only 'mc' heals
-# it: the marker is a file the container TRACKS, so 'st' must stay
-# read-only and only reports. A field that HAS a value is never touched --
+# it: the marker is a file the container TRACKS, and 'st' never writes a
+# tracked file -- it only reports this one. (st DOES heal untracked state
+# and state inside .git: exclude entries, the hook, a redundant index
+# entry, a shadowed HEAD left behind.) A field that HAS a value is never
+# touched --
 # that is drift, and which side is right is not my-git's to decide.
 AUTOHEAL_SHADOW_MARKER=1
 # Put a SHADOWED project's HEAD back on the commit its files already are,
@@ -12494,7 +12497,7 @@ values come from the user's config):
                               while the repo can answer it (branch '' or a
                               bare '(detached)', or an empty remote while
                               origin is set). 'mc go' only -- the marker is
-                              a tracked file, so 'st' stays read-only. A
+                              a tracked file, and 'st' never writes one. A
                               field that HAS a value is never overwritten.
   PULL_FETCH_JOBS             How many repos 'pull' fetches at once (8).
                               Only the fetch is parallel; the report stays

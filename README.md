@@ -253,6 +253,8 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `unshadow`      | `unsh`         | single-repo (or `-i`/PATH-scoped) | Reverse of `shadow`: parent stops tracking the files (`git rm --cached` + commit); the live `.git` is left untouched |
 | `purge`         | —              | single PATH | Remove a path's content **and its entire history** from a repo — the only command that rewrites history. Resolves the repo by searching enclosing repos' **history** (not their index), `--from` to disambiguate; refuses unless the path is a repo in its own right; backs up `.git`, then demands you type `I am sure` |
 | `audit`         |                | always    | Read-only health checks: `--sidecar` (sidecar setup) |
+| `rehydrate`     |                | whole tree | Give a shadowed project its `.git` back on a machine that has only the container's files — clones from the remote the marker records, `--no-checkout` so the files on disk win, then puts HEAD on the commit those files actually are. Also repairs a project sitting on the wrong branch, remote or commit |
+| `stamp-version` |                | single-repo | Record the current commit in `SCRIPT_COMMIT` and amend it, so `--version` identifies the exact build (see [Version and builds](#version-and-builds)) |
 | `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
@@ -359,6 +361,43 @@ destructive ones stand alone. That asymmetry is the signal.
 delete and requires you to type **`I am sure`** — nothing else proceeds. There
 is deliberately no "merge but discard the history" flag; typing one points you
 here.
+
+### `rehydrate` — a clone of the container is not yet a set of repos
+
+Cloning the container gives you every project's **files**, because the
+container tracks them. It does not give you their `.git` directories: those
+never travel, so a fresh machine has the content and no history, and no way
+to push a project back to its own remote.
+
+`rehydrate` closes that gap, using the `.git.shadow.status` marker each
+shadowed project carries:
+
+```sh
+git clone <container-url> src && cd src
+my-git rehydrate          # what would be restored
+my-git rehydrate go       # do it
+```
+
+For each project it clones from the remote the marker records, with
+`--no-checkout` — **the files already on disk win**; only the history is
+attached underneath them. Then it puts HEAD on the commit those files
+actually are, so the restored repo reads CLEAN under plain `git` instead of
+showing an entire upstream's worth of phantom changes.
+
+It repairs, not just restores. A project that already has a `.git` but sits
+on the wrong branch or points at the wrong remote is put back on what the
+marker records; one at the wrong commit is reset onto the commit its files
+are. No working file is written in either case. A project whose files match
+no commit is named and left alone — that is local work, or a state no remote
+has.
+
+A project whose marker records no remote was local-only and cannot be
+cloned; if it was merged rather than shadowed, its history is inside the
+container (see [`unflatten --merge`](#unflatten--rebuild-a-live-git)).
+
+Day to day you rarely need it: `pull go` realigns a lagging HEAD on its own,
+and so does `st`. `rehydrate` is for the case only it can fix — a project
+with no `.git` at all.
 
 ### Why recursion is opt-in for `mc` and `sm`
 
