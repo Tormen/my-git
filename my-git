@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.7
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="00adbbf"
+SCRIPT_COMMIT="bbfbe4a"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -22073,13 +22073,31 @@ main() {
     repair)                     cmd_repair "$@" ;;
     help)                       show_help "${1:-top}" ;;
     -h|--help)                  show_help top ;;
+    add|commit|submodule)
+      # A my-git RULE applies to these and my-git does not implement them yet,
+      # so passing them to git would quietly break it: 'add' and 'commit' skip
+      # .git.force-add-patterns (a '.local' file is then stranded on this
+      # machine) and would gitlink a new nested repo; 'submodule' bypasses
+      # 'sm' entirely. Refusing is the honest answer -- silently doing the
+      # wrong thing is worse than the error this replaced.
+      log_error "$US $_sub: not implemented yet, and plain git would break a my-git rule here."
+      case "$_sub" in
+        add|commit) printf "    > %s does not apply .git.force-add-patterns, so a '.local' file\n" "git" >&2
+                    printf "      would be left behind. Use plain: git %s ...\n" "$_sub" >&2
+                    printf "    > or commit the whole repo the my-git way:  %s mc go\n" "$US" >&2 ;;
+        submodule)  printf "    > registering nested repos is '%s sm' -- see '%s sm --help'\n" "$US" "$US" >&2
+                    printf "    > or bypass my-git deliberately:  git submodule ...\n" >&2 ;;
+      esac
+      exit 64
+      ;;
     *)
       # Anything my-git does not define is git's. Passing it through makes
       # my-git usable as the everyday front-end ('my-git log', 'my-git rebase
       # -i', 'my-git show'), and cannot collide: a verb my-git OWNS was
       # matched by one of the cases above and never reaches here. What it is
       # NOT is a git replacement -- the verbs my-git owns behave differently
-      # from git's, which is what --help is for.
+      # from git's, which is what --help is for, and the case above refuses
+      # the ones where a my-git rule applies but is not implemented yet.
       exec git "$_sub" "$@"
       ;;
   esac
