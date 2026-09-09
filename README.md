@@ -14,9 +14,10 @@ by multiple users and nested several levels deep.
   because the whole point is to see everything in one glance.
 - **`mc`** — mass add + commit + push. **Two-phase like `sm`**: `mc`
   alone analyzes (one concise line per repo, no writes); `mc go` applies
-  it. Walks the whole tree, deepest first, so child
-  commits bubble into parent gitlinks in one run. Commit message is
-  generated automatically (never opens `$EDITOR`).
+  it. Acts on **the repo you are in**, and takes no path; `-R` walks the
+  whole tree below it, deepest first, so child commits bubble into parent
+  gitlinks in one run. Commit message is generated automatically (never
+  opens `$EDITOR`).
 - **`sm`** — register / rebind / clean up nested repos as proper
   submodules. **Single level by default**; pass `-R` to walk top-down
   through every registered submodule.
@@ -239,7 +240,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | Subcommand      | Aliases        | Recursion | What it does                                                                      |
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
 | `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
-| `masscommits`   | `mc`, `c`      | whole tree  | Analyze (default) / `go` = add+commit+push, deepest first; `--sm`/`--sh` narrow |
+| `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push. THIS repo; `-R` = the tree, deepest first; `--sm`/`--sh` narrow (and imply `-R`). Takes no path |
 | `pull`          | `pl`, `fetch`  | whole tree  | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only` |
 | `push`          | `ps`           | whole tree  | Analyze (default) / `go` = publish what is ahead. Never invents an upstream, never pushes a diverged branch, skips local-only |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos as submodules; `-R` = top-down walk. A PATH registers into the repo that **directly encloses** it (its immediate parent), not the toplevel you run from |

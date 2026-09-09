@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.7
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="1bb3750"
+SCRIPT_COMMIT="00adbbf"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -4286,6 +4286,7 @@ cmd_masscommits() {
       -i|--interactive) INTERACTIVE=1; require_tty masscommits ;;
       --sm|--sub-modules|--submodules) MC_SM_ONLY=1 ;;
       --sh|--shadowed)                 MC_SH_ONLY=1 ;;
+      -R|--recursive) RECURSIVE=1 ;;
       --force)      MC_FORCE=1 ;;  # bypass per-repo my-git.ignore markers
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "masscommits: unknown option: $1" 64 ;;
@@ -4350,8 +4351,10 @@ cmd_masscommits() {
          printf -- '--sm: the SUBMODULE tree only, bottom-up (deepest committed first, so parent gitlinks can bump)'
        elif [ "$MC_SH_ONLY" = 1 ]; then
          printf -- '--sh: the SHADOWED repos only'
+       elif [ "${RECURSIVE:-0}" = 1 ]; then
+         printf -- '-R: the whole tree below, bottom-up (deepest committed first, so parent gitlinks can bump)'
        else
-         printf 'the whole tree below, bottom-up (deepest committed first, so parent gitlinks can bump)'
+         printf 'THIS repo only -- add -R to include every repo below it'
        fi)" \
     "$([ "$_mc_mode" != go ] && printf 'analyze only -- nothing is written')"
 
@@ -4369,11 +4372,18 @@ cmd_masscommits() {
       warn) log_major "$_root: [SKIPPED — cross-user policy]"
             _gated_subtree_hint "$_root"; continue ;;
     esac
-    # The whole tree, like pull and push -- committing ONE repo is what
-    # plain git already does. Deepest first, so a parent's gitlink can bump
-    # to a child that was just committed.
-    _nodes=$(select_tree_nodes "$_root" "$MC_SM_ONLY" "$MC_SH_ONLY" \
-             | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}')
+    # THIS repo, and only this one, unless -R. "Mass" is about the many paths
+    # inside one repo; descending into nested repos is a second decision, and
+    # taking it silently is how a sibling's in-flight work got published under
+    # a message nobody wrote. --sm/--sh are tree SELECTIONS, so they imply it.
+    # With -R: deepest first, so a parent's gitlink can bump to a child that
+    # was just committed.
+    if [ "${RECURSIVE:-0}" = 1 ] || [ "$MC_SM_ONLY" = 1 ] || [ "$MC_SH_ONLY" = 1 ]; then
+      _nodes=$(select_tree_nodes "$_root" "$MC_SM_ONLY" "$MC_SH_ONLY" \
+               | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}')
+    else
+      _nodes=$_root
+    fi
     # File-redirected while keeps this in the parent shell so an abort
     # signal from commit_one (via return 77) actually propagates.
     _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
@@ -4723,6 +4733,9 @@ cmd_push() {
       --sh|--shadowed)                 PS_SH_ONLY=1 ;;
       --force)      PS_FORCE=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      # Accepted and inert: push is tree-wide already. "sync -R" passes -R to
+      # every phase, and rejecting it here broke sync -R outright.
+      -R|--recursive) RECURSIVE=1 ;;
       -*)           fatal "push: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
     esac
@@ -5176,6 +5189,9 @@ cmd_pull() {
       --force)          PL_FORCE=1 ;;
       --fetch-only)     PL_FETCH_ONLY=1 ;;
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
+      # Accepted and inert: pull is tree-wide already. "sync -R" passes -R to
+      # every phase, and rejecting it here broke sync -R outright.
+      -R|--recursive) RECURSIVE=1 ;;
       -*)           fatal "pull: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
     esac
@@ -11405,16 +11421,20 @@ show_help_masscommits() {
   cat <<EOF
 my-git masscommits  (aliases: mc, c)
 
-usage: $US [-V|-D] mc [go] [-i|--interactive] [--sm|--sh] [paths...]
+usage: $US [-V|-D] mc [go] [-R] [-i|--interactive] [--sm|--sh]
 
 WHICH REPO does this touch?
   READS/WRITES   EVERY repo in scope — this is the one command that writes to
                  many repos in a single run.
   COMMITS TO     each repo's OWN .git, and pushes to each repo's OWN remote.
                  No shared or parent repo receives anything on their behalf.
-  SCOPE          single level by default (the named repo(s) only); -R walks
-                 every nested repo bottom-up, so a parent's gitlink can bump
-                 to a child that was just committed.
+  SCOPE          THE REPO YOU ARE IN, and only that one. -R walks every
+                 nested repo below it, bottom-up, so a parent's gitlink can
+                 bump to a child that was just committed. --sm/--sh select a
+                 tree and so imply -R.
+  NO PATHS       mc takes none: it is the repo you stand in. To commit one
+                 other repo, cd there; to commit some FILES, use plain git --
+                 mc writes its own message and would take everything dirty.
   A run prints ' >>> mc: TARGET REPO <paths>' before doing anything.
 
 Modes (two-phase, same pattern as 'sm'):
@@ -13065,6 +13085,25 @@ _ignore_apply() {
 
 cmd_ignore()   { _ignore_apply ignore "$@"; }
 cmd_unignore() { _ignore_apply unignore "$@"; }
+
+# mc is MASSCOMMIT: it acts on the repo you are standing in, and with -R on
+# every repo below it. A path reads as "commit just this", which it never
+# meant -- [paths...] named whole REPOS, so a plain folder was an error and a
+# repo path swept everything dirty inside it. Refuse at the CLI and name the
+# tool that does what was wanted. cmd_sync still passes a root INTERNALLY.
+_mc_reject_paths() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      go|-*) ;;
+      *) log_error "mc takes no path: it commits the repo you are in, and with -R every repo below it."
+         printf "    > that one repo:  cd %s && %s mc go\n" "$1" "$US" >&2
+         printf "    > only some files:  git add -- <paths> && git commit -m '...'\n" >&2
+         printf "      (mc writes its own commit message -- plain git keeps yours)\n" >&2
+         exit 64 ;;
+    esac
+    shift
+  done
+}
 
 _sm_safe_git() {
   _repo=$1; shift
@@ -18200,7 +18239,7 @@ _RT_STALE_CONF_EOF
       || { _rt_fail "the setup did not leave proj dirty"; return 1; }
     _rt_ok "the child reads DIRTY, as the second machine saw it" true || return 1
 
-    _rt_ok "mc go" _rt_my_git mc go || return 1
+    _rt_ok "mc go" _rt_my_git mc -R go || return 1
     _rt_contains "says the files came from the mirror" "$_rt_out" "came from the mirror" || return 1
     _rt_contains "points at rehydrate, not a commit" "$_rt_out" "rehydrate go" || return 1
     [ "$(git -C proj rev-parse HEAD)" = "$_rt_before" ] \
@@ -18211,7 +18250,7 @@ _RT_STALE_CONF_EOF
     # mirror too, so the container has it pending and the guard stays out of
     # the way.
     printf 'my own work\n' >> proj/a.md
-    _rt_ok "mc go with a genuine edit" _rt_my_git mc go || return 1
+    _rt_ok "mc go with a genuine edit" _rt_my_git mc -R go || return 1
     [ "$(git -C proj rev-parse HEAD)" = "$_rt_before" ] \
       && { _rt_fail "the guard swallowed a real local edit"; return 1; }
     _rt_ok "a real edit still commits" true || return 1
@@ -18232,8 +18271,12 @@ _RT_STALE_CONF_EOF
     _rt_ok "pull analyze" _rt_my_git pull || return 1
     # container + p1 + p2 = 3. Nothing here is a submodule.
     _rt_contains "walks every live repo, not just submodules" "$_rt_out" "total=3" || return 1
+    # mc reaches the same tree, but only when ASKED: without -R it is the
+    # repo you stand in, so that a nested repo is never swept in silently.
     _rt_ok "mc analyze" _rt_my_git mc || return 1
-    _rt_contains "mc walks the same tree" "$_rt_out" "total=3" || return 1
+    _rt_contains "mc alone is this repo only" "$_rt_out" "total=1" || return 1
+    _rt_ok "mc -R analyze" _rt_my_git mc -R || return 1
+    _rt_contains "mc -R walks the same tree as pull" "$_rt_out" "total=3" || return 1
     # --sm narrows back to git's own nesting, which here is just the root.
     _rt_ok "pull --sm" _rt_my_git pull --sm || return 1
     _rt_contains "--sm is the submodule tree only" "$_rt_out" "total=1" || return 1
@@ -21773,11 +21816,79 @@ PYDRV
     return 0
   }
 
+  _rt_mc_nest() {   # a parent repo with one registered submodule, both dirty
+    _rt_repo kid_o
+    ( cd kid_o && echo v1 > k.txt && git add -A && git commit -q -m one )
+    _rt_repo parent
+    ( cd parent && git submodule add -q ../kid_o kid >/dev/null 2>&1 && git commit -q -m addkid )
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd parent || return 1
+    echo mine > p.txt; echo theirs > kid/k.txt
+    return 0
+  }
+
+  test_mc_commits_only_the_repo_you_are_in() {
+    # "Mass" is about the many paths inside ONE repo. Descending into nested
+    # repos as well is a second decision, and mc used to take it silently --
+    # which published a sibling's in-flight work under a generated message.
+    # mc's own --help promised single-level all along; the code did not.
+    _rt_mc_nest || return 1
+    _rt_ok "mc go" _rt_my_git mc go || return 1
+    [ -n "$(git -C kid status --porcelain)" ] \
+      || { _rt_fail "mc entered the nested repo without -R"; return 1; }
+    [ -z "$(git status --porcelain -- p.txt)" ] \
+      || { _rt_fail "mc did not commit the repo it was actually run in"; return 1; }
+    return 0
+  }
+
+  test_mc_R_walks_the_nested_repos() {
+    # ...and -R must still do the thing it always documented.
+    _rt_mc_nest || return 1
+    _rt_ok "mc -R go" _rt_my_git mc -R go || return 1
+    [ -z "$(git -C kid status --porcelain)" ] \
+      || { _rt_fail "-R did not reach the nested repo"; return 1; }
+    return 0
+  }
+
+  test_mc_refuses_a_path_and_names_the_alternative() {
+    # A path read as "commit just this", which mc never meant: [paths...]
+    # named whole REPOS, so a plain folder errored and a repo path swept
+    # everything dirty in it. Refuse, and say what does do the job.
+    _rt_repo solo
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd solo || return 1
+    mkdir -p sub && echo x > sub/f.txt
+    if _rt_my_git mc go sub > "$_rt_out" 2>&1; then
+      _rt_fail "mc accepted a path"; return 1
+    fi
+    _rt_contains "says it takes no path" "$_rt_out" "mc takes no path" || return 1
+    _rt_contains "and points at plain git" "$_rt_out" "git add --" || return 1
+    [ -z "$(git log --oneline --grep=MASSCOMMIT 2>/dev/null)" ] \
+      || { _rt_fail "it committed anyway"; return 1; }
+    return 0
+  }
+
+  test_an_unknown_subcommand_passes_through_to_git() {
+    # Anything my-git does not define is git's, so my-git can be the everyday
+    # front-end. A verb my-git OWNS is matched earlier and never gets here.
+    _rt_repo pt
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd pt || return 1
+    echo x > f.txt && git add -A && git commit -q -m "a passthrough marker"
+    _rt_ok "my-git log reaches git" _rt_my_git log --oneline -n 1 || return 1
+    _rt_contains "git ran it" "$_rt_out" "a passthrough marker" || return 1
+    # a verb git does not have either must fail as GIT, not as my-git
+    _rt_my_git definitely-not-a-verb > "$_rt_out" 2>&1
+    _rt_contains "an unknown verb is git's to reject" "$_rt_out" "not a git command" || return 1
+    _rt_not_contains "my-git no longer claims it" "$_rt_out" "unknown subcommand" || return 1
+    return 0
+  }
+
   _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_the_real_index_behind test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner"
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_the_real_index_behind test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
@@ -21936,10 +22047,10 @@ main() {
   _init_raoc_errfile
   case "$_sub" in
     status|st|s)                cmd_status "$@" ;;
-    masscommits|mc|c)           cmd_masscommits "$@" ;;
+    masscommits|mc|c)           _mc_reject_paths "$@"; cmd_masscommits "$@" ;;
     go)
       # Back-compat: 'my-git go' = 'my-git mc go' (action).
-      cmd_masscommits go "$@" ;;
+      _mc_reject_paths "$@"; cmd_masscommits go "$@" ;;
     pull|pl)                    cmd_pull "$@" ;;
     push|ps)                    cmd_push "$@" ;;
     pp)                         cmd_pullpush "$@" ;;
@@ -21963,10 +22074,13 @@ main() {
     help)                       show_help "${1:-top}" ;;
     -h|--help)                  show_help top ;;
     *)
-      log_error "unknown subcommand: $_sub"
-      echo >&2
-      show_help_top >&2
-      exit 64
+      # Anything my-git does not define is git's. Passing it through makes
+      # my-git usable as the everyday front-end ('my-git log', 'my-git rebase
+      # -i', 'my-git show'), and cannot collide: a verb my-git OWNS was
+      # matched by one of the cases above and never reaches here. What it is
+      # NOT is a git replacement -- the verbs my-git owns behave differently
+      # from git's, which is what --help is for.
+      exec git "$_sub" "$@"
       ;;
   esac
 }
