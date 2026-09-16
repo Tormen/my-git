@@ -48,8 +48,8 @@ by multiple users and nested several levels deep.
 - **`ignore` / `unignore`** — toggle a generic "leave this nested repo alone"
   marker (`.git/my-git.ignore`) honoured by every subcommand.
 
-The verbs that **write** — `mc`, `commit`, `pull`, `push`, `pp`, `sync`,
-`sm` — act on **the repo you are in**. Reaching into the repos below it is a
+The verbs that **write** — `mc`, `commit`, `add`, `pull`, `push`, `pp`,
+`sync`, `sm` — act on **the repo you are in** (`add` only ever on its index). Reaching into the repos below it is a
 second decision, and `-R` is how you make it: `pull` rewrites worktrees,
 `push` publishes and `mc` commits, and doing any of that to a nested repo
 nobody named is how a sibling's in-flight work gets merged into or
@@ -143,13 +143,17 @@ Concrete examples on this machine:
 
 A verb my-git does not define is passed straight through, so `my-git log`,
 `my-git rebase -i`, `my-git show` all work and my-git can be the everyday
-front-end. Two exceptions, because plain git would silently break a my-git
-rule:
+front-end. Where plain git would silently break a my-git rule, my-git either
+does the verb itself or stops it:
 
-**Refused outright** — `add` and `submodule`. `git add` does not apply
+**my-git's own** — `add` and `commit`. `git add` does not apply
 `.git.force-add-patterns`, so a `.local` file the container carries would be
-stranded on this machine; use `my-git commit go -m "..."`. `submodule`
-bypasses `sm`.
+stranded on this machine, and `git add .` swallows a new nested repo as a
+gitlink. `my-git add go <paths>` stages with both rules applied (analyze
+first, like every verb that writes); plain `git commit` then commits exactly
+that index. `my-git commit go -m "..."` is `mc` with your message.
+
+**Refused outright** — `submodule`, which bypasses `sm`.
 
 **Guarded** — `clean`, `stash`, `rm`, `mv` are passed through *unless* the
 operation would actually break something: `clean -x/-X` and `stash -u/-a`
@@ -280,6 +284,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
 | `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
 | `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push. THIS repo; `-R` = the tree, deepest first; `--sm`/`--sh` narrow (and imply `-R`). Takes no path |
+| `add`           |                | this repo   | Stage PATHS with the force-add patterns and the new-nested-repo gate applied; analyze by default, `go` to stage. Never commits: follow with plain `git commit` |
 | `commit`        |                | opt-in `-R` | `mc` with YOUR message: same rules, same two phases, but the words are yours. `mc go` generates a message; `commit go -m "..."` does not |
 | `branch`        | `br`           | tree-wide   | Read-only: which branch every repo is on — what plain `git branch` cannot answer. Writes are refused |
 | `pull`          | `pl`, `fetch`  | opt-in `-R` | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only`. THIS repo; `-R` = the tree, parents first; `--sm`/`--sh` narrow (and imply `-R`) |
