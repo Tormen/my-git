@@ -48,14 +48,17 @@ by multiple users and nested several levels deep.
 - **`ignore` / `unignore`** — toggle a generic "leave this nested repo alone"
   marker (`.git/my-git.ignore`) honoured by every subcommand.
 
-`st`, `pull`, `push` and `mc` all act on the same thing: **every live
-repo at or below the scope root**. Acting on one repo is what plain `git`
-already does — my-git exists for the multitude, so the multitude is the
-default. Narrow it with `--sm` (the submodule tree only, git's own idea of
-nesting) or `--sh` (only the shadowed repos).
+The verbs that **write** — `mc`, `commit`, `pull`, `push`, `pp`, `sync`,
+`sm` — act on **the repo you are in**. Reaching into the repos below it is a
+second decision, and `-R` is how you make it: `pull` rewrites worktrees,
+`push` publishes and `mc` commits, and doing any of that to a nested repo
+nobody named is how a sibling's in-flight work gets merged into or
+published. `--sm` (the submodule tree only, git's own idea of nesting) and
+`--sh` (only the shadowed repos) select a tree, so they imply `-R`. A
+repo-scoped `pull`/`push` summary says `scope: this repo only`.
 
-`sm` is the exception: it stays single-level with `-R`, because
-registration is a statement about one repo's `.gitmodules`.
+The **read-only** overviews — `st`, `remote`, `branch` — always cover every
+live repo at or below the scope root: overview is their job.
 
 ## The layout this was built for
 
@@ -165,7 +168,10 @@ was found, and a guard that fires on the wrong runs is worse than none.
 
 Two axes, one flag each. A command that is always recursive (`status`,
 `remote`, `branch`) refuses `-R` and names `-RR`, rather than accepting a
-flag that changes nothing.
+flag that changes nothing. `audit` and `repair` refuse both: their sidecar
+search walks the whole subtree in any scope, so neither flag has anything
+to switch on. `sm` recurses on `-R` in either position (`sm -R` or
+`my-git -R sm`) and on `-RR`.
 
 ## Install
 
@@ -243,19 +249,21 @@ config file.
 my-git st                      # recursive OVERVIEW of current tree (CWD-aware)
 my-git st /LINKS/global        # recursive overview of a specific super-repo tree
 my-git mc                      # analyze: one line per repo, shows what 'mc go' WOULD do
-my-git mc go                   # apply: commit+push every live repo in the tree (deepest first)
+my-git mc go                   # apply: commit+push THIS repo
+my-git mc -R go                # ...and every live repo below it (deepest first)
 my-git mc go --sm              # ...only the submodule tree
-my-git push                    # analyze: what is ahead, and where it would go
+my-git push                    # analyze: what is ahead in this repo, and where it would go
+my-git push -R go              # publish this repo and every repo below it
 my-git push go --sh            # publish the shadowed projects
-my-git pull                    # analyze: fetch + report who's behind (no merge)
-my-git pull go                 # fetch + merge everywhere (ff when it can)
-my-git fetch                   # refs-only update across the tree (never merges)
+my-git pull                    # analyze: fetch + report whether this repo is behind (no merge)
+my-git pull -R go              # fetch + merge this repo and every repo below (ff when it can)
+my-git fetch -R                # refs-only update across the tree (never merges)
 my-git sm                      # analyze nested unregistered repos (THIS level)
 my-git sm go                   # register them (THIS level only)
 my-git sm -R go                # register everything, walking the whole tree top-down
 my-git sm --clean-stale        # ONLY remove stale registrations, anywhere in the tree
 my-git sync go -R              # one-shot: sm → pull → mc across the tree
-my-git remote --check -R       # audit remotes (⚠ on suspicious URLs)
+my-git remote --check          # audit remotes across the tree (⚠ on suspicious URLs)
 my-git flatten                 # analyze: nested repos this would merge as content (THIS repo)
 my-git flatten go --merge       # apply one of the 3 modes (--merge/--sidecar/--zip)
 my-git flatten go -i              # per-item: choose skip/sidecar/merge/delete for each nested repo
@@ -274,13 +282,14 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push. THIS repo; `-R` = the tree, deepest first; `--sm`/`--sh` narrow (and imply `-R`). Takes no path |
 | `commit`        |                | opt-in `-R` | `mc` with YOUR message: same rules, same two phases, but the words are yours. `mc go` generates a message; `commit go -m "..."` does not |
 | `branch`        | `br`           | tree-wide   | Read-only: which branch every repo is on — what plain `git branch` cannot answer. Writes are refused |
-| `pull`          | `pl`, `fetch`  | whole tree  | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only` |
-| `push`          | `ps`           | whole tree  | Analyze (default) / `go` = publish what is ahead. Never invents an upstream, never pushes a diverged branch, skips local-only |
+| `pull`          | `pl`, `fetch`  | opt-in `-R` | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only`. THIS repo; `-R` = the tree, parents first; `--sm`/`--sh` narrow (and imply `-R`) |
+| `push`          | `ps`           | opt-in `-R` | Analyze (default) / `go` = publish what is ahead. Never invents an upstream, never pushes a diverged branch, skips local-only. THIS repo; `-R` = the tree |
+| `pp`            |                | opt-in `-R` | `pull` then `push`, in that order — the `gpp` alias. Both halves take the same flags |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos as submodules; `-R` = top-down walk. A PATH registers into the repo that **directly encloses** it (its immediate parent), not the toplevel you run from |
 | `unsm`          | `unsub`        | whole-tree | Reverse of `sm`: de-register a submodule back to a `raw-nested-git` — drops `.gitmodules`+gitlink, **de-absorbs** its gitdir (`.git/modules/<name>` → `<path>/.git`); the repo stays live, history intact |
 | `ignore` / `unignore` | —        | whole-tree (`unignore`); PATH (`ignore`) | Toggle the **generic** `.git/my-git.ignore` marker — honoured by every subcommand (`st` won't descend, `sm` won't register, `mc` won't commit, `flatten` won't touch) |
-| `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`. Settles the whole tree in one command.         |
-| `remote`        | `rem`          | opt-in `-R` | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
+| `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`, each phase scoped like the verb itself — this repo, or with `-R` the whole tree in one command |
+| `remote`        | `rem`          | tree-wide   | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
 | `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir, all history-preserving: `--merge` (history moves into the parent, `refs/my-git/merged/<path>/`), `--sidecar` (`.git.real`), `--zip` (`.git.zip`/`.git.real.zip`); `--rm-git` is the one destructive option and demands typing `I am sure`; `-i`/PATH for per-item or forced-mode control |
 | `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip`/`--merge` all exact (merge restores the preserved history, branches and tags); falls back to best-effort `git subtree split` only for snapshots written before preservation existed; auto-detects the mode per path |
 | `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
@@ -314,7 +323,7 @@ repo that will receive the result:
 |---|---|---|---|
 | `st` | toplevel + every nested repo | **nothing — read-only** | — |
 | `mc` | **every repo in scope** | each repo's **own** `.git`, pushes to its **own** remote | — |
-| `pull` / `fetch` | every repo in scope | each repo's own `.git` | — |
+| `pull` / `fetch` / `push` | the repo you are in; with `-R` every repo below it | each repo's own `.git` | — |
 | `sm` | the repo **directly enclosing** the PATH — *not* the toplevel you ran from, *not* the root repo | that same enclosing repo | nested gitdir is **absorbed** into `<enclosing>/.git/modules/<name>/` |
 | `unsm` | same enclosing repo `sm` used | that same enclosing repo | gitdir **de-absorbed** back to `<path>/.git` |
 | `flatten` | the toplevel (auto-jumps there from a subdir) | the toplevel's `.git` | each nested `.git`: relocated (`--sidecar`), moved into the toplevel (`--merge`), archived (`--zip`), or **deleted** (`--rm-git`) |
@@ -443,10 +452,10 @@ dirty files — is that submodule's concern, not the super's.
 `sm` follows that model: single level, with `-R` for a top-down walk so
 parent rebinds settle before children see them.
 
-`mc`, `pull` and `push` do not, because the question they answer is not
-"what does this index record" but "what is the state of everything I work
-on". `mc` runs deepest-first, so a parent's gitlink lands on a child
-commit made in the same run.
+`mc`, `pull` and `push` follow it too: the repo you are in, and `-R` for
+the tree below. With `-R`, `mc` runs deepest-first, so a parent's gitlink
+lands on a child commit made in the same run; `pull` and `push` run parents
+first.
 
 `st` is always recursive because overview IS its job — a multi-level
 tree seen at a glance, no walking required.
@@ -1153,17 +1162,18 @@ my-git mc
 # Apply for the CURRENT repo only:
 my-git mc go
 
-# Preview what mc -R would do for the whole tree (no writes, bottom-up):
-my-git mc -R /LINKS/global
+# Preview what mc -R would do for the whole tree (no writes, bottom-up).
+# mc takes no path: it is the repo you stand in.
+cd /LINKS/global && my-git mc -R
 
 # Apply bottom-up across the whole tree:
-my-git mc go -R /LINKS/global
+cd /LINKS/global && my-git mc go -R
 
 # Register everything (THIS repo only) + show what it did verbosely:
 my-git -V sm go
 
 # Register everything across the whole tree, top-down, verbose:
-my-git -V sm -R go /LINKS/global
+cd /LINKS/global && my-git -V sm -R go
 
 # See every subprocess my-git runs (grey '$ cmd' trace to stderr):
 my-git -V mc go
