@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.7
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="970eb5d"
+SCRIPT_COMMIT="9a9a962"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -10349,14 +10349,30 @@ cmd_stamp_version() {
     fi
   fi
 
-  # Anything else dirty would be folded into someone else's commit by the
-  # amend below. Refuse rather than quietly widen a release commit.
-  _sv_other=$(git -c safe.directory='*' -C "$_sv_top" status --porcelain 2>/dev/null \
-                | awk -v f="$_sv_rel" '{ p = substr($0, 4); if (p != f) print p }')
+  # An amend of a published commit rewrites history, and the next push is
+  # rejected. The idempotency test above cannot notice: the stamp lags HEAD
+  # by one amend, so it never equals HEAD and would walk the commit forward
+  # for ever.
+  if git -c safe.directory='*' -C "$_sv_top" rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 \
+     && git -c safe.directory='*' -C "$_sv_top" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+    fatal "stamp-version: HEAD $_sv_sha is already pushed -- amending it would rewrite published history. Stamp BEFORE pushing: commit, stamp-version go, push" 1
+  fi
+
+  # The amend commits the INDEX, so what it would fold in is exactly what is
+  # STAGED -- plus uncommitted edits to this script, which the stamp stages.
+  # Unstaged work elsewhere is not touched by it and must not block a release
+  # (a README open in an editor used to).
+  _sv_other=$(git -c safe.directory='*' -C "$_sv_top" diff --cached --name-only 2>/dev/null \
+                | awk -v f="$_sv_rel" '$0 != f')
   if [ -n "$_sv_other" ]; then
-    log_error "stamp-version: other files are dirty -- the amend would fold them into the release commit:"
+    log_error "stamp-version: other files are STAGED -- the amend would fold them into the release commit:"
     printf '%s\n' "$_sv_other" | sed 's/^/    > /' >&2
-    fatal "stamp-version: commit, stash or revert them first" 1
+    fatal "stamp-version: commit or unstage them first" 1
+  fi
+  _sv_head=$(git -c safe.directory='*' -C "$_sv_top" show "HEAD:$_sv_rel" 2>/dev/null \
+               | sed 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=/')
+  if [ "$_sv_head" != "$(sed 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=/' "$_sv_self" 2>/dev/null)" ]; then
+    fatal "stamp-version: $_sv_rel has uncommitted edits -- the amend would release them unreviewed. Commit them first" 1
   fi
 
   log_major "$_sv_rel: stamp SCRIPT_COMMIT=$_sv_sha (currently ${SCRIPT_COMMIT:-<unstamped>}), then amend $(git -c safe.directory='*' -C "$_sv_top" log -1 --format='%h %s' 2>/dev/null)"
@@ -12867,8 +12883,11 @@ THE OFF-BY-ONE: amending changes the commit's sha, so the sha written into
 the file is the one HEAD had BEFORE the amend. That is unavoidable -- a
 commit cannot contain its own sha -- and is not something to "fix".
 
-REFUSES when any OTHER file in the repo is dirty: the amend would fold that
-work into someone else's commit. Idempotent: when the stamp on disk is
+REFUSES when another file is STAGED or the script has uncommitted edits: the
+amend commits the index and would fold that work into the release. Unstaged
+work elsewhere is left alone and does not block. REFUSES when HEAD is already
+pushed: amending it would rewrite published history, so stamp BEFORE pushing.
+Idempotent: when the stamp on disk is
 already the stamp in HEAD there is nothing to do. The file is rewritten via
 a temp file and renamed into place (mode preserved) -- it is the very file
 this process is executing, and only a rename leaves the running copy intact.
@@ -19377,20 +19396,47 @@ _RT_STALE_CONF_EOF
     git -C proj config user.email t@t 2>/dev/null
     ( cd proj && git add mg other.txt && git commit -qm "release" ) >/dev/null 2>&1
 
+    # STAGED work elsewhere is what the amend would fold in: refused.
     printf 'edited\n' >> proj/other.txt
+    git -C proj add other.txt 2>/dev/null
     _rt_stamp0=$(sed -n 's/^SCRIPT_COMMIT=//p' proj/mg | head -n 1)
     if ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
          > "$_rt_out" 2> "$_rt_err"; then
-      _rt_fail "stamped anyway, with other.txt dirty"
+      _rt_fail "stamped anyway, with other.txt staged"
       return 1
     fi
-    _rt_contains "says which file stopped it" "$_rt_err" "other files are dirty" || return 1
+    _rt_contains "says which file stopped it" "$_rt_err" "other files are STAGED" || return 1
     [ "$(sed -n 's/^SCRIPT_COMMIT=//p' proj/mg | head -n 1)" = "$_rt_stamp0" ] \
       || { _rt_fail "rewrote the stamp even though it refused"; return 1; }
+
+    # Uncommitted edits to the script itself would be released unreviewed.
+    git -C proj reset -q -- other.txt 2>/dev/null
+    printf '# stray edit\n' >> proj/mg
+    if ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
+         > "$_rt_out" 2> "$_rt_err"; then
+      _rt_fail "stamped anyway, with the script itself edited"
+      return 1
+    fi
+    _rt_contains "names the script's own edits" "$_rt_err" "has uncommitted edits" || return 1
+    git -C proj checkout -- mg 2>/dev/null
+
+    # UNSTAGED work elsewhere is not the amend's business: it goes through,
+    # and other.txt stays modified and out of the release commit.
+    _rt_was=$(git -C proj rev-parse --short HEAD)
+    ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
+      > "$_rt_out" 2> "$_rt_err" \
+      || { _rt_fail "an unstaged edit elsewhere blocked the stamp: $(tail -c 200 "$_rt_err")"; return 1; }
+    [ "$(git -C proj status --porcelain 2>/dev/null)" = " M other.txt" ] \
+      || { _rt_fail "other.txt should still be unstaged-modified: $(git -C proj status --porcelain | tr '\n' ' ')"; return 1; }
+    git -C proj show HEAD:other.txt 2>/dev/null | grep -q edited \
+      && { _rt_fail "the unstaged edit was folded into the release commit"; return 1; }
+    _rt_ok "an unstaged edit elsewhere neither blocks nor rides along" true || return 1
 
     # Clean, and it goes through: the file carries the sha of the commit it
     # was released from, and the repo is left clean.
     git -C proj checkout -- other.txt 2>/dev/null
+    sed 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=""/' proj/mg > proj/mg.tmp && cat proj/mg.tmp > proj/mg && rm -f proj/mg.tmp
+    ( cd proj && git commit -qam "release again, unstamped" ) >/dev/null 2>&1
     _rt_was=$(git -C proj rev-parse --short HEAD)
     ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
       > "$_rt_out" 2> "$_rt_err" \
@@ -19408,6 +19454,22 @@ _RT_STALE_CONF_EOF
       > "$_rt_out" 2> "$_rt_err" \
       || { _rt_fail "second run failed: $(tail -c 200 "$_rt_err")"; return 1; }
     _rt_contains "second run is a no-op" "$_rt_out" "unchanged since it was stamped" || return 1
+
+    # A pushed HEAD is never amended: that rewrites published history.
+    git init -q --bare up.git 2>/dev/null
+    ( cd proj && git remote add origin ../up.git && git push -q -u origin HEAD ) >/dev/null 2>&1
+    printf '# next change\n' >> proj/mg
+    ( cd proj && git commit -qam "next" && git push -q ) >/dev/null 2>&1
+    _rt_pushed=$(git -C proj rev-parse HEAD)
+    if ( cd proj && MY_GIT_SELFTEST=1 ./mg --config "$_rt_conf_path" stamp-version go ) \
+         > "$_rt_out" 2> "$_rt_err"; then
+      _rt_fail "stamped a commit that is already pushed"
+      return 1
+    fi
+    _rt_contains "says it is already pushed" "$_rt_err" "already pushed" || return 1
+    [ "$(git -C proj rev-parse HEAD)" = "$_rt_pushed" ] \
+      || { _rt_fail "HEAD moved although it refused"; return 1; }
+    _rt_ok "a pushed HEAD is left alone" true || return 1
     return 0
   }
 
