@@ -366,9 +366,9 @@ AUTOHEAL_SHADOW_MARKER=1
 AUTOHEAL_PULL_REALIGN_IN_SHADOWED_REPOS=1
 # Clear an index entry that carries no information: the worktree matches
 # HEAD, yet a path is staged, so what is staged is a copy of something HEAD
-# already records. my-git's own pre-commit hook leaves exactly this behind
-# on every pathspec commit, and tidying up after a tool is not the user's
-# job.
+# already records. A pathspec commit leaves exactly this behind (the
+# post-commit hook clears it at once where it is installed; this catches the
+# rest), and tidying up after a tool is not the user's job.
 #
 # The entry lives in the CONTAINER's index (it stages its children's
 # markers), not inside the shadowed repo -- which is why this knob is named
@@ -2596,9 +2596,10 @@ wt_matches_commit() {
 #
 # The state: the worktree matches HEAD, yet a path is staged. Whatever is
 # in the index is then a copy of something HEAD already records, so
-# resetting it to HEAD loses nothing. my-git's own pre-commit hook produces
-# this on every pathspec commit; the user should never have to type
-# 'git add -A' to tidy after a tool.
+# resetting it to HEAD loses nothing. A pathspec commit produces this with
+# the pre-commit hook's marker; the post-commit hook clears it at once, and
+# this catches what it cannot reach (no hook yet, a foreign hook). The user
+# should never have to type 'git add -A' to tidy after a tool.
 #
 # SCOPED TO my-git's OWN artifacts ('.git.*' markers) on purpose. A staged
 # blob is not always worthless: 'git add foo' followed by restoring foo in
@@ -8952,16 +8953,75 @@ HOOK
   printf '%s\n' "$_SHADOW_HOOK_END"
 }
 
-# _shadow_install_hook <abs-git-dir>  — ensure the parent's pre-commit hook
-# carries the managed block. Creates it if absent; leaves ours as-is if already
-# present; refuses to touch a FOREIGN hook (warns with the manual snippet).
+# The post-commit half. 'git commit -- <paths>' hands the pre-commit hook a
+# TEMPORARY index, so the marker it rewrites reaches the commit while the REAL
+# index keeps the old copy: every scoped container commit left the marker 'MM'
+# until the next 'st' healed it -- and a plain 'git status' never does. The
+# post-commit hook runs against the real index, so it clears the leftover at
+# the moment it is made, with st's own rule (_autoheal_index_stale).
+_SHADOW_POST_HOOK_BEGIN='# >>> my-git shadow (managed block — unstages what a scoped commit leaves behind) >>>'
+_shadow_post_hook_block() {
+  printf '%s\n' "$_SHADOW_POST_HOOK_BEGIN"
+  cat <<'HOOK'
+# Managed by 'my-git shadow'. A scoped commit ('git commit -- <paths>') runs
+# pre-commit on a temporary index: the marker it rewrote is committed, but the
+# real index keeps the previous copy. Unstage such a leftover -- my-git's own
+# '.git.*' files only, and only when the file on disk is exactly what HEAD
+# records, so the staged copy carries nothing that would be lost.
+_mgp_top=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$_mgp_top" ]; then
+  git -C "$_mgp_top" diff --cached --name-only 2>/dev/null | while IFS= read -r _mgp_p; do
+    case "${_mgp_p##*/}" in .git.*) ;; *) continue ;; esac
+    _mgp_h=$(git -C "$_mgp_top" rev-parse -q --verify "HEAD:$_mgp_p" 2>/dev/null) || continue
+    [ "$(git -C "$_mgp_top" hash-object -- "$_mgp_p" 2>/dev/null)" = "$_mgp_h" ] || continue
+    git -C "$_mgp_top" reset -q HEAD -- "$_mgp_p" >/dev/null 2>&1
+  done
+fi
+HOOK
+  printf '%s\n' "$_SHADOW_HOOK_END"
+}
+
+# _shadow_install_hook <abs-git-dir> [quiet]  — ensure the parent's pre-commit
+# and post-commit hooks carry the CURRENT managed blocks.
 _shadow_install_hook() {
-  _sih_gd=$1; _sih_quiet=${2:-}
+  _shadow_install_hook_one "$1" pre-commit  "$_SHADOW_HOOK_BEGIN"      _shadow_hook_block      "${2:-}"
+  _shadow_install_hook_one "$1" post-commit "$_SHADOW_POST_HOOK_BEGIN" _shadow_post_hook_block "${2:-}"
+}
+
+# _shadow_install_hook_one <abs-git-dir> <hook> <begin> <block-fn> [quiet]
+# Creates the hook if absent. A hook that carries our block gets the block
+# REPLACED when it differs from what this my-git emits: checking only for the
+# begin marker left a July copy in place for months, so every later fix to the
+# block (stamping 'commit:', refreshing 'branch:'/url) never reached the
+# machine that had installed it first -- and a marker named a commit that no
+# longer existed. Lines outside the block are kept. A FOREIGN hook is never
+# touched.
+_shadow_install_hook_one() {
+  _sih_gd=$1; _sih_name=$2; _sih_b=$3; _sih_fn=$4; _sih_quiet=${5:-}
   [ -n "$_sih_gd" ] && [ -d "$_sih_gd" ] || return 0
-  _sih_hook="$_sih_gd/hooks/pre-commit"
+  _sih_hook="$_sih_gd/hooks/$_sih_name"
   if [ -f "$_sih_hook" ]; then
-    if grep -qF "$_SHADOW_HOOK_BEGIN" "$_sih_hook" 2>/dev/null; then
-      log_dbg_med "shadow: pre-commit hook already carries the managed block ($_sih_hook)"
+    if grep -qF "$_sih_b" "$_sih_hook" 2>/dev/null; then
+      _sih_new=$(mktemp "${TMPDIR:-/tmp}/${US}.hook.XXXXXX") || return 0
+      "$_sih_fn" > "$_sih_new"
+      if awk -v b="$_sih_b" -v e="$_SHADOW_HOOK_END" \
+           'index($0,b){f=1} f{print} f&&index($0,e){exit}' "$_sih_hook" 2>/dev/null \
+         | cmp -s - "$_sih_new"; then
+        log_dbg_med "shadow: $_sih_name hook already carries the current managed block ($_sih_hook)"
+        rm -f "$_sih_new"; return 0
+      fi
+      _sih_tmp="$_sih_hook.mgs.$$"
+      # cat > rather than mv: keeps the hook's mode.
+      if awk -v b="$_sih_b" -v e="$_SHADOW_HOOK_END" -v nf="$_sih_new" '
+           index($0,b) && !done { while ((getline l < nf) > 0) print l; skip=1; done=1; next }
+           skip { if (index($0,e)) skip=0; next }
+           { print }' "$_sih_hook" > "$_sih_tmp" 2>/dev/null \
+         && cat "$_sih_tmp" > "$_sih_hook" 2>/dev/null; then
+        log_dbg_med "shadow: refreshed the outdated managed block in $_sih_hook"
+      else
+        log_warn "shadow: could not refresh the outdated managed block in $_sih_hook"
+      fi
+      rm -f "$_sih_tmp" "$_sih_new"
       return 0
     fi
     if [ "$_sih_quiet" = quiet ]; then
@@ -8971,34 +9031,39 @@ _shadow_install_hook() {
       log_dbg_med "shadow: $_sih_hook is not managed by my-git — leaving it alone"
       return 0
     fi
-    log_warn "shadow: $_sih_hook already exists and is NOT managed by my-git — NOT modifying it. 'last-shadowed' won't auto-update on commit until you paste the managed block into it (see '$US --help shadow')."
+    log_warn "shadow: $_sih_hook already exists and is NOT managed by my-git — NOT modifying it. Paste the managed block into it by hand (see '$US --help shadow')."
     return 0
   fi
   run mkdir -p "$_sih_gd/hooks" 2>/dev/null
-  { printf '#!/bin/sh\n'; _shadow_hook_block; } > "$_sih_hook" 2>/dev/null \
+  { printf '#!/bin/sh\n'; "$_sih_fn"; } > "$_sih_hook" 2>/dev/null \
     && chmod +x "$_sih_hook" 2>/dev/null \
-    && log_dbg_med "shadow: installed pre-commit hook ($_sih_hook)" \
-    || log_warn "shadow: could not write pre-commit hook at $_sih_hook (last-shadowed won't auto-update on commit)"
+    && log_dbg_med "shadow: installed $_sih_name hook ($_sih_hook)" \
+    || log_warn "shadow: could not write $_sih_name hook at $_sih_hook"
 }
 
 # _shadow_uninstall_hook <abs-git-dir>  — remove the managed block when the last
 # shadow is gone. If the hook was ONLY our block (we created it), delete it;
 # otherwise strip just our lines and leave the rest of a foreign hook intact.
 _shadow_uninstall_hook() {
-  _suh_gd=$1
+  _shadow_uninstall_hook_one "$1" pre-commit  "$_SHADOW_HOOK_BEGIN"
+  _shadow_uninstall_hook_one "$1" post-commit "$_SHADOW_POST_HOOK_BEGIN"
+}
+
+_shadow_uninstall_hook_one() {
+  _suh_gd=$1; _suh_b=$3
   [ -n "$_suh_gd" ] && [ -d "$_suh_gd" ] || return 0
-  _suh_hook="$_suh_gd/hooks/pre-commit"
+  _suh_hook="$_suh_gd/hooks/$2"
   [ -f "$_suh_hook" ] || return 0
-  grep -qF "$_SHADOW_HOOK_BEGIN" "$_suh_hook" 2>/dev/null || return 0
+  grep -qF "$_suh_b" "$_suh_hook" 2>/dev/null || return 0
   # Strip our block (from BEGIN to END inclusive).
   _suh_tmp="$_suh_hook.mgs.$$"
-  awk -v b="$_SHADOW_HOOK_BEGIN" -v e="$_SHADOW_HOOK_END" '
+  awk -v b="$_suh_b" -v e="$_SHADOW_HOOK_END" '
     index($0,b){skip=1} skip{ if(index($0,e))skip=0; next } {print}' \
     "$_suh_hook" > "$_suh_tmp" 2>/dev/null || { rm -f "$_suh_tmp"; return 0; }
   # If what remains is just a shebang + blank lines, remove the file entirely.
   if [ -z "$(grep -vE '^#!|^[[:space:]]*$' "$_suh_tmp" 2>/dev/null | head -1)" ]; then
     rm -f "$_suh_hook" "$_suh_tmp" 2>/dev/null
-    log_dbg_med "shadow: removed now-empty pre-commit hook ($_suh_hook)"
+    log_dbg_med "shadow: removed now-empty $2 hook ($_suh_hook)"
   else
     cat "$_suh_tmp" > "$_suh_hook" 2>/dev/null; rm -f "$_suh_tmp" 2>/dev/null
     log_dbg_med "shadow: stripped the managed block from $_suh_hook (left the rest)"
@@ -9402,7 +9467,9 @@ _shadow_one() {
   # keeps .venv and node_modules out of the mirror. The files the child
   # hides from GitHub but wants on every machine are the exception, and
   # they are named explicitly in the container's force-add pattern file.
-  container_force_add "$PWD" 1 || true
+  # Scoped to THIS repo: a tree-wide sweep staged other projects' ignored
+  # files, and the scoped commit that follows then left them staged.
+  container_force_add "$PWD" 1 "$_sho_p" || true
   return $_sho_rc
 }
 
@@ -11015,7 +11082,8 @@ _sum_file_sizes() {
   printf '%s' "$_sfs_n"
 }
 
-# container_force_add <repo> <apply 0|1>
+# container_force_add <repo> <apply 0|1> [path]
+# With [path] (relative to <repo>) only files below it are considered.
 # Force-add, into <repo>'s index, every ignored file matching a configured
 # pattern. It REPORTS through the log and returns nothing: an earlier version
 # printed the count on stdout, so both call sites redirected stdout to discard
@@ -11029,7 +11097,7 @@ _sum_file_sizes() {
 # files) reached this container that way once. Only paths that ALREADY
 # matched a configured pattern are ever named.
 container_force_add() {
-  _cfa_r=$1; _cfa_apply=${2:-0}
+  _cfa_r=$1; _cfa_apply=${2:-0}; _cfa_scope=${3:-.}
   _cfa_pats=$(_force_add_patterns "$_cfa_r") || return 0
   [ -n "$_cfa_pats" ] || return 0
   _cfa_all=$(mktemp "${TMPDIR:-/tmp}/${US}.fapall.XXXXXX" 2>/dev/null) || return 0
@@ -11041,7 +11109,7 @@ container_force_add() {
   # absent from it and need no forcing: an ignore rule has no say over a
   # path that is already in the index, so one forced add per file is all
   # this ever costs.
-  run_as_owner_capture "$_cfa_r" git ls-files -o -i --exclude-standard \
+  run_as_owner_capture "$_cfa_r" git ls-files -o -i --exclude-standard -- "$_cfa_scope" \
     > "$_cfa_all" 2>/dev/null || { rm -f "$_cfa_all" "$_cfa_hit"; return 0; }
   while IFS= read -r _cfa_f; do
     [ -n "$_cfa_f" ] || continue
@@ -12121,6 +12189,16 @@ The pre-commit hook:
   clobbers a pre-existing foreign pre-commit hook (it warns instead, and you
   can paste the managed block in by hand). 'unshadow' removes the block when
   the last shadow under the parent is gone (deleting the hook if it was ours).
+
+The post-commit hook:
+  A second managed block, in <parent-git-dir>/hooks/post-commit. A scoped
+  commit ('git commit -- <paths>') runs pre-commit on a TEMPORARY index, so
+  the marker reaches the commit while the real index keeps the old copy. The
+  post-commit block unstages that leftover -- my-git's '.git.*' files only,
+  and only when the file on disk is what HEAD records.
+
+Both blocks are re-derived by 'st': a missing hook is installed, an outdated
+block is replaced (lines outside it are kept), a foreign hook is left alone.
 
 Targets:
   <path>       shadow (or re-shadow, refreshing last-shadowed) that one repo.
@@ -18763,19 +18841,14 @@ _RT_STALE_CONF_EOF
     return 0
   }
 
-  test_pathspec_commit_leaves_the_real_index_behind() {
-    # WHY the index healer exists -- and it is not a my-git bug.
-    #
+  test_pathspec_commit_leaves_no_stale_marker_staged() {
     # 'git commit -- <paths>' builds a temporary index from HEAD plus the
     # named paths and never updates the REAL one. The shadow pre-commit
     # hook is handed that temp index (git sets GIT_INDEX_FILE), so its
-    # rewritten marker IS committed correctly. What is left behind is the
-    # real index, still holding the pre-commit value: HEAD and the worktree
-    # both moved, the index did not, and git reports 'MM'.
-    #
-    # Pinned as a test so that if git's partial-commit semantics ever
-    # change, we find out here rather than by the healer quietly becoming
-    # dead code.
+    # rewritten marker IS committed -- and the real index keeps the
+    # pre-commit value: HEAD and the worktree moved, the index did not, and
+    # git reports 'MM'. The post-commit hook clears it at commit time, so a
+    # plain 'git status' is clean without waiting for 'st'.
     _rt_repo_file up_k a.md
     _rt_repo container
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
@@ -18783,17 +18856,19 @@ _RT_STALE_CONF_EOF
     cd container || return 1
     _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
     git commit -q -am "carry proj" 2>/dev/null || true
+    [ -x .git/hooks/post-commit ] \
+      || { _rt_fail "shadow go installed no post-commit hook"; return 1; }
 
-    printf 'a change the container carries\n' >> proj/a.md
+    # 1. git's semantics, pinned: without the post-commit hook the real index
+    #    IS left behind. If git ever changes this, the hook is dead code.
+    mv .git/hooks/post-commit .git/hooks/post-commit.off
+    printf 'change one\n' >> proj/a.md
     git add -- proj/a.md 2>/dev/null
     # 'last-shadowed' has ONE-SECOND resolution: without crossing a second
-    # boundary the hook rewrites the marker to byte-identical content, the
-    # index then matches HEAD, and this test reports that git's semantics
-    # changed when nothing did. It passed by luck until it did not.
+    # boundary the hook rewrites the marker to byte-identical content and
+    # the index matches HEAD by luck.
     sleep 1
     git commit -q -m "publish, scoped to one project" -- proj >/dev/null 2>&1
-
-    # HEAD and the worktree agree; the index is the odd one out.
     _rt_h=$(git show HEAD:proj/.git.shadow.status 2>/dev/null | grep '^last-shadowed')
     _rt_w=$(grep '^last-shadowed' proj/.git.shadow.status)
     _rt_i=$(git show :proj/.git.shadow.status 2>/dev/null | grep '^last-shadowed')
@@ -18801,14 +18876,30 @@ _RT_STALE_CONF_EOF
       || { _rt_fail "HEAD and worktree disagree, so the hook did NOT commit its marker"; return 1; }
     _rt_ok "the hook's marker reached the commit" true || return 1
     [ "$_rt_i" != "$_rt_h" ] \
-      || { _rt_fail "the real index kept up -- git changed, the healer may be dead code now"; return 1; }
-    _rt_ok "the real index is the one left behind" true || return 1
+      || { _rt_fail "the real index kept up without the hook -- git changed"; return 1; }
+    _rt_ok "without post-commit, the real index is left behind" true || return 1
+    git reset -q HEAD -- proj/.git.shadow.status >/dev/null 2>&1
 
-    # ...and st clears it, which is the layer this can be fixed at.
-    _rt_ok "st" _rt_my_git st || return 1
+    # 2. with it, the same commit leaves nothing staged.
+    mv .git/hooks/post-commit.off .git/hooks/post-commit
+    printf 'change two\n' >> proj/a.md
+    git add -- proj/a.md 2>/dev/null
+    sleep 1
+    git commit -q -m "publish again, scoped" -- proj >/dev/null 2>&1
     [ -z "$(git status --porcelain -uno)" ] \
-      || { _rt_fail "st did not heal it: $(git status --porcelain -uno | tr '\n' ' ')"; return 1; }
-    _rt_ok "st heals what git's partial commit leaves" true || return 1
+      || { _rt_fail "a scoped commit left: $(git status --porcelain -uno | tr '\n' ' ')"; return 1; }
+    _rt_ok "post-commit leaves the index clean" true || return 1
+
+    # 3. content that exists ONLY in the index is never thrown away.
+    printf 'hand-staged\n' > .git.local-note
+    git add -f -- .git.local-note 2>/dev/null
+    rm -f .git.local-note
+    printf 'change three\n' >> proj/a.md
+    git add -- proj/a.md 2>/dev/null
+    git commit -q -m "scoped, with a staged-only file" -- proj >/dev/null 2>&1
+    [ -n "$(git diff --cached --name-only -- .git.local-note)" ] \
+      || { _rt_fail "post-commit unstaged content that existed only in the index"; return 1; }
+    _rt_ok "a staged-only file is left alone" true || return 1
     return 0
   }
 
@@ -19056,8 +19147,8 @@ _RT_STALE_CONF_EOF
     # wt_matches_commit, which only ever looks at WORKING files, got HEAD
     # back, and printed "OLD CHECKOUT (= <sha>, lags HEAD by 0)" -- a
     # sentence that refutes itself, and a checkout problem that does not
-    # exist. my-git's own pre-commit hook produces this state on every
-    # pathspec commit, so it is not hypothetical.
+    # exist. A pathspec commit produces this state with the pre-commit
+    # hook's marker, so it is not hypothetical.
     _rt_repo_file proj a.md
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     cd proj || return 1
@@ -21944,6 +22035,66 @@ PYDRV
     return 0
   }
 
+  test_st_refreshes_an_outdated_shadow_hook() {
+    # Checking only for the begin marker kept a months-old block in place:
+    # every later fix to it never reached the machine that installed it
+    # first. 'st' must replace an outdated block -- and nothing else.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
+    cd container || return 1
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+    cp .git/hooks/pre-commit ../current-pre-commit
+    # An OLD block: the current one with its commit-stamping line gone, and a
+    # line of the user's own after it.
+    grep -v 'print "commit: " ci' ../current-pre-commit > .git/hooks/pre-commit
+    printf 'echo users-own-line\n' >> .git/hooks/pre-commit
+    grep -q 'print "commit: " ci' .git/hooks/pre-commit \
+      && { _rt_fail "the test did not make the block outdated"; return 1; }
+
+    _rt_ok "st" _rt_my_git st || return 1
+    _rt_contains "the block is current again" .git/hooks/pre-commit 'print "commit: " ci' || return 1
+    _rt_contains "the user's line survives" .git/hooks/pre-commit "echo users-own-line" || return 1
+    [ "$(grep -c 'my-git shadow (managed block' .git/hooks/pre-commit)" = 2 ] \
+      || { _rt_fail "block duplicated or lost: $(grep -c 'managed block' .git/hooks/pre-commit) markers"; return 1; }
+    _rt_ok "exactly one block" true || return 1
+    [ -x .git/hooks/pre-commit ] || { _rt_fail "the hook lost its execute bit"; return 1; }
+    _rt_ok "still executable" true || return 1
+    return 0
+  }
+
+  test_shadow_go_carries_only_the_ignored_files_below_its_path() {
+    # 'shadow go <path>' used to force-add every ignored file the container's
+    # patterns match ANYWHERE in the tree, then commit scoped to <path>:
+    # another project's .local files were left staged for someone else's
+    # commit to sweep up.
+    _rt_repo_file up_o a.md
+    _rt_repo_file up_p b.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj && git clone -q ../up_p other ) >/dev/null 2>&1
+    cd container || return 1
+    printf '*.local\n*.local.*\n' > .git.force-add-patterns
+    printf '*.local\n' > .gitignore
+    git add .git.force-add-patterns .gitignore >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm patterns >/dev/null 2>&1
+    # 'other' must be shadowed too: an unshadowed nested repo hides its files
+    # from the container's ls-files anyway, and the test would pass vacuously.
+    _rt_ok "shadow go other" _rt_my_git shadow go other || return 1
+    printf 'mine\n'   > proj/notes.local
+    printf 'theirs\n' > other/notes.local
+
+    _rt_ok "shadow go proj" _rt_my_git shadow go proj || return 1
+    [ -n "$(git ls-files -- proj/notes.local)" ] \
+      || { _rt_fail "the shadowed repo's own .local file was not carried"; return 1; }
+    _rt_ok "proj/notes.local is carried" true || return 1
+    [ -z "$(git ls-files -- other/notes.local)" ] \
+      || { _rt_fail "shadow go proj staged other/notes.local: $(git status --porcelain -- other | tr '\n' ' ')"; return 1; }
+    _rt_ok "other/notes.local is left alone" true || return 1
+    return 0
+  }
+
   test_shadow_hook_bumps_last_shadowed_on_commit() {
     # shadow installs a parent pre-commit hook that bumps 'last-shadowed' at
     # COMMIT time — ONLY for shadowed repos that commit stages content into,
@@ -22302,7 +22453,7 @@ PYDRV
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_the_real_index_behind test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write"
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_st_refreshes_an_outdated_shadow_hook test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
