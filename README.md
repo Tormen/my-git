@@ -136,6 +136,37 @@ Concrete examples on this machine:
     `,github/create_ap`, `,github/mkinitcpio-ykfde`,
     `,github/rsync-tmbackup___rsync-time-backup`.
 
+## Anything else is git's — with two exceptions
+
+A verb my-git does not define is passed straight through, so `my-git log`,
+`my-git rebase -i`, `my-git show` all work and my-git can be the everyday
+front-end. Two exceptions, because plain git would silently break a my-git
+rule:
+
+**Refused outright** — `add` and `submodule`. `git add` does not apply
+`.git.force-add-patterns`, so a `.local` file the container carries would be
+stranded on this machine; use `my-git commit go -m "..."`. `submodule`
+bypasses `sm`.
+
+**Guarded** — `clean`, `stash`, `rm`, `mv` are passed through *unless* the
+operation would actually break something: `clean -x/-X` and `stash -u/-a`
+delete or stash the ignored files the container carries, and `rm`/`mv` on a
+path that is itself a git repo destroys the relationship recorded for it.
+Ordinary uses (`clean -n`, `rm --cached`) are untouched.
+
+`checkout`, `switch`, `restore` and `reset` are **not** guarded. They can
+cross into a shadowed child too, but no condition narrow enough to refuse on
+was found, and a guard that fires on the wrong runs is worse than none.
+
+## `-R` and `-RR`
+
+    -R   --recursive   descend into nested repos
+    -RR  --foreign     ALSO discover in a scope outside GIT_REPOS; implies -R
+
+Two axes, one flag each. A command that is always recursive (`status`,
+`remote`, `branch`) refuses `-R` and names `-RR`, rather than accepting a
+flag that changes nothing.
+
 ## Install
 
 ```sh
@@ -241,6 +272,8 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 |-----------------|----------------|-----------|-----------------------------------------------------------------------------------|
 | `status`        | `st`, `s`      | always    | Compact tree summary; `-V` = per-node porcelain listing; end-of-run total counts  |
 | `masscommits`   | `mc`, `c`      | opt-in `-R` | Analyze (default) / `go` = add+commit+push. THIS repo; `-R` = the tree, deepest first; `--sm`/`--sh` narrow (and imply `-R`). Takes no path |
+| `commit`        |                | opt-in `-R` | `mc` with YOUR message: same rules, same two phases, but the words are yours. `mc go` generates a message; `commit go -m "..."` does not |
+| `branch`        | `br`           | tree-wide   | Read-only: which branch every repo is on — what plain `git branch` cannot answer. Writes are refused |
 | `pull`          | `pl`, `fetch`  | whole tree  | Fetch origin + reconcile what is behind or diverged (`PULL_STRATEGY`); `fetch` = `pull --fetch-only` |
 | `push`          | `ps`           | whole tree  | Analyze (default) / `go` = publish what is ahead. Never invents an upstream, never pushes a diverged branch, skips local-only |
 | `submodules`    | `sm`, `sub`    | opt-in `-R` | Discover & register nested git repos as submodules; `-R` = top-down walk. A PATH registers into the repo that **directly encloses** it (its immediate parent), not the toplevel you run from |
