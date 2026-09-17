@@ -185,8 +185,8 @@ nesting:
 
 | | how my-git learns of it | cost | followed |
 |---|---|---|---|
-| **declared** | the repo records it in `.gitmodules` | one file read | always, in any tree |
-| **discovered** | my-git searches the filesystem for `.git` | grows with the tree | only where it may look |
+| **declared** | the tree records it: a registered submodule in `.gitmodules`, or a **shadowed** repo, whose `.git.shadow.status` marker the parent tracks | one file read | always, in any tree |
+| **discovered** | my-git searches the filesystem for a `.git` nobody recorded | grows with the tree | only where it may look |
 
 "Where it may look" is: a tree you named in `GIT_REPOS` — naming it *is* the
 permission — or, this once, with `--discover`.

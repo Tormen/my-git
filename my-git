@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.7
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="1a1e534"
+SCRIPT_COMMIT="ec17b47"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -1820,14 +1820,21 @@ list_stale_submodules() {
 #   below them -- ignoring a repo means leaving it alone, not descending
 #   through it. [merged] paths have no .git and never appear.
 list_live_repos_tree() {
-  # Declared nesting (registered submodules) is followed in any scope.
-  # DISCOVERED nesting needs permission -- see _may_discover. Asked once for
-  # the scope root: every node below a managed root is managed too, and every
-  # node below a foreign one is foreign.
+  # DECLARED nesting is followed in any scope: a registered submodule
+  # (.gitmodules) and a SHADOWED repo (its marker is a file the parent
+  # TRACKS) are both relationships this tree records -- neither is something
+  # my-git had to go looking for. Only genuine DISCOVERY -- searching the
+  # filesystem for a .git nobody recorded -- needs _may_discover. Asked once
+  # for the scope root: every node below a managed root is managed too.
+  #
+  # Getting that line wrong is not academic: a container whose children are
+  # all shadowed is the normal case here, and treating its markers as
+  # "discovered" made 'mc -R' reach 2 repos out of 35.
   _llr_may=0; _may_discover "$1" && _llr_may=1
   _llr_q=$(mktemp "${TMPDIR:-/tmp}/${US}.llrq.XXXXXX") || return 1
   _llr_k=$(mktemp "${TMPDIR:-/tmp}/${US}.llrk.XXXXXX") || { rm -f "$_llr_q"; return 1; }
   printf '%s\n' "$1" > "$_llr_q"
+  _llr_seen=$(mktemp "${TMPDIR:-/tmp}/${US}.llrs.XXXXXX") || { rm -f "$_llr_q" "$_llr_k"; return 1; }
   # A worklist, not recursion, and fd 9 rather than stdin. Both matter: the
   # discovery helpers run git through run_as_owner_capture -- su/sudo --
   # which READ STDIN, so a "| while read" walk loses every remaining entry
@@ -1837,8 +1844,13 @@ list_live_repos_tree() {
     _llr_cur=$(head -n 1 "$_llr_q")
     sed '1d' "$_llr_q" > "$_llr_q.t" 2>/dev/null && mv -f "$_llr_q.t" "$_llr_q"
     [ -n "$_llr_cur" ] || continue
+    # list_shadowed_dirs is recursive, so a deep marker is reachable from the
+    # root AND from its own parent; without this the repo is walked twice.
+    grep -qxF "$_llr_cur" "$_llr_seen" 2>/dev/null && continue
+    printf '%s\n' "$_llr_cur" >> "$_llr_seen"
     printf '%s\n' "$_llr_cur"
     { list_direct_submodules "$_llr_cur" 2>/dev/null
+      list_shadowed_dirs "$_llr_cur" 2>/dev/null
       [ "$_llr_may" = 1 ] && list_unregistered_nested "$_llr_cur" 2>/dev/null
     } | sort -u > "$_llr_k"
     while IFS= read -r _llr_c <&9; do
@@ -1852,7 +1864,7 @@ list_live_repos_tree() {
       printf '%s\n' "$_llr_cur/$_llr_c" >> "$_llr_q"
     done 9< "$_llr_k"
   done
-  rm -f "$_llr_q" "$_llr_q.t" "$_llr_k"
+  rm -f "$_llr_q" "$_llr_q.t" "$_llr_k" "$_llr_seen"
 }
 
 # select_tree_nodes <root> <sm 0|1> <shadowed 0|1>
@@ -11746,9 +11758,10 @@ Global options:
                            --discover for the rest.
   -RR, --discover          ALSO go LOOKING for nested repos nobody declared.
                            Automatic in your GIT_REPOS trees; elsewhere my-git
-                           follows only what a repo DECLARES (its registered
-                           submodules), because searching a foreign tree --
-                           \$HOME and its plugin clones -- is slow and noisy.
+                           follows only what the tree RECORDS -- registered
+                           submodules, and shadowed repos (their marker is
+                           tracked) -- because searching a foreign tree,
+                           \$HOME and its plugin clones, is slow and noisy.
                            Implies -R.
   --config <FILE>          Use specific config file
   --create-config          Write default config to first writable location
@@ -22804,14 +22817,16 @@ PYDRV
     return 0
   }
 
-  _rt_declared_and_found() {   # top/ with a DECLARED submodule and a DISCOVERED nested repo
+  _rt_declared_and_found() {   # top/ with all three kinds of nesting
     _rt_repo_file subo s.txt
     _rt_repo top
     ( cd top && git -c protocol.file.allow=always submodule add -q ../subo declared >/dev/null 2>&1 \
         && git -c user.name=T -c user.email=t@t commit -qm addsub ) >/dev/null 2>&1
-    _rt_repo_file top/found f.txt
+    _rt_repo_file top/found f.txt      # DISCOVERED: nothing records it
+    _rt_repo_file top/mirrored m.txt   # DECLARED by a my-git marker, below
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     cd top || return 1
+    _rt_my_git shadow go mirrored >/dev/null 2>&1 || return 1
     return 0
   }
 
@@ -22824,14 +22839,19 @@ PYDRV
     # 'pull -R go' in a $HOME full of plugin clones fetches and merges them.
     _rt_declared_and_found || return 1
 
-    # FOREIGN (GIT_REPOS is empty in the test config).
+    # FOREIGN (GIT_REPOS is empty in the test config). root + declared
+    # submodule + SHADOWED repo = 3; the found one needs permission = 4.
+    # The shadowed one is the case that matters most here: a container whose
+    # children are all shadowed is the normal layout, and reading its marker
+    # as "discovered" made 'mc -R' reach 2 repos out of 35 on the real tree.
     for _rt_v in "mc -R" "pull -R" "push -R"; do
       # shellcheck disable=SC2086
       _rt_ok "$_rt_v, foreign" _rt_my_git $_rt_v || return 1
-      _rt_contains "'$_rt_v' takes the root + the DECLARED submodule" "$_rt_out" "total=2" || return 1
+      _rt_contains "'$_rt_v' takes what the tree DECLARES (submodule + marker)" "$_rt_out" "total=3" || return 1
+      _rt_not_contains "'$_rt_v' does not go looking" "$_rt_out" "total=4" || return 1
       # shellcheck disable=SC2086
       _rt_ok "$_rt_v --discover, foreign" _rt_my_git $_rt_v --discover || return 1
-      _rt_contains "'$_rt_v --discover' also takes the found repo" "$_rt_out" "total=3" || return 1
+      _rt_contains "'$_rt_v --discover' also takes the found repo" "$_rt_out" "total=4" || return 1
     done
     _rt_ok "st, foreign" _rt_my_git st || return 1
     _rt_contains "st lists the declared submodule" "$_rt_out" "declared" || return 1
@@ -22848,7 +22868,7 @@ PYDRV
     for _rt_v in "mc -R" "pull -R" "push -R"; do
       # shellcheck disable=SC2086
       _rt_ok "$_rt_v, managed" _rt_my_git $_rt_v || return 1
-      _rt_contains "'$_rt_v' reaches everything in a GIT_REPOS tree" "$_rt_out" "total=3" || return 1
+      _rt_contains "'$_rt_v' reaches everything in a GIT_REPOS tree" "$_rt_out" "total=4" || return 1
     done
     _rt_ok "st, managed" _rt_my_git st || return 1
     _rt_contains "st shows the found repo unasked" "$_rt_out" "found" || return 1
