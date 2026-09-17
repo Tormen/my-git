@@ -165,17 +165,52 @@ Ordinary uses (`clean -n`, `rm --cached`) are untouched.
 cross into a shadowed child too, but no condition narrow enough to refuse on
 was found, and a guard that fires on the wrong runs is worse than none.
 
-## `-R` and `-RR`
+## `-R` and `--discover`
 
-    -R   --recursive   descend into nested repos
-    -RR  --foreign     ALSO discover in a scope outside GIT_REPOS; implies -R
+    -R    --recursive   descend into nested repos
+    -RR   --discover    also go LOOKING for nested repos nobody declared
+                        (automatic in your GIT_REPOS trees; implies -R)
 
-Two axes, one flag each. A command that is always recursive (`status`,
-`remote`, `branch`) refuses `-R` and names `-RR`, rather than accepting a
-flag that changes nothing. `audit` and `repair` refuse both: their sidecar
-search walks the whole subtree in any scope, so neither flag has anything
-to switch on. `sm` recurses on `-R` in either position (`sm -R` or
-`my-git -R sm`) and on `-RR`.
+Two axes, one flag each.
+
+**`-R` is depth.** Does this command act on the repos below this one at all?
+Only the verbs that write have this axis (`mc`, `commit`, `pull`, `push`,
+`pp`, `sync`, `sm`): acting on a nested repo is a second decision, and `-R`
+is how you make it. The read-only overviews — `st`, `remote`, `branch` —
+always walk, so they refuse `-R` in either position (`st -R` and
+`my-git -R st` alike) and name `--discover` instead.
+
+**`--discover` is permission to search.** my-git distinguishes two kinds of
+nesting:
+
+| | how my-git learns of it | cost | followed |
+|---|---|---|---|
+| **declared** | the repo records it in `.gitmodules` | one file read | always, in any tree |
+| **discovered** | my-git searches the filesystem for `.git` | grows with the tree | only where it may look |
+
+"Where it may look" is: a tree you named in `GIT_REPOS` — naming it *is* the
+permission — or, this once, with `--discover`.
+
+The rule exists because `$HOME` is a git repo for many people, with
+`.oh-my-zsh` and every `.emacs.d` plugin clone beneath it. Searching that is
+slow and surfaces a tree nobody wants — and for the verbs that write it would
+fetch, merge, commit and publish repos nobody ever registered. So in a
+foreign tree:
+
+```sh
+my-git st                # this repo + its registered submodules
+my-git st --discover     # ...and every nested repo found on disk
+my-git pull -R go        # reconciles declared nesting only
+my-git pull -R go --discover   # ...and the found repos too
+```
+
+In your `GIT_REPOS` trees nothing changes: discovery is already on.
+
+`audit` and `repair` are searches by nature (a sidecar is never declared),
+so they take `--discover` and refuse `-R`. `sm` searches too — a bare `sm`
+outside `GIT_REPOS` asks for `--discover` first, while `sm <path>` always
+works, because naming a path is not a search. `add` refuses both: it writes
+one index.
 
 ## Install
 
