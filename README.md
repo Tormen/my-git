@@ -207,7 +207,9 @@ my-git pull -R go --discover   # ...and the found repos too
 In your `GIT_REPOS` trees nothing changes: discovery is already on.
 
 `audit` and `repair` are searches by nature (a sidecar is never declared),
-so they take `--discover` and refuse `-R`. `sm` searches too — a bare `sm`
+so they take `--discover` and refuse `-R`. `shadow`, `unshadow` and
+`flatten` act on every nested repo below the toplevel already — a PATH is
+how you narrow them (`shadow go <path>`) — so they refuse `-R` too. `sm` searches too — a bare `sm`
 outside `GIT_REPOS` asks for `--discover` first, while `sm <path>` always
 works, because naming a path is not a search. `add` refuses both: it writes
 one index.
