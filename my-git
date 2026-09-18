@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.8
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="f86e0af"
+SCRIPT_COMMIT="72676d6"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -559,10 +559,12 @@ EOF
 # rides on it -- so a later ssh of the user's to the same host would keep
 # my-git from finishing, long after the remote had answered (a my-tm status
 # once sat ten minutes that way). No -n: git speaks its protocol over stdin.
+# No port forwards either (ClearAllForwardings): those in an ssh config are for
+# the user's own logins -- a fetch must neither take them nor fail on them.
 # A GIT_SSH_COMMAND the user set is theirs, and is left exactly as it is.
 git_ssh_setup() {
   [ -n "${GIT_SSH_COMMAND:-}" ] && return 0
-  GIT_SSH_COMMAND="ssh -o ControlMaster=no"
+  GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ClearAllForwardings=yes"
   # exported too, so a nested my-git knows this one is ours to extend
   MYGIT_OWN_GIT_SSH=1
   export GIT_SSH_COMMAND MYGIT_OWN_GIT_SSH
@@ -14583,7 +14585,7 @@ _sm_run_here() {
   # (git_ssh_setup's own is extended; one the user set is not touched)
   if [ -z "${GIT_SSH_COMMAND:-}" ] || [ "${MYGIT_OWN_GIT_SSH:-0}" = 1 ]; then
     _sm_ct=${SM_SSH_CONNECT_TIMEOUT:-30}
-    GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ConnectTimeout=$_sm_ct -o BatchMode=no"
+    GIT_SSH_COMMAND="ssh -o ControlMaster=no -o ClearAllForwardings=yes -o ConnectTimeout=$_sm_ct -o BatchMode=no"
     export GIT_SSH_COMMAND
     log_dbg_med "GIT_SSH_COMMAND=$GIT_SSH_COMMAND"
   fi
@@ -18138,6 +18140,8 @@ _RT_STALE_CONF_EOF
     [ -s ../ssh.args ] || { _rt_fail "no ssh was run -- the test proves nothing"; return 1; }
     grep -q 'ControlMaster=no' ../ssh.args \
       || { _rt_fail "git's ssh can become a connection master: $(cat ../ssh.args)"; return 1; }
+    grep -q 'ClearAllForwardings=yes' ../ssh.args \
+      || { _rt_fail "git's ssh sets up the user's port forwards: $(cat ../ssh.args)"; return 1; }
 
     # one the user set is theirs: used as it is, nothing added
     : > ../ssh.args
