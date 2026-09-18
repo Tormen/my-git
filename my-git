@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.8
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="a06ae52"
+SCRIPT_COMMIT="ca401e6"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -13556,6 +13556,42 @@ _ign_list_ignored() {
       done
 }
 
+# _ia_full <relpath>
+#   The full path of one target, as typed: the logical path for a named one,
+#   the toplevel + relative path for the ones a bare 'unignore' found.
+_ia_full() {
+  if [ -n "$_ia_log" ]; then printf '%s' "$_ia_log"; else printf '%s/%s' "$_ia_top" "$1"; fi
+}
+
+# _ia_effect_banner
+#   What the change DOES, before it is done. Where it acts is not "the repo
+#   this command was run from": the marker lives in the target's own gitdir,
+#   so it takes effect in EVERY repo above the target -- they are listed,
+#   innermost first. Then what it means, then where the marker goes.
+_ia_effect_banner() {
+  if [ "$_ia_go" = go ]; then _iab_will="will have"; _iab_is="is"; _iab_do="will"; _iab_inc="includes"
+  else _iab_will="would have"; _iab_is="would be"; _iab_do="would"; _iab_inc="would include"; fi
+  if [ -n "$_ia_log" ]; then _iab_dir=$(dirname "$_ia_log"); else _iab_dir=$_ia_top; fi
+  _iab_any=0; _iab_prev=""
+  while :; do
+    _iab_top=$(git_toplevel_of "$_iab_dir" 2>/dev/null)
+    [ -n "$_iab_top" ] && [ "$_iab_top" != "$_iab_prev" ] || break
+    log_major "The change $_iab_will an effect here: $_iab_top"
+    _iab_any=1; _iab_prev=$_iab_top
+    _iab_dir=$(dirname "$_iab_top")
+    [ "$_iab_dir" != / ] || break
+  done
+  [ "$_iab_any" = 1 ] || log_major "No repo contains it yet -- the marker takes effect wherever it is nested later"
+  if [ "${_ia_total:-1}" -gt 1 ]; then _iab_what="each repo below"; else _iab_what="the given repo"; fi
+  if [ "$_ia_mode" = ignore ]; then
+    log_major "Effect: my-git $_iab_do leave $_iab_what alone: st won't descend; sm won't register; mc/flatten skip it"
+    log_major "The marker \"$_sm_IGNORE_MARKER\" $_iab_is written into $_iab_what, but untracked by every repo"
+  else
+    log_major "Effect: my-git $_iab_inc $_iab_what again -- 'sm go' may now register it as a submodule"
+    log_major "The marker \"$_sm_IGNORE_MARKER\" $_iab_is removed from $_iab_what -- no repo tracks it"
+  fi
+}
+
 # Consistent with flatten/unflatten/shadow/unshadow: analyze by default, 'go'
 # to apply, '-i' to confirm per repo, and a bare verb acts tree-wide. 'ignore'
 # needs a <path> (no bulk 'ignore everything'); bare 'unignore' targets EVERY
@@ -13603,7 +13639,7 @@ _ignore_apply() {
   # nothing to decide here, and demanding a git repo there was ceremony:
   # 'ignore go /abs/path' from $HOME died with "not inside a git repo" while
   # holding every fact the action needed.
-  _ia_scope=""
+  _ia_scope=""; _ia_log=""
   if [ -n "$_ia_scope_raw" ]; then
     _ia_abs=$(cd "$_ia_scope_raw" 2>/dev/null && pwd -P) || fatal "$_ia_mode: '$_ia_scope_raw': no such directory" 1
     # Logical form of what was typed, so messages speak the path you gave.
@@ -13634,10 +13670,6 @@ _ignore_apply() {
   # Unusual among the mutating commands: NOTHING is committed, and the
   # toplevel is only used to resolve the path. The marker is written into
   # the NESTED repo's own gitdir, which no repo tracks.
-  log_repo_context "$_ia_mode" "$_ia_top" \
-    "shown only to place the target -- NOTHING here is modified or committed" \
-    "${_ia_scope:+target: $_ia_scope}" \
-    "the marker is written inside the nested repo's own gitdir ($_sm_IGNORE_MARKER) -- untracked by every repo"
 
   # Build the target list.
   if [ -n "$_ia_scope" ]; then
@@ -13650,24 +13682,25 @@ _ignore_apply() {
     _ia_list=$(_ign_list_ignored ".")
     [ -n "$_ia_list" ] || { log_major "$_ia_top: nothing to unignore (no repo carries the $_sm_IGNORE_MARKER marker)"; exit 0; }
   fi
+  _ia_total=$(printf '%s\n' "$_ia_list" | grep -c .)
+  # One repo that is already where it was asked to be: nothing changes, so
+  # there is no effect to announce -- say that, and only that.
+  if [ "$_ia_total" = 1 ] && _ia_gp1=$(_ign_gitpath_of "$_ia_list" 2>/dev/null); then
+    if [ "$_ia_mode" = ignore ] && _sm_is_ignored "$_ia_gp1" "$_ia_list"; then
+      log_major "already ignored, nothing to do: $(_ia_full "$_ia_list")"; exit 0
+    fi
+    if [ "$_ia_mode" = unignore ] && ! _sm_is_ignored "$_ia_gp1" "$_ia_list"; then
+      log_major "not ignored, nothing to do: $(_ia_full "$_ia_list")"; exit 0
+    fi
+  fi
+  _ia_effect_banner
 
   # Analyze (default): show the plan, don't touch anything.
   if [ "$_ia_go" != go ]; then
-    log_major "$_ia_top: $_ia_mode plan"
     printf '%s\n' "$_ia_list" | while IFS= read -r _p; do
       [ -n "$_p" ] || continue
-      _gp=$(_ign_gitpath_of "$_p" 2>/dev/null) || continue
-      if [ "$_ia_mode" = ignore ]; then
-        if _sm_is_ignored "$_gp" "$_p"; then
-          printf '  %s>> %s   (already ignored — no change)%s\n' "$C_BLUE" "$_p" "$C_RESET"
-        else
-          printf '  %s>> %s   (mark ignored — my-git will leave it alone)%s\n' "$C_BLUE" "$_p" "$C_RESET"
-        fi
-      else
-        printf '  %s>> %s   (remove ignore marker — my-git includes it again)%s\n' "$C_BLUE" "$_p" "$C_RESET"
-      fi
+      log_major "WOULD $_ia_mode: $(_ia_full "$_p")"
     done
-    echo
     log_major "This was analyze-only — re-run with 'go' to apply:"
     printf '  %s>>   %s %s go %s%s%s\n' "$C_BLUE" "$US" "$_ia_mode" \
       "$([ "$_ia_i" = 1 ] && printf -- '-i ')" "${_ia_scope_raw:-}" "$C_RESET"
@@ -13676,7 +13709,6 @@ _ignore_apply() {
 
   # Apply.
   _ia_ok=0; _ia_noop=0; _ia_fail=0; _ia_skip=0; _ia_n=0
-  _ia_total=$(printf '%s\n' "$_ia_list" | grep -c .)
   _ia_oifs=$IFS; IFS='
 '
   # shellcheck disable=SC2086
@@ -13698,21 +13730,22 @@ _ignore_apply() {
     fi
     if [ "$_ia_mode" = ignore ]; then
       if _sm_is_ignored "$_gp" "$_p"; then
-        log_medium "already ignored: $_p"; _ia_noop=$((_ia_noop + 1))
+        log_major "already ignored, nothing to do: $(_ia_full "$_p")"; _ia_noop=$((_ia_noop + 1))
       elif _sm_mark_ignored "$_gp" "$_p" >/dev/null; then
-        log_ok "ignored $_p — my-git will leave it alone (st won't descend; sm won't register; mc/flatten skip it)"
+        log_ok "$(_ia_full "$_p")"
         _ia_ok=$((_ia_ok + 1))
       else _ia_fail=$((_ia_fail + 1)); fi
     else
       if ! _sm_is_ignored "$_gp" "$_p"; then
-        log_medium "not ignored: $_p"; _ia_noop=$((_ia_noop + 1))
+        log_major "not ignored, nothing to do: $(_ia_full "$_p")"; _ia_noop=$((_ia_noop + 1))
       elif _sm_unmark_ignored "$_gp" "$_p"; then
-        log_ok "unignored $_p — my-git includes it again ('sm go' may now register it as a submodule)"
+        log_ok "$(_ia_full "$_p")"
         _ia_ok=$((_ia_ok + 1))
       else _ia_fail=$((_ia_fail + 1)); fi
     fi
   done
-  log_major "$_ia_mode: $_ia_ok changed, $_ia_noop no-op$([ "$_ia_skip" -gt 0 ] && printf ', %s skipped' "$_ia_skip")$([ "$_ia_fail" -gt 0 ] && printf ', %s FAILED' "$_ia_fail")"
+  # A tally of one repo repeats the line just printed about it.
+  [ "$_ia_total" -gt 1 ] && log_major "$_ia_mode: $_ia_ok changed, $_ia_noop no-op$([ "$_ia_skip" -gt 0 ] && printf ', %s skipped' "$_ia_skip")$([ "$_ia_fail" -gt 0 ] && printf ', %s FAILED' "$_ia_fail")"
   [ "$_ia_fail" -eq 0 ]
 }
 
@@ -21529,6 +21562,42 @@ PYDRV
     return 0
   }
 
+  test_ignore_says_where_it_takes_effect() {
+    # The banner used to name ONE "TARGET REPO" -- the repo that merely
+    # resolved the path -- while the marker, living in the target's own gitdir,
+    # takes effect in EVERY repo above it. Now: each of those repos, innermost
+    # first, then what it means, then where the marker goes, then the full
+    # path. No tally for one repo, and no banner at all when nothing changes.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    _rt_repo mid_r
+    mv mid_r container/mid
+    _rt_repo_file container/mid/kid k.txt
+    _rt_kid="$PWD/container/mid/kid"
+    cd container || return 1
+
+    _rt_ok "ignore (analyze)" _rt_my_git ignore "$_rt_kid" || return 1
+    _rt_contains "analyze says would" "$_rt_out" "would have an effect here" || return 1
+    _rt_contains "and names the one it would change" "$_rt_out" "WOULD ignore: $_rt_kid" || return 1
+
+    _rt_ok "ignore go" _rt_my_git ignore go "$_rt_kid" || return 1
+    _rt_contains "says what it means" "$_rt_out" "Effect: my-git will leave the given repo alone" || return 1
+    _rt_contains "says where the marker goes" "$_rt_out" "is written into the given repo, but untracked by every repo" || return 1
+    _rt_contains "names the full path" "$_rt_out" "SUCCESS: $_rt_kid" || return 1
+    _rt_not_contains "no tally for a single repo" "$_rt_out" "1 changed" || return 1
+    grep 'effect here:' "$_rt_out" | sed -e 's/.*effect here: //' > "$_rt_out.eff"
+    [ "$(sed -n '1p' "$_rt_out.eff")" = "${_rt_kid%/kid}" ] \
+      || { _rt_fail "the innermost repo is not listed first: $(tr '\n' ' ' < "$_rt_out.eff")"; return 1; }
+    [ "$(sed -n '2p' "$_rt_out.eff")" = "${_rt_kid%/mid/kid}" ] \
+      || { _rt_fail "the outer repo is not listed: $(tr '\n' ' ' < "$_rt_out.eff")"; return 1; }
+    rm -f "$_rt_out.eff"
+
+    _rt_ok "ignore go, already ignored" _rt_my_git ignore go "$_rt_kid" || return 1
+    _rt_contains "says there is nothing to do" "$_rt_out" "already ignored, nothing to do" || return 1
+    _rt_not_contains "and announces no effect it will not have" "$_rt_out" "effect here" || return 1
+    return 0
+  }
+
   test_ignore_unignore_toggles_marker() {
     # 'ignore'/'unignore' follow the analyze/go idiom (like flatten/unshadow):
     # analyze by default, 'go' applies. Bare 'unignore' acts tree-wide; bare
@@ -21541,7 +21610,7 @@ PYDRV
     cd root || return 1
     # analyze must NOT write.
     _rt_ok "ignore kid (analyze)" _rt_my_git ignore kid || return 1
-    _rt_contains "analyze shows the plan" "$_rt_out" "mark ignored" || return 1
+    _rt_contains "analyze shows the plan" "$_rt_out" "WOULD ignore" || return 1
     _rt_absent "analyze wrote nothing" kid/.git/my-git.ignore || return 1
     # go applies.
     _rt_ok "ignore go kid" _rt_my_git ignore go kid || return 1
@@ -21551,7 +21620,7 @@ PYDRV
       || { _rt_fail "kid should be tagged [.., ignored] after ignore go"; return 1; }
     # idempotent go.
     _rt_ok "ignore go again" _rt_my_git ignore go kid || return 1
-    _rt_contains "reports no-op" "$_rt_out" "no-op" || return 1
+    _rt_contains "reports no-op" "$_rt_out" "already ignored, nothing to do" || return 1
     # bare 'ignore go' (no path) is refused — no bulk ignore-everything.
     if _rt_my_git ignore go >"$_rt_out" 2>"$_rt_err"; then
       _rt_fail "bare 'ignore go' (no path) should be refused"; return 1
@@ -23331,7 +23400,7 @@ PYDRV
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_st_refreshes_an_outdated_shadow_hook test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write"
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_st_refreshes_an_outdated_shadow_hook test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
