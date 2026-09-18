@@ -105,8 +105,8 @@ involved with `@<repo>`:
 
 ```
 └── src                          [raw-nested-git]      ↑
-    ├── icfp                     [merged @src]         ⌂  (history preserved in /syst/global/src)
-    ├── py/my-plex               [shadowed @src]       ↑  CLEAN, ahead 1
+    ├── icfp                     [merged @src]²        ⌂  CLEAN :))
+    ├── py/my-plex               [shadowed @src]       ↑  CLEAN, but ahead 1
 ```
 
 ## Nested repos: archived / private / published
@@ -1068,7 +1068,10 @@ branch position in the tree followed by its state summary:
 ├── src [registered-sm]                ↑  DIRTY (18)  [M:1 ??:17]
 │   ├── py/my-plex [registered-sm]     ↑  CLEAN :))
 │   └── sh/my-git [raw-nested-git]     ⌂  DIRTY (2)  [M:2]
-└── etc [registered-sm]                ↑  CLEAN, ahead 1
+├── etc [registered-sm]                ↑  CLEAN, but ahead 1
+└── icfp [merged @global]¹             ⌂  CLEAN :))
+
+  ¹ merged: content only, NO preserved history -- see <dir>/.git.merged
 ```
 
 The column between the `[tag]` and the state is the **flag**: `⌂` = local-only
@@ -1076,10 +1079,30 @@ The column between the `[tag]` and the state is the **flag**: `⌂` = local-only
 blank = n/a (a `[zipped]`/stale entry). The end-of-run **Summary** tallies them,
 e.g. `⌂ local-only(no remote)=15  ↑ has-remote(publishable)=44  ignored(...)=9`.
 
-States: `CLEAN :))`, `CLEAN, ahead N`, `CLEAN, behind N`,
-`DIVERGED (ahead X, behind Y)`, `CLEAN (no remote for B)`,
-`DIRTY (N) [M:.. A:.. D:.. R:.. ??:..]`, `[SKIPPED — cross-user policy]`,
-`[ERROR …]`.
+Every row ends in one **state**, and it is measured, never assumed. A
+repo with a live `.git` asks its own `git status`. A `[merged]` or
+`[sidecar]` path has no repo of its own, so the enclosing repo is asked
+about *that path* — clean when the parent has nothing uncommitted under
+it. A `[zipped]` row is clean when its archive is committed. In a
+terminal the state is coloured (`NO_COLOR` turns it off):
+
+| colour | meaning | states |
+|---|---|---|
+| green | nothing to do | `CLEAN :))` |
+| yellow | committed, but something to do | `CLEAN, but ahead N` · `behind N` · `DIVERGED (ahead X, behind Y)` · `no upstream (branch B)` · `INDEX STALE`⁶ · `OLD CHECKOUT (<sha> <date>, lags HEAD by N)`⁷ · `no repo`⁵ |
+| yellow | not committed | `DIRTY (N) [M:.. A:.. D:.. R:.. ??:..]`, plus `, ahead N` etc. when also out of step |
+| red | could not be measured | `[ERROR …]` · `[BROKEN …]` · `[SKIPPED — cross-user policy]` · `[no dir on disk]`⁸ |
+
+`no upstream` is only yellow on a repo that HAS a remote; a local-only
+(`⌂`) repo with no upstream is `CLEAN :))`.
+
+What a kind or state *means* is the same on every row, so it never sits in
+the row: it is a **footnote** under the tree, printed once and only when a
+row uses it. The numbers are fixed, so `¹` means the same in every run:
+¹ merged (no preserved history), ² merged (history kept in the parent),
+³ sidecar, ⁴ zipped, ⁵ no repo (rehydrate), ⁶ index stale, ⁷ old
+checkout, ⁸ stale registration. Anything that differs per row — a sha, a
+lag — stays in the row.
 
 The tree includes **both** submodule-registered and raw (unregistered)
 nested git repos found on disk. The first word of the mark says what the
