@@ -15,7 +15,7 @@ SCRIPT_VERSION=1.8
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="4c23d37"
+SCRIPT_COMMIT="5f2c99e"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
@@ -13602,22 +13602,19 @@ _ia_effect_banner() {
   else
     log_major "The marker \"$_sm_IGNORE_MARKER\" $_iab_is removed from $_iab_what -- no repo tracks it"
   fi
-  if [ -n "$_ia_log" ]; then _iab_dir=$(dirname "$_ia_log"); _iab_tgt=$_ia_abs
-  else _iab_dir=$_ia_top; _iab_tgt=$(cd "$_ia_top" 2>/dev/null && pwd -P); fi
-  _iab_any=0; _iab_prev=""
+  # Walk the path upward to '/' and name every directory on it that is a git
+  # repo: those are the repos that descend into the target and so honour the
+  # marker. '/' is checked like any other directory -- named only if it
+  # really is a repo, never assumed either way.
+  if [ -n "$_ia_log" ]; then _iab_dir=$(dirname "$_ia_log"); else _iab_dir=$_ia_top; fi
+  _iab_any=0
   while :; do
-    _iab_top=$(git_toplevel_of "$_iab_dir" 2>/dev/null)
-    [ -n "$_iab_top" ] && [ "$_iab_top" != "$_iab_prev" ] || break
-    # Only a repo the target PHYSICALLY lies in is affected. Walking the
-    # logical path up crosses symlinks: /LINKS is a link INTO the /LINKS/local
-    # repo, which holds /LINKS/src only as a symlink it never descends --
-    # and git's '../' answered from /LINKS came back as '/'.
-    _iab_tp=$(cd "$_iab_top" 2>/dev/null && pwd -P)
-    case "$_iab_tgt" in "$_iab_tp"/*|"$_iab_tp") : ;; *) break ;; esac
-    printf '    > The change %s an effect here: %s\n' "$_iab_will" "$_iab_top"
-    _iab_any=1; _iab_prev=$_iab_top
-    _iab_dir=$(dirname "$_iab_top")
-    [ "$_iab_dir" != / ] || break
+    if is_git_repo "$_iab_dir"; then
+      printf '    > The change %s an effect here: %s\n' "$_iab_will" "$_iab_dir"
+      _iab_any=1
+    fi
+    [ "$_iab_dir" = / ] && break
+    _iab_dir=$(dirname "$_iab_dir")
   done
   [ "$_iab_any" = 1 ] || printf '    > No repo contains it yet -- the marker takes effect wherever it is nested later\n'
   if [ "$_ia_mode" = ignore ]; then
@@ -21662,19 +21659,19 @@ PYDRV
     _rt_contains "says there is nothing to do" "$_rt_out" "already ignored, nothing to do" || return 1
     _rt_not_contains "and announces no effect it will not have" "$_rt_out" "effect here" || return 1
 
-    # A path typed THROUGH a symlink that lives inside another repo -- the
-    # /LINKS layout: /LINKS is a link into the /LINKS/local repo, and walking
-    # the logical path up asked that repo too (git's '../' from /LINKS came
-    # back as '/'). A repo that holds the target only as a symlink never
-    # descends into it, so it is not where the change takes effect.
+    # The /LINKS layout: 'links' is a symlink (no .git of its own) into the
+    # farm of repo 'other' -- as /LINKS is a link into the /LINKS/local repo.
+    # Walking the typed path up names only the repos ON that path; 'other'
+    # is not on it, and '/' is never a repo.
     cd .. || return 1
-    _rt_repo farm_r
-    mkdir -p farm_r/links && ln -s ../../container farm_r/links/x
+    _rt_repo other
+    mkdir -p other/farm && ln -s ../../container other/farm/src && ln -s other/farm links
     _rt_my_git unignore go "$_rt_kid" > /dev/null 2>&1
-    _rt_ok "ignore go, typed through a symlink" _rt_my_git ignore go "$PWD/farm_r/links/x/mid/kid" || return 1
-    grep -xF "    > The change will have an effect here: $PWD/farm_r" "$_rt_out" \
-      && { _rt_fail "the repo holding only a symlink was named as affected"; return 1; }
-    _rt_contains "the repos it is really inside are named, as typed" "$_rt_out" "effect here: $PWD/farm_r/links/x" || return 1
+    _rt_ok "ignore go, typed through the links farm" _rt_my_git ignore go "$PWD/links/src/mid/kid" || return 1
+    grep 'effect here:' "$_rt_out" | sed -e 's/.*effect here: //' > "$_rt_out.eff"
+    [ "$(tr '\n' ' ' < "$_rt_out.eff")" = "$PWD/links/src/mid $PWD/links/src " ] \
+      || { _rt_fail "expected exactly the two repos on the path, got: $(tr '\n' ' ' < "$_rt_out.eff")"; return 1; }
+    rm -f "$_rt_out.eff"
     return 0
   }
 
