@@ -9,13 +9,13 @@
 # See:  my-git --help   (or: my-git --help <subcommand>)
 
 US=${0##*/}
-SCRIPT_VERSION=2.0
+SCRIPT_VERSION=2.1
 # The commit this file was released from, written by 'my-git stamp-version'
 # just before the release commit is amended -- so it lags HEAD by exactly one
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="29bf10b"
+SCRIPT_COMMIT="d5c8910"
 
 # _build_id -- first 12 hex of the running file's own SHA-256.
 #
