@@ -1092,6 +1092,7 @@ terminal the state is coloured (`NO_COLOR` turns it off):
 | yellow | committed, but something to do | `CLEAN, but ahead N` · `behind N` · `DIVERGED (ahead X, behind Y)` · `no upstream (branch B)` · `INDEX STALE`⁶ · `OLD CHECKOUT (<sha> <date>, lags HEAD by N)`⁷ · `no repo`⁵ |
 | yellow | not committed | `DIRTY (N) [M:.. A:.. D:.. R:.. ??:..]`, plus `, ahead N` etc. when also out of step |
 | red | could not be measured | `[ERROR …]` · `[BROKEN …]` · `[SKIPPED — cross-user policy]` · `[no dir on disk]`⁸ |
+| none | carries the ignore marker | `ignored` — listed, not measured, not counted |
 
 `no upstream` is only yellow on a repo that HAS a remote; a local-only
 (`⌂`) repo with no upstream is `CLEAN :))`.
@@ -1120,6 +1121,9 @@ such a repo, so the label is not a simple registered/unregistered binary:
   `my-git sm --list-ignored`.
 - `[raw-nested-git, ignored]` — raw nested repo carrying the ignore
   marker; `sm go` skips it and `st` does not descend into its subtree.
+  Its row reads `ignored` instead of a state: it is listed, so no repo in
+  the tree is invisible, but not measured and not counted — a state such as
+  `behind 87` would invite a pull that every writing verb refuses.
 - `[STALE REGISTRATION]` — entry in `.gitmodules` whose on-disk path does
   not exist. Run `my-git sm --clean-stale` to remove **only** this —
   `sm go` also adds new raw nested repos and rebinds moved ones,
