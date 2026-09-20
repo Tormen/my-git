@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="d9e3b2c"
+SCRIPT_COMMIT="c59cd39"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-1-gd9e3b2c"
+SCRIPT_RELEASE="v2.0-2-gc59cd39"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -13484,7 +13484,7 @@ Run it after committing and before deploying. '--version' then identifies
 the exact build:
 
   $US 2.0 (v2.0-0-gce0c64a: the v2.0 tag, build 9f86d081884c)
-  $US 2.0 (v2.0-3-ga1b2c3d: 3 commit(s) past v2.0, unreleased, build 9f86..)
+  $US 2.0+3 (v2.0-3-ga1b2c3d: 3 commit(s) past v2.0, unreleased, build 9f86)
   $US 2.0 (commit 1a2b3c4, build 9f86d081884c)          # no tag to measure by
   $US 2.0 (build 9f86d081884c, unstamped)
 

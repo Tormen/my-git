@@ -233,7 +233,7 @@ this).
 
 ```
 my-git 2.0 (v2.0-0-gce0c64a: the v2.0 tag, build 9f86d081884c)
-my-git 2.0 (v2.0-3-ga1b2c3d: 3 commit(s) past v2.0, unreleased, build 9f86d0…)
+my-git 2.0+3 (v2.0-3-ga1b2c3d: 3 commit(s) past v2.0, unreleased, build 9f86d0…)
 my-git 2.0 (commit 1a2b3c4, build 9f86d081884c)          # no tag to measure by
 my-git 2.0 (build 9f86d081884c, unstamped)
 ```
