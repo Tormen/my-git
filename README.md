@@ -232,17 +232,31 @@ this).
 `--version` identifies the exact bytes you are running, not just a number:
 
 ```
-my-git 1.4 (commit 1a2b3c4, build 9f86d081884c)
-my-git 1.4 (build 9f86d081884c, unstamped)
+my-git 2.0 (v2.0-0-gce0c64a: the v2.0 tag, build 9f86d081884c)
+my-git 2.0 (v2.0-3-ga1b2c3d: 3 commit(s) past v2.0, unreleased, build 9f86d0…)
+my-git 2.0 (commit 1a2b3c4, build 9f86d081884c)          # no tag to measure by
+my-git 2.0 (build 9f86d081884c, unstamped)
 ```
+
+The **version number** names the release these bytes are *based on*. The
+release commit sets it and nothing bumps it in between, so the tree never
+claims a version with no content behind it.
+
+Whether this build **is** that release or work on top of it is git's own
+`describe` string, printed verbatim: `<nearest tag>-<commits since it>-g<short
+sha>`. It is read from git where there is a repository, which is always exact,
+and from the stamped `SCRIPT_RELEASE` otherwise — a deployed copy has no git.
+The stamp is written *before* the release is tagged (commit → stamp → push →
+tag; tagging earlier would leave the tag on the commit the amend replaced), so
+a stamped string lags one release step.
 
 The **build id** is the first 12 hex of the file's own SHA-256, so two copies
 that differ by one byte report different versions — comparing installs is
 `--version` on each and a diff. The **commit** is a literal in the file,
 written by `my-git stamp-version go`, which rewrites that line and amends the
 release commit; a deployed copy therefore needs neither git nor a repository
-to say where it came from. Both are printed so a stale stamp shows up as a
-disagreement.
+to say where it came from. Everything is printed, so a stale stamp shows up as
+a disagreement.
 
 `stamp-version` refuses when any other file is dirty (the amend would fold
 that work in), is a no-op once the stamp on disk is the one in HEAD, and
@@ -339,7 +353,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `purge`         | —              | single PATH | Remove a path's content **and its entire history** from a repo — the only command that rewrites history. Resolves the repo by searching enclosing repos' **history** (not their index), `--from` to disambiguate; refuses unless the path is a repo in its own right; backs up `.git`, then demands you type `I am sure` |
 | `audit`         |                | always    | Read-only health checks: `--sidecar` (sidecar setup) |
 | `rehydrate`     |                | whole tree | Give a shadowed project its `.git` back on a machine that has only the container's files — clones from the remote the marker records, `--no-checkout` so the files on disk win, then puts HEAD on the commit those files actually are. Also repairs a project sitting on the wrong branch, remote or commit |
-| `stamp-version` |                | single-repo | Record the current commit in `SCRIPT_COMMIT` and amend it, so `--version` identifies the exact build (see [Version and builds](#version-and-builds)) |
+| `stamp-version` |                | single-repo | Record the current commit and `git describe` in `SCRIPT_COMMIT` / `SCRIPT_RELEASE` and amend it, so `--version` identifies the exact build (see [Version and builds](#version-and-builds)) |
 | `repair`        |                | always    | Fix sidecar setup problems (`--sidecar`); analyze by default, `go` to apply       |
 | `help`          |                | —         | Show top-level help                                                               |
 | *(none)*        |                | always    | `status`, paged through `less` when stdout is a TTY                               |
