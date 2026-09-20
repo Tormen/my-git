@@ -15,19 +15,35 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="c59cd39"
+SCRIPT_COMMIT="fc6379f"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-2-gc59cd39"
+SCRIPT_RELEASE="v2.0-3-gfc6379f"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
 #   anything else changed?" without the bytes that must differ counting.
 _sv_blank_stamp() {
   sed -e 's/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=/' -e 's/^SCRIPT_RELEASE=.*/SCRIPT_RELEASE=/'
+}
+
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
 }
 
 # _version_line -- the '--version' text.
@@ -47,7 +63,7 @@ _sv_blank_stamp() {
 # which is as close as anything offline can be.
 _version_line() {
   _vl_build=$(_build_id) || _vl_build=""
-  _vl_desc=$(git -c safe.directory='*' -C "${0%/*}" describe --tags --long 2>/dev/null)
+  _vl_desc=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
   [ -n "$_vl_desc" ] || _vl_desc=$SCRIPT_RELEASE
   case "$_vl_desc" in
     *-*-g*)
