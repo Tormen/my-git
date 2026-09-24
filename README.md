@@ -413,11 +413,16 @@ uncommitted changes.
 
 Because preserved history lives outside `refs/heads/*`, a default clone/fetch
 and `git push --all` would skip it, so my-git adds the fetch **and** push
-refspecs to every remote and pushes `refs/my-git/merged/*` explicitly. To pick
-it up in a clone made by hand:
+refspecs to every remote and pushes `refs/my-git/merged/*` explicitly. None of
+them is forced: a `+` push spec makes a plain `git push` from a checkout that
+is behind rewind the remote, and a `+` fetch spec would replace a newer local
+pin with the remote's older one. A pin the remote holds differently is
+reported as `pin-rejected`, never overwritten. `flatten --merge` and
+`push go` fold any older spelling of these lines (forced, duplicated) into
+one unforced line each. To pick the history up in a clone made by hand:
 
 ```sh
-git config --add remote.origin.fetch '+refs/my-git/merged/*:refs/my-git/merged/*'
+git config --replace-all remote.origin.fetch 'refs/my-git/merged/*:refs/my-git/merged/*' '^\+?refs/my-git/merged/\*:refs/my-git/merged/\*$'
 git fetch origin
 ```
 

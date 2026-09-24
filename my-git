@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="a92ea61"
+SCRIPT_COMMIT="82f06e1"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-5-ga92ea61"
+SCRIPT_RELEASE="v2.0-6-g82f06e1"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -1382,6 +1382,11 @@ ensure_sidecar_exclude() {
 #   destructive operation in my-git is 'flatten --rm-git', which deletes
 #   nested .git dirs outright behind a spelled-out confirmation.
 MERGED_REFS_ROOT=refs/my-git/merged
+# The one spelling of each preserved-history refspec my-git writes, as the
+# ERE 'git config --replace-all' folds every other spelling into. Only '/'
+# and '-' occur in $MERGED_REFS_ROOT, and neither is special in an ERE.
+EPR_HEADS_RE='^\+?refs/heads/\*:refs/heads/\*$'
+EPR_MERGED_RE="^\\+?$MERGED_REFS_ROOT/\\*:$MERGED_REFS_ROOT/\\*\$"
 
 # ─── Container force-add ────────────────────────────────────────────────
 # A container repo (src) mirrors its children's files but HONOURS their
@@ -1522,58 +1527,124 @@ preserve_merged_history() {
   return 0
 }
 
-# ensure_preserved_refspec <repo>
+# ensure_preserved_refspec <repo> [analyze]
 #   Preserved history lives OUTSIDE refs/heads, so neither a default
 #   'git clone'/'git fetch' nor 'git push --all' touches it. Teach every
 #   remote to carry it, so the parent stays portable: once a merge has
 #   deleted a nested .git, $MERGED_REFS_ROOT is the ONLY copy of that
 #   history, and a push that silently skips it is data loss on the next
-#   machine. Idempotent; adds nothing until there is something to carry.
+#   machine. Setting ANY push refspec replaces git's default 'push the
+#   current branch', so the heads spec is restated alongside ours.
+#
+#   Nothing here is forced. A '+' push spec turns a plain 'git push' from a
+#   machine that is BEHIND into a rewind of the shared remote: it cost
+#   /LINKS/gits/src.git 12 commits once and 7 more on 2026-09-24. A '+'
+#   fetch spec into $MERGED_REFS_ROOT -- a LOCAL namespace, not a
+#   remote-tracking one -- replaces a newer unpushed pin with the remote's
+#   older one. Unforced, both are rejected and nothing is lost.
+#
+#   Each of our lines is written with 'config --replace-all <spec> <regex>',
+#   which folds every spelling of it (forced, unforced, duplicated by pasted
+#   advice) into ONE canonical line and adds it when missing; a second run
+#   finds nothing to do. A line of ours that is present is always healed; a
+#   missing one is only added once there is history to carry, because a
+#   heads push spec where none was configured changes what a plain push
+#   sends. Lines my-git never writes are left alone. 'analyze' reports
+#   instead of writing. EPR_CHANGES counts what was (or would be) changed.
 ensure_preserved_refspec() {
   _epr_repo=$1
-  _epr_spec="+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*"
-  ( cd "$_epr_repo" 2>/dev/null || exit 0
-    [ -n "$(git for-each-ref --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] || exit 0
-    for _epr_r in $(git remote 2>/dev/null); do
-      git config --get-all "remote.$_epr_r.fetch" 2>/dev/null | grep -qxF "$_epr_spec" \
-        || { log_dbg_med "ensure_preserved_refspec: $_epr_repo — adding fetch refspec '$_epr_spec' to remote '$_epr_r'"
-             git config --add "remote.$_epr_r.fetch" "$_epr_spec" 2>/dev/null; }
-      # Setting ANY push refspec replaces git's default 'push the current
-      # branch', so the heads spec has to be restated alongside ours.
-      #
-      # UNFORCED, unlike ours. '+' is right for $MERGED_REFS_ROOT -- my-git
-      # owns that namespace and moves it deliberately -- and catastrophic for
-      # refs/heads: it turns a plain 'git push' from a machine that is BEHIND
-      # into a silent rewind of every branch on the shared remote. That is not
-      # hypothetical; it cost /LINKS/gits/src.git 12 commits from a checkout
-      # that was 11 behind. Unforced, the same push is simply rejected.
-      if ! git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF "$_epr_spec"; then
-        log_dbg_med "ensure_preserved_refspec: $_epr_repo — adding push refspecs to remote '$_epr_r'"
-        git config --get-all "remote.$_epr_r.push" 2>/dev/null | grep -qxF 'refs/heads/*:refs/heads/*' \
-          || git config --add "remote.$_epr_r.push" 'refs/heads/*:refs/heads/*' 2>/dev/null
-        git config --add "remote.$_epr_r.push" "$_epr_spec" 2>/dev/null
-      fi
-    done
-  )
+  _epr_dry=0; [ "${2:-}" = analyze ] && _epr_dry=1
+  EPR_CHANGES=0
+  _epr_add=0
+  [ -n "$(run_as_owner_capture "$_epr_repo" git for-each-ref --count=1 --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] \
+    && _epr_add=1
+  for _epr_r in $(run_as_owner_capture "$_epr_repo" git remote 2>/dev/null); do
+    _epr_one "remote.$_epr_r.push"  'refs/heads/*:refs/heads/*' "$EPR_HEADS_RE"
+    _epr_one "remote.$_epr_r.push"  "$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" "$EPR_MERGED_RE"
+    _epr_one "remote.$_epr_r.fetch" "$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" "$EPR_MERGED_RE"
+  done
+  return 0
+}
+
+# _epr_one <key> <spec> <regex>   (reads _epr_repo, _epr_dry, _epr_add)
+_epr_one() {
+  _eo_key=$1; _eo_spec=$2; _eo_re=$3
+  _eo_hit=$(run_as_owner_capture "$_epr_repo" git config --get-all "$_eo_key" 2>/dev/null | grep -E -- "$_eo_re")
+  if [ -z "$_eo_hit" ]; then
+    [ "$_epr_add" = 1 ] || return 0
+    _eo_verb=add; _eo_done=added; _eo_what="$_eo_key '$_eo_spec'"
+  else
+    [ "$_eo_hit" = "$_eo_spec" ] && return 0
+    _eo_verb=heal; _eo_done=healed
+    _eo_was=$(printf '%s\n' "$_eo_hit" | sort | uniq -c \
+      | awk '{ printf "%s%sx %s", (NR > 1 ? ", " : ""), $1, $2 }')
+    _eo_what="$_eo_key: $(printf '%s\n' "$_eo_hit" | grep -c .) line(s) -> '$_eo_spec' (was: $_eo_was)"
+  fi
+  EPR_CHANGES=$((EPR_CHANGES + 1))
+  if [ "$_epr_dry" = 1 ]; then
+    log_major "$_epr_repo: would $_eo_verb $_eo_what"
+  elif run_as_owner "$_epr_repo" git config --replace-all "$_eo_key" "$_eo_spec" "$_eo_re" 2>/dev/null; then
+    log_major "$_epr_repo: $_eo_done $_eo_what"
+  else
+    log_warn "$_epr_repo: could not $_eo_verb $_eo_key as the repo's owner — by hand: $(_owner_cmd_prefix "$_epr_repo")git -C $_epr_repo config --replace-all $_eo_key '$_eo_spec' '$_eo_re'"
+  fi
+  return 0
+}
+
+# _forced_push_specs <repo> <remote>
+#   The '+' push refspecs configured for <remote> that are NOT my-git's own
+#   (those ensure_preserved_refspec heals). Each makes a plain 'git push' a
+#   force push, so push_one refuses the repo while one is there.
+_forced_push_specs() {
+  run_as_owner_capture "$1" git config --get-all "remote.$2.push" 2>/dev/null \
+    | grep '^+' | grep -vE -- "$EPR_HEADS_RE" | grep -vE -- "$EPR_MERGED_RE"
+}
+
+# _rejected_refs <git-push-output>
+#   The refs a 'git push' reported as '! [rejected]', one per line.
+_rejected_refs() {
+  printf '%s\n' "$1" | awk '$1 == "!" && $2 == "[rejected]" { print $3 }'
 }
 
 # push_preserved_refs <repo>
 #   'git push --all' means refs/heads/* ONLY — it does not honour a
-#   configured push refspec and never carries $MERGED_REFS_ROOT. Every
-#   place my-git pushes calls this straight afterwards so preserved
-#   history reaches the remote too. No-op when there is none.
+#   configured push refspec and never carries $MERGED_REFS_ROOT. mc's
+#   pushes ('git push --all') call this straight afterwards so preserved
+#   history reaches the remote too; push_one runs a plain 'git push', which
+#   carries it through the refspec ensure_preserved_refspec configured.
+#   UNFORCED: a pin the remote holds differently may be the only copy of
+#   what another machine merged, so it is reported, never replaced.
+#   No-op when there is nothing to carry.
 push_preserved_refs() {
   _ppr_repo=$1
-  [ -n "$(run_as_owner_capture "$_ppr_repo" git for-each-ref --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] || return 0
+  [ -n "$(run_as_owner_capture "$_ppr_repo" git for-each-ref --count=1 --format='%(refname)' "$MERGED_REFS_ROOT" 2>/dev/null)" ] || return 0
   _ppr_remote=$(run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | grep -x origin || \
                 run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | head -n 1)
   [ -n "$_ppr_remote" ] || return 0
-  run_as_owner "$_ppr_repo" git push -q "$_ppr_remote" "+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" || {
-    log_warn "$_ppr_repo: could not push $MERGED_REFS_ROOT/* to '$_ppr_remote' — merged history is still LOCAL-ONLY on this machine"
-    return 1
-  }
-  log_medium "$_ppr_repo: pushed preserved merge history ($MERGED_REFS_ROOT/*) to '$_ppr_remote'"
-  return 0
+  if _ppr_out=$(run_as_owner "$_ppr_repo" git push -q "$_ppr_remote" "$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" 2>&1); then
+    log_medium "$_ppr_repo: pushed preserved merge history ($MERGED_REFS_ROOT/*) to '$_ppr_remote'"
+    return 0
+  fi
+  _ppr_rej=$(_rejected_refs "$_ppr_out")
+  if [ -n "$_ppr_rej" ]; then
+    _pin_rejected_report "$_ppr_repo" "$_ppr_remote" "$_ppr_rej"
+  else
+    log_warn "$_ppr_repo: could not push $MERGED_REFS_ROOT/* to '$_ppr_remote' — merged history is still LOCAL-ONLY on this machine: $(printf '%s' "$_ppr_out" | tail -n 1)"
+  fi
+  return 1
+}
+
+# _pin_rejected_report <repo> <remote> <refs, one per line>
+#   One WARN per pin the remote refused to have replaced, with our sha and
+#   the command that shows theirs. Counted in PIN_REJECTED_N.
+_pin_rejected_report() {
+  while IFS= read -r _prr_ref; do
+    [ -n "$_prr_ref" ] || continue
+    PIN_REJECTED_N=$((${PIN_REJECTED_N:-0} + 1))
+    log_warn "$1: pin-rejected $_prr_ref — '$2' holds a different pin, NOT overwritten (ours $(run_as_owner_capture "$1" git rev-parse --short "$_prr_ref" 2>/dev/null); theirs: git -C $1 ls-remote $2 $_prr_ref)"
+  done <<_PRR_EOF
+$3
+_PRR_EOF
 }
 
 # list_merged_dirs <repo>
@@ -5116,6 +5187,36 @@ push_one() {
     PS_N_DIVERGED=$((PS_N_DIVERGED + 1)); return 0
   fi
 
+  # The push below is a plain 'git push', so it follows the configured
+  # refspecs -- and a '+' there makes it a FORCE push: every branch this
+  # checkout is behind on gets rewound on the remote, although only the
+  # current branch was weighed above. my-git's own lines are healed (or,
+  # in analyze, reported); a '+' line it did not write is not its to
+  # rewrite, so the repo is refused until it is removed or --force says so.
+  _ps_rem=${_up%%/*}
+  if [ "$DRY_RUN" = 1 ]; then
+    ensure_preserved_refspec "$_r" analyze
+  else
+    ensure_preserved_refspec "$_r"
+  fi
+  _ps_plus=$(_forced_push_specs "$_r" "$_ps_rem")
+  if [ -n "$_ps_plus" ]; then
+    if [ "${PS_FORCE:-0}" = 1 ]; then
+      log_medium "$_r: forced push refspec(s) OVERRIDDEN by --force"
+    else
+      log_major "$(printf '%-60s %s' "$_r" "FORCED push refspec configured -> refused")"
+      while IFS= read -r _ps_line; do
+        printf '    > remote.%s.push = %s\n' "$_ps_rem" "$_ps_line"
+        printf "    > remove it:  %sgit -C %s config --fixed-value --unset remote.%s.push '%s'\n" \
+          "$(_owner_cmd_prefix "$_r")" "$_r" "$_ps_rem" "$_ps_line"
+      done <<_PS_PLUS_EOF
+$_ps_plus
+_PS_PLUS_EOF
+      printf '    > or push anyway:  %s%s push go --force\n' "$(_cd_prefix "$_r")" "$US"
+      PS_N_REFUSED=$((PS_N_REFUSED + 1)); return 0
+    fi
+  fi
+
   if [ "$DRY_RUN" = 1 ]; then
     log_major "$(printf '%-60s %s' "$_r" "ahead $_ahead -> would push to $_up")"
     PS_N_WOULD=$((PS_N_WOULD + 1)); return 0
@@ -5135,6 +5236,17 @@ push_one() {
   # going instead of blocking the whole tree on a prompt.
   if _ps_err=$(run_as_owner "$_r" env GIT_TERMINAL_PROMPT=0 git push 2>&1); then
     log_ok "push: $_r — $_ahead commit(s) published to $_up"
+    PS_N_PUSHED=$((PS_N_PUSHED + 1)); return 0
+  fi
+  # Only preserved-history pins refused, nothing else: the commits DID go
+  # out, so calling the repo FAILED would be false. The pins are named and
+  # counted apart.
+  _ps_rej=$(_rejected_refs "$_ps_err")
+  if [ -n "$_ps_rej" ] \
+     && ! printf '%s\n' "$_ps_rej" | grep -qv "^$MERGED_REFS_ROOT/" \
+     && ! printf '%s\n' "$_ps_err" | grep -qF '[remote rejected]'; then
+    log_ok "push: $_r — $_ahead commit(s) published to $_up"
+    _pin_rejected_report "$_r" "$_ps_rem" "$_ps_rej"
     PS_N_PUSHED=$((PS_N_PUSHED + 1)); return 0
   fi
   log_fail "push: $_r — git push to $_up FAILED"
@@ -5191,6 +5303,7 @@ cmd_push() {
   PS_N_TOTAL=0; PS_N_PUSHED=0; PS_N_WOULD=0; PS_N_UPTODATE=0
   PS_N_NOREMOTE=0; PS_N_NOUPSTREAM=0; PS_N_DIVERGED=0
   PS_N_SKIPPED=0; PS_N_IGNORED=0; PS_N_ERROR=0; PS_N_FOREIGN=0
+  PS_N_REFUSED=0; PIN_REJECTED_N=0
 
   _rc_total=0
   _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.psroots.XXXXXX")
@@ -5243,6 +5356,8 @@ cmd_push() {
   [ "$PS_N_NOUPSTREAM" -gt 0 ] && _p="$_p no-upstream=$PS_N_NOUPSTREAM"
   [ "$PS_N_DIVERGED"   -gt 0 ] && _p="$_p diverged=$PS_N_DIVERGED"
   [ "$PS_N_FOREIGN"    -gt 0 ] && _p="$_p foreign=$PS_N_FOREIGN"
+  [ "$PS_N_REFUSED"    -gt 0 ] && _p="$_p refused=$PS_N_REFUSED"
+  [ "$PIN_REJECTED_N"  -gt 0 ] && _p="$_p pin-rejected=$PIN_REJECTED_N"
   [ "$PS_N_IGNORED"    -gt 0 ] && _p="$_p ignored=$PS_N_IGNORED"
   [ "$PS_N_SKIPPED"    -gt 0 ] && _p="$_p skipped=$PS_N_SKIPPED"
   [ "$PS_N_ERROR"      -gt 0 ] && _p="$_p FAILED=$PS_N_ERROR"
@@ -6294,7 +6409,7 @@ _FL_ADD_EOF
         printf -- 'NOT carry %s/* -- my-git adds the fetch+push\n' "$MERGED_REFS_ROOT"
         printf -- 'refspecs to every remote so its own push/pull do. To pick them up\n'
         printf -- 'in a fresh clone made by hand:\n'
-        printf -- '  git config --add remote.origin.fetch "+%s/*:%s/*" && git fetch origin\n\n' "$MERGED_REFS_ROOT" "$MERGED_REFS_ROOT"
+        printf -- "  git config --replace-all remote.origin.fetch '%s/*:%s/*' '%s' && git fetch origin\n\n" "$MERGED_REFS_ROOT" "$MERGED_REFS_ROOT" "$EPR_MERGED_RE"
       fi
       if [ -n "$_msn_transferred" ]; then
         printf -- '--- sub-submodule(s) transferred to their own sidecar (would otherwise have lost their history along with this .git) ---\n'
@@ -8812,7 +8927,7 @@ _unfl_restore_preserved() {
   _urp_branch=$4
   _urp_parent_gitdir=$(run git rev-parse --absolute-git-dir) || return 1
   if [ -z "$(git for-each-ref --format='%(refname)' "$_urp_ns" 2>/dev/null)" ]; then
-    log_warn "unflatten: $_urp_path: .git.merged points at '$_urp_ns' but this repo has no such refs — the preserved history is missing here (a plain clone does NOT fetch $MERGED_REFS_ROOT/*; try: git config --add remote.origin.fetch '+$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*' && git fetch origin)"
+    log_warn "unflatten: $_urp_path: .git.merged points at '$_urp_ns' but this repo has no such refs — the preserved history is missing here (a plain clone does NOT fetch $MERGED_REFS_ROOT/*; try: git config --replace-all remote.origin.fetch '$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*' '$EPR_MERGED_RE' && git fetch origin)"
     return 1
   fi
   log_medium "unflatten  $_urp_path  (restoring the preserved history from $_urp_ns — full pre-merge history, branches and tags)"
@@ -13585,6 +13700,16 @@ What it will NOT do:
   * touch local-only repos (the '⌂' rows in st) — there is nowhere to send
     them, which is not an error.
   * touch repos carrying the my-git.ignore marker (--force overrides).
+  * force anything. The push is a plain 'git push', which follows the
+    configured push refspecs, and a '+' there makes it a force push that
+    rewinds every branch this checkout is behind on. my-git's own lines
+    (refs/heads/*, refs/my-git/merged/*) are healed to one unforced line
+    each before pushing ('would heal' in analyze). A '+' line it did not
+    write refuses the repo, naming the line and the command that removes
+    it; --force pushes anyway.
+  * replace a pin. A refs/my-git/merged/* ref the remote holds differently
+    may be the only copy of another machine's merge: it is left there,
+    named, and counted as 'pin-rejected'. The commits still go out.
 EOF
 }
 
@@ -18214,18 +18339,61 @@ _RT_STALE_CONF_EOF
         && git clone -q ../kid_o kid >/dev/null 2>&1 )
     cd global || return 1
     _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
-    git config --get-all remote.origin.fetch | grep -qxF '+refs/my-git/merged/*:refs/my-git/merged/*' \
+    git config --get-all remote.origin.fetch | grep -qxF 'refs/my-git/merged/*:refs/my-git/merged/*' \
       || { _rt_fail "remote.origin.fetch is missing the preserved-history refspec"; return 1; }
-    git config --get-all remote.origin.push | grep -qxF '+refs/my-git/merged/*:refs/my-git/merged/*' \
+    git config --get-all remote.origin.push | grep -qxF 'refs/my-git/merged/*:refs/my-git/merged/*' \
       || { _rt_fail "remote.origin.push is missing the preserved-history refspec"; return 1; }
     # Setting a push refspec replaces git's default, so heads must be restated.
     git config --get-all remote.origin.push | grep -qxF 'refs/heads/*:refs/heads/*' \
       || { _rt_fail "remote.origin.push must still carry refs/heads/* alongside"; return 1; }
-    # ...UNFORCED. A '+' here makes every plain push from a behind checkout
-    # rewind the shared remote; only $MERGED_REFS_ROOT may be forced.
-    if git config --get-all remote.origin.push | grep -qxF '+refs/heads/*:refs/heads/*'; then
-      _rt_fail "remote.origin.push force-pushes refs/heads/* -- a behind checkout would rewind the remote"; return 1
+    # ...and NOTHING forced: a '+' turns a plain push from a behind checkout
+    # into a rewind of the shared remote, and a '+' fetch replaces a newer
+    # local pin with the remote's older one.
+    if git config --get-all remote.origin.push | grep -q '^+' \
+       || git config --get-all remote.origin.fetch | grep -q '^+refs/my-git/'; then
+      _rt_fail "a preserved-history refspec is forced"; return 1
     fi
+    return 0
+  }
+
+  test_flatten_merge_preserved_refspecs_heal() {
+    # A config the old writer left behind: forced heads, forced pins,
+    # duplicates from pasted '--add' advice, and a hand-stripped line the old
+    # exact-string check did not recognise, so it appended a forced one again.
+    # A line my-git never wrote must survive untouched.
+    _rt_repo_file kid_o a.md
+    _rt_repo_file kid2_o b.md
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git init -q --bare "$PWD/globalremote.git"
+    ( cd global && git remote add origin "$PWD/../globalremote.git" \
+        && git clone -q ../kid_o kid >/dev/null 2>&1 && git clone -q ../kid2_o kid2 >/dev/null 2>&1 )
+    cd global || return 1
+    for _rt_s in '+refs/heads/*:refs/heads/*' '+refs/my-git/merged/*:refs/my-git/merged/*' \
+                 'refs/tags/*:refs/tags/*' '+refs/heads/*:refs/heads/*' \
+                 'refs/my-git/merged/*:refs/my-git/merged/*' '+refs/my-git/merged/*:refs/my-git/merged/*'; do
+      git config --add remote.origin.push "$_rt_s"
+    done
+    for _rt_s in 1 2 3; do
+      git config --add remote.origin.fetch '+refs/my-git/merged/*:refs/my-git/merged/*'
+    done
+    _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
+    _rt_contains "says what it healed, with the lines it replaced" "$_rt_out" \
+      "healed remote.origin.push: 3 line(s) -> 'refs/my-git/merged/*:refs/my-git/merged/*'" || return 1
+    [ "$(git config --get-all remote.origin.push)" = "refs/tags/*:refs/tags/*
+refs/heads/*:refs/heads/*
+refs/my-git/merged/*:refs/my-git/merged/*" ] \
+      || { _rt_fail "push refspecs not healed to one unforced line each (got: $(git config --get-all remote.origin.push | tr '\n' ' '))"; return 1; }
+    if [ "$(git config --get-all remote.origin.fetch | grep -c 'my-git/merged')" != 1 ] \
+       || ! git config --get-all remote.origin.fetch | grep -qxF 'refs/my-git/merged/*:refs/my-git/merged/*'; then
+      _rt_fail "fetch refspecs not healed to one unforced line (got: $(git config --get-all remote.origin.fetch | tr '\n' ' '))"; return 1
+    fi
+    # Stable: the next run finds nothing to do and leaves the file byte-equal.
+    cp .git/config ../config.after1
+    _rt_ok "flatten go kid2 --merge" _rt_my_git flatten go kid2 --merge || return 1
+    _rt_not_contains "a second run heals nothing" "$_rt_out" "healed" || return 1
+    cmp -s .git/config ../config.after1 \
+      || { _rt_fail "a second run changed .git/config"; return 1; }
     return 0
   }
 
@@ -19730,6 +19898,111 @@ _RT_STALE_CONF_EOF
     _rt_contains "says why" "$_rt_out" "pushing would CREATE it" || return 1
     [ "$(git -C ../up_bare for-each-ref --format=x refs/heads/ | grep -c x)" = "$_rt_before" ] \
       || { _rt_fail "created a branch on the remote nobody asked for"; return 1; }
+    return 0
+  }
+
+  test_push_heals_forced_refspecs_and_refuses_a_foreign_plus() {
+    # The 2026-09-24 accident, in miniature. 'proj' is ahead on main but
+    # BEHIND on 'side', where someone else has published. push_one only
+    # weighs the current branch, then runs a plain 'git push' -- which
+    # honours the configured refspecs. With '+refs/heads/*:refs/heads/*'
+    # configured, that rewinds 'side' on the remote.
+    _rt_repo_file up_a a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git clone -q --bare up_a up_bare >/dev/null 2>&1
+    ( cd container && git clone -q ../up_bare proj >/dev/null 2>&1 )
+    git -C container/proj branch -q side 2>/dev/null
+    git -C container/proj push -q origin side 2>/dev/null
+    git clone -q up_bare other >/dev/null 2>&1
+    git -C other checkout -q side 2>/dev/null
+    printf 'theirs\n' >> other/a.md
+    git -C other commit -q -am "published on side elsewhere" 2>/dev/null
+    git -C other push -q origin side 2>/dev/null
+    _rt_theirs=$(git -C up_bare rev-parse side)
+    cd container || return 1
+    printf 'ours\n' >> proj/a.md
+    git -C proj commit -q -am "our work on main" 2>/dev/null
+    git -C proj config --add remote.origin.push '+refs/heads/*:refs/heads/*'
+    git -C proj config --add remote.origin.push '+refs/heads/*:refs/heads/*'
+
+    _rt_ok "push analyze" _rt_my_git push --discover -R || return 1
+    _rt_contains "analyze names the heal it would do" "$_rt_out" \
+      "would heal remote.origin.push: 2 line(s) -> 'refs/heads/*:refs/heads/*'" || return 1
+    [ "$(git -C proj config --get-all remote.origin.push | grep -c '^+')" = 2 ] \
+      || { _rt_fail "analyze mode wrote .git/config"; return 1; }
+
+    _rt_my_git push --discover -R go >/dev/null 2>&1
+    [ "$(git -C ../up_bare rev-parse side)" = "$_rt_theirs" ] \
+      || { _rt_fail "push go REWOUND 'side' on the remote -- the '+' refspec forced it"; return 1; }
+    [ "$(git -C proj config --get-all remote.origin.push)" = 'refs/heads/*:refs/heads/*' ] \
+      || { _rt_fail "push go did not heal the forced heads refspec"; return 1; }
+
+    # A '+' my-git did not write is not mine to rewrite: refuse, say how to
+    # remove it, and offer --force for the one run that means it.
+    git -C proj fetch -q origin side:side 2>/dev/null
+    git -C proj branch -q wip 2>/dev/null
+    git -C proj config --add remote.origin.push '+refs/heads/wip:refs/heads/wip'
+    printf 'more\n' >> proj/a.md
+    git -C proj commit -q -am "more work on main" 2>/dev/null
+    _rt_main_before=$(git -C ../up_bare rev-parse main)
+    _rt_ok "push go with a foreign '+' refspec" _rt_my_git push --discover -R go || return 1
+    _rt_contains "names the forced line" "$_rt_out" "+refs/heads/wip:refs/heads/wip" || return 1
+    _rt_contains "says how to remove it" "$_rt_out" \
+      "config --fixed-value --unset remote.origin.push '+refs/heads/wip:refs/heads/wip'" || return 1
+    _rt_contains "offers --force" "$_rt_out" "push go --force" || return 1
+    _rt_contains "counts it" "$_rt_out" "refused=1" || return 1
+    [ "$(git -C ../up_bare rev-parse main)" = "$_rt_main_before" ] \
+      || { _rt_fail "pushed despite a forced refspec it did not write"; return 1; }
+    _rt_ok "push go --force" _rt_my_git push --discover -R go --force || return 1
+    [ "$(git -C ../up_bare rev-parse main)" = "$(git -C proj rev-parse main)" ] \
+      || { _rt_fail "--force did not push"; return 1; }
+    return 0
+  }
+
+  test_push_preserved_refs_never_overwrites_a_pin() {
+    # A pin under refs/my-git/merged/ can be the ONLY copy of a merged
+    # repo's history. Another machine has published a different pin for the
+    # same path; neither 'push' (config refspec) nor mc's push_preserved_refs
+    # may replace it. The commits still go out, so the repo is not FAILED.
+    _rt_repo_file up_a a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    git clone -q --bare up_a up_bare >/dev/null 2>&1
+    ( cd container && git clone -q ../up_bare proj >/dev/null 2>&1 )
+    git clone -q up_bare other >/dev/null 2>&1
+    git -C other commit -q --allow-empty -m "their pin" 2>/dev/null
+    git -C other push -q origin 'HEAD:refs/my-git/merged/kid/heads/main' 2>/dev/null
+    _rt_theirs=$(git -C up_bare rev-parse refs/my-git/merged/kid/heads/main)
+    cd container || return 1
+    git -C proj commit -q --allow-empty -m "our unrelated pin" 2>/dev/null
+    git -C proj update-ref refs/my-git/merged/kid/heads/main HEAD
+    git -C proj reset -q --hard HEAD~1
+    # As the old flatten --merge configured it.
+    git -C proj config --add remote.origin.push '+refs/heads/*:refs/heads/*'
+    git -C proj config --add remote.origin.push '+refs/my-git/merged/*:refs/my-git/merged/*'
+    printf 'ours\n' >> proj/a.md
+    git -C proj commit -q -am "our work" 2>/dev/null
+
+    _rt_my_git push --discover -R go >"$PWD/../push.out" 2>&1
+    [ "$(git -C ../up_bare rev-parse refs/my-git/merged/kid/heads/main)" = "$_rt_theirs" ] \
+      || { _rt_fail "push OVERWROTE the remote's pin"; return 1; }
+    [ "$(git -C ../up_bare rev-parse main)" = "$(git -C proj rev-parse main)" ] \
+      || { _rt_fail "push did not publish the commits beside the rejected pin"; return 1; }
+    _rt_contains "names the rejected pin" "$PWD/../push.out" "refs/my-git/merged/kid/heads/main" || return 1
+    _rt_contains "counts it apart from failures" "$PWD/../push.out" "pin-rejected=1" || return 1
+    _rt_not_contains "the published repo is not FAILED" "$PWD/../push.out" "FAILED=" || return 1
+
+    # mc's path pushes the pins explicitly (push_preserved_refs), forced
+    # until now. GIT_REPOS makes proj mc-pushable.
+    printf 'GIT_REPOS="%s"\n' "$PWD/proj" >> "$_rt_conf_path"
+    printf 'y\n' >> proj/a.md
+    ( cd proj && _rt_my_git mc go >/dev/null 2>&1 )
+    [ "$(git -C ../up_bare rev-parse main)" = "$(git -C proj rev-parse main)" ] \
+      || { _rt_fail "setup: mc did not push -- the pin assertion would prove nothing"; return 1; }
+    [ "$(git -C ../up_bare rev-parse refs/my-git/merged/kid/heads/main)" = "$_rt_theirs" ] \
+      || { _rt_fail "mc's push_preserved_refs OVERWROTE the remote's pin"; return 1; }
+    _rt_ok "both pushes left the remote's pin alone" true || return 1
     return 0
   }
 
@@ -24274,7 +24547,7 @@ PYDRV
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_version_says_whether_these_bytes_are_the_release test_version_ignores_a_foreign_repos_tags test_stamp_version_never_amends_someone_elses_commit test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_container_commit_refuses_what_the_child_has_not_committed test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_names_the_commits_it_pushes test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_measures_the_rows_that_have_no_repo_of_their_own test_st_names_dirty_and_out_of_step_together test_st_colours_the_state_by_what_it_asks_of_you test_st_hides_an_ignored_repo_unless_V test_st_V_is_the_default_tree_with_more_on_it test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_toplevel_across_a_symlink_into_another_repo test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_st_inside_an_intermediate_repo_keeps_the_block_the_container_needs test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_never_commits_the_repos_own_marker test_shadow_hook_repoints_a_marker_whose_container_moved test_shadow_hook_lives_only_in_a_repo_that_mirrors_something test_st_refreshes_an_outdated_shadow_hook test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write test_git_ssh_never_becomes_a_connection_master"
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_version_says_whether_these_bytes_are_the_release test_version_ignores_a_foreign_repos_tags test_stamp_version_never_amends_someone_elses_commit test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_container_commit_refuses_what_the_child_has_not_committed test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_names_the_commits_it_pushes test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_push_heals_forced_refspecs_and_refuses_a_foreign_plus test_push_preserved_refs_never_overwrites_a_pin test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_which_repo_mirrors_it test_st_flags_shadow_marker_whose_mirror_is_gone test_st_measures_the_rows_that_have_no_repo_of_their_own test_st_names_dirty_and_out_of_step_together test_st_colours_the_state_by_what_it_asks_of_you test_st_hides_an_ignored_repo_unless_V test_st_V_is_the_default_tree_with_more_on_it test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_preserved_refspecs_heal test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_toplevel_across_a_symlink_into_another_repo test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_st_inside_an_intermediate_repo_keeps_the_block_the_container_needs test_shadow_excludes_retire_from_the_container_itself test_shadow_status_preserves_first_bumps_last test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_bumps_last_shadowed_on_commit test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_never_commits_the_repos_own_marker test_shadow_hook_repoints_a_marker_whose_container_moved test_shadow_hook_lives_only_in_a_repo_that_mirrors_something test_st_refreshes_an_outdated_shadow_hook test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write test_git_ssh_never_becomes_a_connection_master"
 
   if [ -n "$_rt_filter" ]; then
     _rt_matched=""
