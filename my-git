@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="ecc5d7f"
+SCRIPT_COMMIT="905d47a"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-12-gecc5d7f"
+SCRIPT_RELEASE="v2.0-13-g905d47a"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -9113,7 +9113,7 @@ _unfl_reconstruct_merge() {
   fi
   # Fetch into FETCH_HEAD, not directly into refs/heads/main — git
   # refuses to fetch straight into whatever branch is currently checked
-  # out (which 'main' always is, right after 'git init'). Then
+  # out (which the initial branch always is, right after 'git init'). Then
   # 'reset --hard' onto an unborn branch is exactly how first-checkout
   # normally happens, just from a specific commit instead of an empty tree.
   if ! ( cd "$_urm_path" \
@@ -16917,10 +16917,13 @@ cmd_run_tests() {
   # owner's ~/.gitconfig, and a self-test that edits the developer's own git
   # config would break the "touches nothing of yours" promise the banner
   # just made. Seeded with an identity so a clone that never sets a local
-  # one can still commit.
+  # one can still commit, and with the initial branch name: the sandbox
+  # hides the developer's init.defaultBranch, and git's built-in default
+  # differs between versions, so without it a test repo starts on 'main' on
+  # one machine and on 'master' on the next.
   GIT_CONFIG_GLOBAL="$_rt_workdir/gitconfig.global"
   export GIT_CONFIG_GLOBAL
-  printf '[user]\n\tname = my-git selftest\n\temail = selftest@localhost\n' > "$GIT_CONFIG_GLOBAL"
+  printf '[user]\n\tname = my-git selftest\n\temail = selftest@localhost\n[init]\n\tdefaultBranch = main\n' > "$GIT_CONFIG_GLOBAL"
 
   _rt_conf() {
     cat > "$1" <<'_RT_CONF_EOF'
@@ -20091,7 +20094,9 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     git -C proj config --add remote.origin.push '+refs/heads/wip:refs/heads/wip'
     printf 'more\n' >> proj/a.md
     git -C proj commit -q -am "more work on main" 2>/dev/null
-    _rt_main_before=$(git -C ../up_bare rev-parse main)
+    _rt_main_before=$(git -C ../up_bare rev-parse --verify -q main)
+    [ -n "$_rt_main_before" ] \
+      || { _rt_fail "setup: the remote has no 'main' -- every comparison below would compare two empty strings"; return 1; }
     _rt_ok "push go with a foreign '+' refspec" _rt_my_git push --discover -R go || return 1
     _rt_contains "names the forced line" "$_rt_out" "+refs/heads/wip:refs/heads/wip" || return 1
     _rt_contains "says how to remove it" "$_rt_out" \
@@ -20129,6 +20134,8 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     git -C proj config --add remote.origin.push '+refs/my-git/merged/*:refs/my-git/merged/*'
     printf 'ours\n' >> proj/a.md
     git -C proj commit -q -am "our work" 2>/dev/null
+    git -C ../up_bare rev-parse --verify -q main >/dev/null \
+      || { _rt_fail "setup: the remote has no 'main' -- every comparison below would compare two empty strings"; return 1; }
 
     _rt_my_git push --discover -R go >"$PWD/../push.out" 2>&1
     [ "$(git -C ../up_bare rev-parse refs/my-git/merged/kid/heads/main)" = "$_rt_theirs" ] \
