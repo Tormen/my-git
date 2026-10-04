@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="60e2893"
+SCRIPT_COMMIT="149a3f2"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-14-g60e2893"
+SCRIPT_RELEASE="v2.0-15-g149a3f2"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -66,7 +66,7 @@ _version_line() {
   _vl_desc=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
   # describe answers about WHERE this file sits, not about what it is: a copy
   # dropped in a foreign repo gets THAT repo's tags (/LINKS/global is one, and
-  # it holds the copies update-LINKS promotes). Its tags are this tool's
+  # it holds the copies my-rollout promotes). Its tags are this tool's
   # releases only where the tool OWNS the repo -- and the repo that owns it
   # holds the release this build is measured against, with this very file in
   # it at the same path: SCRIPT_RELEASE's tag, or -- when the stamp names none
@@ -10056,8 +10056,8 @@ $_selr_p/.git.shadow.status
 # healed without re-reading the file.
 # With <container> given, the container's force-add VETOES are excluded here
 # as well. A '!' line names a file the container deliberately does not carry
-# although one of its globs matches it -- .update-LINKS.local, written
-# root-owned and chflags-locked on every machine. The CHILD has no reason to
+# although one of its globs matches it -- e.g. a machine-state file every
+# machine writes root-owned and chflags-locked. The CHILD has no reason to
 # ignore it (what the container backs up is not the project's business), so
 # without this line the file reads as one untracked path in the child
 # forever, and wt_matches_commit hashes it into the tree and then matches
@@ -11797,7 +11797,7 @@ _fap_path_matches() {
 # Exit 0 when PATH matches at least one positive glob and NO '!' negation.
 #
 # A negation exists for the file a broad pattern is right to catch in general
-# but must never carry: '.update-LINKS.local' matches '*.local', yet it is
+# but must never carry: a machine-state file that matches '*.local', yet is
 # written root-owned and chflags-locked on every machine, so a clone that
 # received it could not check it out at all -- 'git pull' fails with
 # "unable to unlink old" and the merge aborts.
@@ -21228,7 +21228,7 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd container && git clone -q ../up_bare proj >/dev/null 2>&1 )
     cd container || return 1
-    printf '*.local\n*.local.*\n!.update-LINKS.local\n' > .git.force-add-patterns
+    printf '*.local\n*.local.*\n!.machine-state.local\n' > .git.force-add-patterns
     git add .git.force-add-patterns >/dev/null 2>&1
     _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
     git commit -q -am "container with a force-add veto" 2>/dev/null || true
@@ -21236,9 +21236,9 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     git clone -q . ../fresh >/dev/null 2>&1
     cd ../fresh || return 1
     # Per-machine state: written HERE, never carried by the container.
-    printf 'machine state\n' > proj/.update-LINKS.local
+    printf 'machine state\n' > proj/.machine-state.local
     _rt_ok "rehydrate go" _rt_my_git rehydrate go || return 1
-    _rt_contains "the exclude names the vetoed path" "proj/.git/info/exclude" ".update-LINKS.local" || return 1
+    _rt_contains "the exclude names the vetoed path" "proj/.git/info/exclude" ".machine-state.local" || return 1
     if [ -n "$(git -C proj status --porcelain 2>/dev/null)" ]; then
       _rt_fail "the vetoed file still shows: $(git -C proj status --porcelain | head -3 | tr '\n' ' ')"
       return 1
@@ -21722,7 +21722,7 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
 
   test_force_add_negation_beats_a_matching_glob() {
     # A '!' line vetoes a file the positive globs are right to catch in
-    # general. '.update-LINKS.local' is the real case: it matches '*.local',
+    # general. A machine-state file is the case: it matches '*.local',
     # but every machine writes it root-owned and chflags-locked, so a clone
     # that received it could not check it out -- 'git pull' dies with
     # "unable to unlink old" and the merge aborts.
@@ -21731,11 +21731,11 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 )
     cd container || return 1
-    printf '*.local\n*.local.*\n!.update-LINKS.local\n' > .git.force-add-patterns
+    printf '*.local\n*.local.*\n!.machine-state.local\n' > .git.force-add-patterns
     printf '*.local\n*.local.*\n' > proj/.gitignore
     printf 'real\n' > proj/keep.py
     printf 'x\n'    > proj/notes.local
-    printf 'ctrl\n' > proj/.update-LINKS.local
+    printf 'ctrl\n' > proj/.machine-state.local
     ( cd proj && git add .gitignore keep.py \
       && git -c user.name=T -c user.email=t@t commit -qm base ) >/dev/null 2>&1
 
@@ -21744,7 +21744,7 @@ refs/my-git/merged/*:refs/my-git/merged/*" ] \
     [ -n "$(git ls-files -- proj/notes.local)" ] \
       || { _rt_fail "the positive glob stopped carrying an ordinary .local file"; return 1; }
     _rt_ok "positive globs still carry" true || return 1
-    if [ -n "$(git ls-files -- proj/.update-LINKS.local)" ]; then
+    if [ -n "$(git ls-files -- proj/.machine-state.local)" ]; then
       _rt_fail "a '!' negation did not veto the file its glob matched"; return 1
     fi
     _rt_ok "the negated file stays out" true || return 1
