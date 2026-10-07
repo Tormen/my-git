@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="149a3f2"
+SCRIPT_COMMIT="98c646a"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-15-g149a3f2"
+SCRIPT_RELEASE="v2.0-16-g98c646a"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -9106,6 +9106,33 @@ _unfl_reconstruct_merge() {
   log_dbg_med "reconstruct $_urm_path: subtree split OK; branch '$_urm_branch' -> $(git rev-parse --short "$_urm_branch" 2>/dev/null)"
   _urm_parent_gitdir=$(run git rev-parse --absolute-git-dir)
   log_dbg_med "reconstruct $_urm_path: parent gitdir = $_urm_parent_gitdir"
+  # A SHADOWED path: this repo tracks <path>/.git.shadow.status, so every
+  # commit since the shadow carries it, and the split hands them over as they
+  # are. The marker is the PARENT's record of the mirror -- shadow keeps it
+  # out of the child -- so rewrite it out of the split history before the
+  # child sees it. filter-branch keeps authors and dates: two machines
+  # rebuilding the same container history get the same commits. It refuses
+  # to run without a HEAD (a fresh 'git init') or with a dirty worktree (the
+  # parent), hence a throwaway bare repo between the two.
+  _urm_src=$_urm_parent_gitdir
+  _urm_bare=""
+  if [ -n "$(git log -n 1 --format=%H -- "$_urm_path/.git.shadow.status" 2>/dev/null)" ]; then
+    _urm_bare=$(mktemp -d "${TMPDIR:-/tmp}/${US}.unflsh.XXXXXX") || _urm_bare=""
+    if [ -z "$_urm_bare" ] || ! (
+         export FILTER_BRANCH_SQUELCH_WARNING=1
+         run git init -q --bare "$_urm_bare" \
+           && run git -C "$_urm_bare" fetch -q "$_urm_parent_gitdir" "$_urm_branch:refs/heads/$_urm_branch" \
+           && run git -C "$_urm_bare" symbolic-ref HEAD "refs/heads/$_urm_branch" \
+           && run git -C "$_urm_bare" filter-branch -f --prune-empty \
+                --index-filter 'git rm -q --cached --ignore-unmatch -- .git.shadow.status' \
+                -- "refs/heads/$_urm_branch" >/dev/null 2>&1 ); then
+      log_error "unflatten: $_urm_path: could not keep the shadow marker out of the reconstructed history"
+      [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
+      run git branch -D "$_urm_branch" >/dev/null 2>&1
+      return 1
+    fi
+    _urm_src=$_urm_bare
+  fi
   if ! run git init -q "$_urm_path"; then
     log_error "unflatten: $_urm_path: git init failed"
     run git branch -D "$_urm_branch" >/dev/null 2>&1
@@ -9117,14 +9144,20 @@ _unfl_reconstruct_merge() {
   # 'reset --hard' onto an unborn branch is exactly how first-checkout
   # normally happens, just from a specific commit instead of an empty tree.
   if ! ( cd "$_urm_path" \
-         && run git fetch -q "$_urm_parent_gitdir" "$_urm_branch" \
+         && run git fetch -q "$_urm_src" "$_urm_branch" \
          && run git reset -q --hard FETCH_HEAD ); then
     log_error "unflatten: $_urm_path: materializing the reconstructed history failed"
     run rm -rf -- "$_urm_path/.git"
+    [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
     run git branch -D "$_urm_branch" >/dev/null 2>&1
     return 1
   fi
+  [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
   run git branch -D "$_urm_branch" >/dev/null 2>&1
+  if [ -n "$_urm_bare" ]; then
+    _shadow_exclude_marker "$_urm_path" "$PWD" || true
+    log_medium "$_urm_path: its .git.shadow.status stays this repo's record of the mirror — kept out of the reconstructed history and excluded in the child, as shadow does"
+  fi
   _urm_n_commits=$(run git -C "$_urm_path" rev-list --count HEAD 2>/dev/null)
   log_dbg_med "reconstruct $_urm_path: materialized live .git, HEAD=$(git -C "$_urm_path" rev-parse --short HEAD 2>/dev/null), $_urm_n_commits commit(s)"
   log_major "$_urm_path: reconstructed — $_urm_n_commits commit(s) recovered, starting from when this path was first merged in"
@@ -9284,8 +9317,11 @@ cmd_unflatten() {
   if [ "$_ufl_mode" != "go" ]; then
     echo
     log_major "This was analyze-only — re-run with 'go' to apply:"
-    printf '  %s>>   %s unflatten go%s\n' "$C_BLUE" "$US" "$C_RESET"
-    printf '  %s>>   %s unflatten go -i    (confirm per item)%s\n' "$C_BLUE" "$US" "$C_RESET"
+    # The same scope and mode as this run: a bare 'unflatten go' would restore
+    # every candidate in the tree, not the one that was analyzed.
+    _ufl_again="${_ufl_forced_mode:+ --$_ufl_forced_mode}$([ "$_ufl_keep" = 1 ] && printf ' -k')${_ufl_scope_path_raw:+ $_ufl_scope_path_raw}"
+    printf '  %s>>   %s unflatten go%s%s\n' "$C_BLUE" "$US" "$_ufl_again" "$C_RESET"
+    printf '  %s>>   %s unflatten go -i%s    (confirm per item)%s\n' "$C_BLUE" "$US" "$_ufl_again" "$C_RESET"
     runq rm -f "$_ufl_cand"
     exit 0
   fi
@@ -11157,6 +11193,7 @@ cmd_stamp_version() {
 cmd_rehydrate() {
   _rh_mode=analyze
   _rh_scope=""
+  _rh_nlocal=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) show_help rehydrate; exit 0 ;;
@@ -11259,7 +11296,10 @@ cmd_rehydrate() {
     _rh_br=$(sed -n 's|^branch: ||p' "$_rh_p/.git.shadow.status" 2>/dev/null | head -n 1)
     case "$_rh_br" in '(detached)'*) _rh_br="" ;; esac
     if [ -z "$_rh_url" ]; then
-      log_warn "$_rh_p: marker records no remote — cannot rehydrate (it was local-only; its history lives in $_rh_top if it was merged)"
+      # Local-only: nothing to clone from. Its history is still in THIS repo's
+      # commits, which is what 'unflatten --merge' rebuilds from.
+      log_warn "$_rh_p: marker records no remote — nothing to clone it from; rebuild its history from $_rh_top's commits:  $US unflatten go --merge $_rh_p"
+      _rh_nlocal=$(( ${_rh_nlocal:-0} + 1 ))
       continue
     fi
     printf '%s\t%s\t%s\n' "$_rh_p" "$_rh_url" "${_rh_br:-}" >> "$_rh_tmp"
@@ -11275,7 +11315,11 @@ _RH_EOF
   if [ "${_rh_n:-0}" -eq 0 ] && [ "${_rh_nfix:-0}" -eq 0 ] && [ "${_rh_naln:-0}" -eq 0 ] \
      && [ ! -s "$_rh_nomatch" ]; then
     rm -f "$_rh_tmp" "$_rh_fix" "$_rh_align" "$_rh_nomatch"
-    log_major "$_rh_top: nothing to rehydrate — every shadowed repo has its own .git, at the commit its files are"
+    if [ "${_rh_nlocal:-0}" -gt 0 ]; then
+      log_major "$_rh_top: nothing rehydrate can clone — $_rh_nlocal local-only project(s) above have no .git and no remote; unflatten rebuilds them"
+    else
+      log_major "$_rh_top: nothing to rehydrate — every shadowed repo has its own .git, at the commit its files are"
+    fi
     exit 0
   fi
 
@@ -12958,6 +13002,12 @@ modes, matching flatten's three:
               'flatten'/'--merge' just before deletion — removed again
               once unflatten successfully reconstructs a live .git.
 
+              The same reconstruction rebuilds a SHADOWED repo that has no
+              .git here and no remote to rehydrate from (a local-only
+              project on a second machine). Its '.git.shadow.status' is
+              this repo's record of the mirror: it is kept OUT of the
+              rebuilt history and excluded in the child, as shadow does.
+
   --zip       EXACT, lossless. Un-archives a git dir that 'flatten --zip'
               packed away: '.git.zip' -> '.git', or
               'GIT_SIDECAR_DIRNAME.zip' -> the sidecar dir. The .zip is
@@ -13120,8 +13170,9 @@ files match no commit is NAMED and left alone -- that is local work, or a
 state no remote has.
 
 A project whose marker records NO remote was local-only; there is nothing
-to clone. If it was merged rather than shadowed, its history is inside the
-container -- see '$US unflatten --merge'.
+to clone. Its history is still in the container's commits, and
+'$US unflatten go --merge <path>' rebuilds it from them (rehydrate names that
+line for each such project).
 EOF
 }
 
@@ -17874,6 +17925,78 @@ _RT_CONF_EOF
     _rt_absent ".git.merged removed after successful reconstruction" kid/.git.merged || return 1
     _rt_kid_commits=$(git -C kid rev-list --count HEAD 2>/dev/null)
     [ "$_rt_kid_commits" -ge 2 ] || { _rt_fail "expected >=2 reconstructed commits (merge + edit), got $_rt_kid_commits"; return 1; }
+    return 0
+  }
+
+  test_unflatten_analyze_names_the_path_and_mode_it_was_given() {
+    # The go line of a scoped analyze dropped the PATH and the mode: asked
+    # 'unflatten --merge kid', it answered 'unflatten go' -- run as printed,
+    # that restores EVERY candidate in the tree. Every other analyze/go verb
+    # (flatten, shadow, unshadow, rehydrate, ignore, unsm) repeats its scope.
+    _rt_repo_file kid_o x.txt
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd global && git clone -q ../kid_o kid >/dev/null 2>&1 \
+        && git -C kid submodule update --init -q )
+    cd global || return 1
+    _rt_ok "flatten go kid --merge" _rt_my_git flatten go kid --merge || return 1
+    _rt_ok "unflatten --merge kid (analyze)" _rt_my_git unflatten --merge kid || return 1
+    _rt_contains "the go line keeps path and mode" "$_rt_out" "unflatten go --merge kid" || return 1
+    _rt_contains "the -i line too" "$_rt_out" "unflatten go -i --merge kid" || return 1
+    _rt_absent "analyze changed nothing" kid/.git || return 1
+    return 0
+  }
+
+  test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history() {
+    # A SHADOWED repo with no remote, on a machine that got the container
+    # but not the repo's .git (it never travels): 'rehydrate' has nothing to
+    # clone, so 'unflatten --merge' rebuilds the history from the
+    # container's commits. Those commits carry the container's marker, and
+    # subtree split handed them over as they were -- the child ended up
+    # TRACKING the parent's record of the mirror, which shadow keeps out of
+    # it on purpose. Found reconstructing ,ai-mentor in a throwaway clone.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 \
+        && git -C proj remote remove origin )
+    cd container || return 1
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+    echo more >> proj/a.md
+    git -C proj commit -q -am "edit in the child"
+    git add -- proj/a.md && git commit -q -m "mirror the edit" -- proj
+    command rm -rf proj/.git
+    _rt_ok "unflatten go --merge proj" _rt_my_git unflatten go --merge proj || return 1
+    _rt_isdir "proj has a live .git again" proj/.git || return 1
+    _rt_n=$(git -C proj log --all --format= --name-only | grep -c 'git\.shadow\.status' || true)
+    [ "$_rt_n" -eq 0 ] || { _rt_fail "the parent's marker is in the child's own history ($_rt_n time(s))"; return 1; }
+    _rt_exists "the marker stays on disk -- the parent tracks it" proj/.git.shadow.status || return 1
+    _rt_st=$(git -C proj status --porcelain)
+    [ -z "$_rt_st" ] || { _rt_fail "child not clean after reconstruction: $(printf '%s' "$_rt_st" | tr '\n' '|')"; return 1; }
+    _rt_c=$(git -C proj rev-list --count HEAD 2>/dev/null)
+    [ "${_rt_c:-0}" -ge 2 ] || { _rt_fail "expected >=2 commits (shadow + edit), got $_rt_c"; return 1; }
+    [ -z "$(git -C proj for-each-ref refs/original)" ] || { _rt_fail "rewrite backup refs left in the child"; return 1; }
+    [ -z "$(git branch --list 'my-git-unflatten-tmp-*')" ] || { _rt_fail "temporary split branch left in the parent"; return 1; }
+    return 0
+  }
+
+  test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote() {
+    # A shadowed repo that recorded no remote cannot be cloned back. rehydrate
+    # warned so, then closed with "nothing to rehydrate -- every shadowed repo
+    # has its own .git" about a tree where one had none, and never named the
+    # route that does work: rebuild the history from the container's commits.
+    _rt_repo_file up_o a.md
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    ( cd container && git clone -q ../up_o proj >/dev/null 2>&1 \
+        && git -C proj remote remove origin )
+    cd container || return 1
+    _rt_ok "shadow it" _rt_my_git shadow go proj || return 1
+    command rm -rf proj/.git
+    _rt_ok "rehydrate (analyze)" _rt_my_git rehydrate || return 1
+    cat "$_rt_err" >> "$_rt_out"
+    _rt_contains "names the route" "$_rt_out" "unflatten go --merge proj" || return 1
+    _rt_not_contains "no false all-clear" "$_rt_out" "every shadowed repo has its own .git" || return 1
     return 0
   }
 
@@ -24993,7 +25116,7 @@ _RT_GUARD_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
