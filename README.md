@@ -427,6 +427,28 @@ git config --replace-all remote.origin.fetch 'refs/my-git/merged/*:refs/my-git/m
 git fetch origin
 ```
 
+### A shadowed repo with NO REMOTE: the container keeps its branch
+
+A shadowed repo normally travels by its own remote. One that has none has its
+commits in its own `.git` and nowhere else — the container carries its FILES,
+not its history. On another machine `rehydrate` then has nothing to clone, and
+rebuilding from the container's own commits produces a different lineage, so
+the two can never meet.
+
+So the container keeps that repo's branch under
+`refs/my-git/shadowed/<path>/heads/<branch>`, written by the shadow pre-commit
+hook on every commit, and carried by the same unforced push/fetch refspec pair
+as the merged history. It is cheap: the container already holds the files as
+identical blobs, so only commits and trees are added.
+
+Unforced means a preserved branch is never moved backwards: a ref that would
+rewind is refused by git, the refusal is reported, and the container commit
+still goes through — a commit is not the place to lose somebody's history.
+
+`st` says when a local-only repo's history is kept nowhere yet (`no remote,
+and its history is in this one .git`); one commit in the container fixes it,
+or give the repo a remote.
+
 ### `purge` — reclaiming space after content moved out
 
 `unshadow`/`unflatten` answer *"who tracks this path now?"*. `purge` answers
