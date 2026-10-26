@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="035f12e"
+SCRIPT_COMMIT="b6d1f47"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-23-g035f12e"
+SCRIPT_RELEASE="v2.0-24-gb6d1f47"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -12052,9 +12052,75 @@ cmd_branch() {
   return 0
 }
 
+# _remote_set_one <path> <url>  —  'my-git remote go <PATH> <URL>'
+#
+# Give a repo that has NO remote the one it should have, and push it there.
+# The case it exists for: a shadowed, local-only project whose history only
+# this machine and its container hold. A PRIVATE bare repo (ada:
+# my-gits:/LINKS/gits/<name>.git) is made by root -- /LINKS/gits is root's
+# tree -- and my-git does the half that is the user's: adopt it, push, and
+# then let the preserved branches go, because the remote is the travel route
+# from that moment on.
+_remote_set_one() {
+  _rs_p=${1:-}; _rs_u=${2:-}
+  [ -n "$_rs_p" ] && [ -n "$_rs_u" ] \
+    || fatal "remote go: needs a PATH and a URL (e.g. '$US remote go py/thing my-gits:/LINKS/gits/thing.git')" 2
+  [ -d "$_rs_p" ] || fatal "remote go: '$_rs_p' is not a directory" 2
+  _rs_top=$(git_toplevel_of "$_rs_p" 2>/dev/null)
+  [ -n "$_rs_top" ] && [ -e "$_rs_p/.git" ] \
+    || fatal "remote go: '$_rs_p' is not a live repo of its own (nothing to give a remote to)" 2
+  # It must have none: changing an existing remote is plain git's business,
+  # and doing it silently here would move a repo's publishing route.
+  _rs_cur=$(run_as_owner_capture "$_rs_p" git config --get remote.origin.url 2>/dev/null)
+  if [ -n "$_rs_cur" ]; then
+    log_error "remote go: $_rs_p already has a remote ($_rs_cur) — leave it, or change it with plain git"
+    return 1
+  fi
+  # This verb is for a PRIVATE remote. A public forge is a different
+  # decision, made deliberately, not as a side effect of wanting a backup.
+  case "$_rs_u" in
+    *github.com*|*gitlab.com*|*bitbucket.org*)
+      if [ "${RM_FORCE:-0}" != 1 ]; then
+        log_error "remote go: '$_rs_u' is a public forge — this verb gives a repo its PRIVATE remote. Publish deliberately with plain git, or --force if you mean it."
+        return 1
+      fi ;;
+  esac
+  _rs_br=$(run_as_owner_capture "$_rs_p" git symbolic-ref --short -q HEAD 2>/dev/null)
+  [ -n "$_rs_br" ] || { log_error "remote go: $_rs_p is on no branch (detached) — check one out first"; return 1; }
+
+  run_as_owner "$_rs_p" git remote add origin "$_rs_u" >/dev/null 2>&1 \
+    || { log_fail "remote go: $_rs_p — could not add origin $_rs_u"; return 1; }
+  if ! _rs_err=$(run_as_owner "$_rs_p" git push -u origin "$_rs_br" 2>&1); then
+    run_as_owner "$_rs_p" git remote remove origin >/dev/null 2>&1
+    log_fail "remote go: $_rs_p — push to $_rs_u failed, so origin was removed again (nothing half-set): $(printf '%s' "$_rs_err" | tail -n 2 | tr '\n' ' ')"
+    return 1
+  fi
+  log_ok "remote go: $_rs_p — origin=$_rs_u, '$_rs_br' pushed and tracking"
+
+  # The branches the container kept for it are now a second copy of a history
+  # that has a home. Retire them, in the repo that TRACKS this path.
+  _rs_track=$(tracking_repo_of "$_rs_p" 2>/dev/null)
+  if [ -n "$_rs_track" ]; then
+    _rs_rel=${_rs_p#"$_rs_track"/}
+    _rs_n=0
+    while IFS= read -r _rs_ref; do
+      [ -n "$_rs_ref" ] || continue
+      run_as_owner "$_rs_track" git update-ref -d "$_rs_ref" >/dev/null 2>&1 && _rs_n=$((_rs_n + 1))
+    done <<_RS_EOF
+$(run_as_owner_capture "$_rs_track" git for-each-ref --format='%(refname)' "$SHADOWED_REFS_ROOT/$_rs_rel" 2>/dev/null)
+_RS_EOF
+    [ "$_rs_n" -gt 0 ] \
+      && log_medium "remote go: $_rs_track no longer keeps $_rs_n branch(es) for $_rs_rel — its remote is the route now"
+  fi
+  # The marker records the remote; the next container commit re-reads it.
+  log_medium "remote go: commit $_rs_track so its marker records the new remote"
+  return 0
+}
+
 cmd_remote() {
   RM_CHECK=0
   RM_FORCE=0
+  RM_SET=0
   _args=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -12069,12 +12135,19 @@ cmd_remote() {
       --force)      RM_FORCE=1 ;;
       list)         : ;;      # optional explicit 'list' subword
       check)        RM_CHECK=1 ;;  # alias for --check
+      go)           RM_SET=1 ;;    # 'remote go <PATH> <URL>': give it one
       --)           shift; _args="$_args $(shell_escape "$@")"; break ;;
       -*)           fatal "remote: unknown option: $1" 64 ;;
       *)            _args="$_args $(shell_escape "$1")" ;;
     esac
     shift
   done
+  if [ "${RM_SET:-0}" = 1 ]; then
+    # shellcheck disable=SC2086
+    eval "set -- $_args"
+    _remote_set_one "${1:-}" "${2:-}"
+    exit $?
+  fi
   _refuse_R_always_recursive remote "ALSO discover nested repos in a scope
       outside GIT_REPOS (that is what -R used to do here, confusingly)"
   # shellcheck disable=SC2086
@@ -13220,10 +13293,24 @@ show_help_remote() {
 my-git remote  (alias: rem)
 
 usage: $US [-V|-D] remote [list | check] [--check] [-R|--force] [paths...]
+       $US remote go <PATH> <URL>
 
-List / audit git remotes across the scoped tree.
+List / audit git remotes across the scoped tree -- or give ONE repo the
+remote it has been missing.
 
 Modes:
+  go <PATH> <URL>   Give a repo that has NO remote that URL, push its branch
+                    there and set it tracking. For a shadowed, local-only
+                    project whose history only this machine and its
+                    container hold: the PRIVATE bare repo is made by root
+                    (ada's /LINKS/gits is root's tree; its own NEW-REPO.sh
+                    makes one), and this does the half that is yours.
+                    Afterwards the branches the container kept for it are
+                    retired -- its remote is the travel route from then on.
+                    REFUSES a repo that already has a remote (that is plain
+                    git's business), a detached HEAD, and a public forge
+                    (--force if you really mean to publish there). A push
+                    that fails removes origin again, so nothing is half-set.
   list (default)    One line per remote per repo:
                       >>> <path>   <remote>   -> <url>
                     Repos with no remotes show in RED as '(no remotes)'.
@@ -18556,6 +18643,46 @@ _RT_CONF_EOF
     [ "${_rt_c:-0}" -ge 2 ] || { _rt_fail "expected >=2 commits (shadow + edit), got $_rt_c"; return 1; }
     [ -z "$(git -C proj for-each-ref refs/original)" ] || { _rt_fail "rewrite backup refs left in the child"; return 1; }
     [ -z "$(git branch --list 'my-git-unflatten-tmp-*')" ] || { _rt_fail "temporary split branch left in the parent"; return 1; }
+    return 0
+  }
+
+  test_remote_go_gives_a_local_only_repo_its_private_remote() {
+    # The last step for a local-only project: a PRIVATE bare repo (root makes
+    # it -- /LINKS/gits is root's tree) becomes its remote, it is pushed, and
+    # the branches the container kept for it are retired, because the remote
+    # is the travel route from then on.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd container || return 1
+    _rt_repo_file kid k.md
+    ( cd kid && git branch -q -M main ) >/dev/null 2>&1
+    _rt_ok "shadow it" _rt_my_git shadow go kid || return 1
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm "carry kid" >/dev/null 2>&1
+    [ -n "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed)" ] \
+      || { _rt_fail "nothing was kept for kid -- the test proves nothing"; return 1; }
+    git init -q --bare "$PWD/../private.git"
+
+    # a public forge is refused: this verb is for a PRIVATE remote
+    _rt_my_git remote go kid "https://github.com/someone/kid.git" > "$_rt_out" 2>"$_rt_err"
+    _rt_contains "a public forge is refused" "$_rt_err" "public forge" || return 1
+    [ -z "$(git -C kid config --get remote.origin.url 2>/dev/null)" ] \
+      || { _rt_fail "it set a remote it had just refused"; return 1; }
+    _rt_ok "a public forge is refused and nothing is set" true || return 1
+
+    _rt_ok "remote go" _rt_my_git remote go kid "$PWD/../private.git" || return 1
+    [ "$(git -C kid config --get remote.origin.url 2>/dev/null)" = "$PWD/../private.git" ] \
+      || { _rt_fail "origin was not set"; return 1; }
+    [ -n "$(git --git-dir=../private.git for-each-ref --format='%(refname)' refs/heads 2>/dev/null)" ] \
+      || { _rt_fail "nothing was pushed to the private remote"; return 1; }
+    [ -z "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed 2>/dev/null)" ] \
+      || { _rt_fail "the container still keeps branches for a repo that now has a remote"; return 1; }
+    _rt_ok "pushed, tracking, and the kept branches retired" true || return 1
+
+    # a repo that already has a remote is left alone
+    _rt_my_git remote go kid "$PWD/../private.git" > "$_rt_out" 2>"$_rt_err"
+    _rt_contains "it refuses to change an existing remote" "$_rt_err" "already has a remote" || return 1
+    _rt_ok "an existing remote is never moved" true || return 1
     return 0
   }
 
@@ -26111,7 +26238,7 @@ _RT_GUARD_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
