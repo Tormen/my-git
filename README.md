@@ -450,6 +450,18 @@ still goes through — a commit is not the place to lose somebody's history.
 and its history is in this one .git`); one commit in the container fixes it,
 or give the repo a remote.
 
+**Getting it back on another machine:** `rehydrate` restores such a repo from
+those refs — the same commits with the same shas, not a rebuilt lineage. A
+fresh clone fetches `refs/heads/*` only, so `rehydrate go` configures the
+refspec pair and fetches the kept branches first; `rehydrate` (analyze) writes
+nothing and asks the remote instead. Where nothing was kept (a container from
+before this existed), it still names the old route, `unflatten go --merge`.
+
+**`push` carries them even when the branch is up to date.** Preserved history
+lives outside `refs/heads/*`, so a container with nothing to push can still
+have kept branches that never left the machine — which is the loss these refs
+exist to prevent.
+
 ### `purge` — reclaiming space after content moved out
 
 `unshadow`/`unflatten` answer *"who tracks this path now?"*. `purge` answers
