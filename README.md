@@ -296,6 +296,7 @@ config file.
 | `AUTO_SIDECAR_EMBEDDED`               | `0`                                      | `flatten`: `1` = bare `go` auto-sidecars every embedded nested repo, no prompt |
 | `PULL_STRATEGY`                       | `merge`                                  | How `pull go` reconciles a repo that is behind or diverged: `merge` (fast-forwards when it can) or `rebase` |
 | `AUTOHEAL_PULL_CONFIG`                | `1`                                      | `st`/`pull` record `PULL_STRATEGY` in the repo owner's **global** gitconfig — only when it states nothing |
+| `AUTOHEAL_SUBMODULE_ON_ITS_BRANCH`    | `1`                                      | `st` puts a submodule a pull left DETACHED back on the branch `.gitmodules` names — only when that branch already contains the commit and the submodule is clean |
 | `MC_NEW_NESTED_REPO`                  | `warn`                                   | What `mc go` does with a nested repo whose relationship to its parent is unrecorded: `warn` / `shadow` / `ignore` |
 
 ## Quick start
