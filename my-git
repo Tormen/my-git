@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="a7ee121"
+SCRIPT_COMMIT="7ff657f"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-18-ga7ee121"
+SCRIPT_RELEASE="v2.0-19-g7ff657f"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -637,6 +637,14 @@ SM_AUTO_SAFE_DIRECTORY=1
 # via SSH. Protects against half-minute+ default stalls when a host is
 # unreachable. Applied via GIT_SSH_COMMAND at cmd_submodules start.
 SM_SSH_CONNECT_TIMEOUT=30
+
+# ─── Self-test ──────────────────────────────────────────────────────────
+# How many tests '--run-tests' runs at a time. 0 = one per CPU, which is
+# what the suite is built for: every test works in its own case directory
+# and its own sandboxed git config, and nearly all of their time is spent
+# waiting on git. Measured on 64 tests: 61.5s at 1, 11.2s at 16.
+# Set it to 1 to read a failing run as one uninterleaved story.
+RUN_TESTS_JOBS=0
 
 # ─── flatten: registered-submodule -> self-contained conversion ─────────
 # When flattening a REGISTERED submodule (not a plain embedded nested
@@ -12435,6 +12443,10 @@ Global options:
                            'unflatten', 'sidecar', 'merge', 'sm', 'st').
                            Prints TAP: the plan '1..N' first, then
                            'ok K - name' / 'not ok K - name' per test.
+                           Tests run SIDE BY SIDE, one per CPU by default
+                           (each in its own case dir and git config); the
+                           report stays in list order. RUN_TESTS_JOBS sets
+                           how many at a time, 1 = one after another.
   --version                Print version, release commit and build id, exit
   stamp-version [go]       Record the current HEAD in this file and amend
                            that commit, so the released bytes say where
@@ -16848,8 +16860,10 @@ _CS_EOF
           2) echo "Aborted by user." >&2; exit 77 ;;
         esac
         printf 'UNTRACK  %s\n' "$sp"
-        # Recursive index-entry removal without 'git rm' (forbidden as
-        # implicit side effect; see feedback_my_git_no_implicit_rm.md).
+        # Recursive index-entry removal without 'git rm': my-git never runs
+        # 'git rm' as a side effect of something the user asked for by
+        # another name -- it deletes working files, and nobody asked for a
+        # deletion here.
         # 'git ls-files -z -- <sp>' enumerates every tracked entry under
         # <sp> (handles both a tracked content tree AND a single gitlink
         # entry), piped into 'git update-index -z --force-remove --stdin'
@@ -25360,32 +25374,106 @@ _RT_GUARD_EOF
   log_major "(builds real git repos in temp dirs; touches nothing of yours; safe to run anywhere)"
   [ -n "$_rt_filter" ] && log_major "--run-tests: filtered to$_rt_all_tests"
 
+  # The tests run SIDE BY SIDE. Each builds real git repos in its own case
+  # directory and talks to nothing outside it, so all the sequential runner
+  # gave them was wall-clock time: 277 of them, nearly all waiting on git,
+  # took about five minutes -- long enough that nobody runs the suite while
+  # working, which is when it would catch the most.
+  #
+  # The REPORT stays sequential: 'ok K - name' is printed in list order as
+  # soon as test K has finished, so the TAP numbering is the suite's own and
+  # a reader (my-rollout draws a letter per test from these lines) sees the
+  # same stream as before, only sooner.
+  #
+  # Isolation, per test: its own case directory, its own $_rt_out/$_rt_err/
+  # reason files, and its own copy of the sandboxed GLOBAL gitconfig --
+  # 'pull' WRITES that file (AUTOHEAL_PULL_CONFIG), so one shared copy would
+  # have two tests writing it in the same moment.
+  _rt_jobs=${RUN_TESTS_JOBS:-0}
+  case "$_rt_jobs" in ''|*[!0-9]*) _rt_jobs=0 ;; esac
+  if [ "$_rt_jobs" -eq 0 ]; then
+    _rt_jobs=$( (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null) | head -n 1 )
+    case "$_rt_jobs" in ''|*[!0-9]*) _rt_jobs=4 ;; esac
+    [ "$_rt_jobs" -lt 1 ] && _rt_jobs=1
+  fi
+  log_major "--run-tests: $_rt_jobs at a time (RUN_TESTS_JOBS=$_rt_jobs)"
+  _rt_resdir="$_rt_workdir/.results"; mkdir "$_rt_resdir"
+
+  # _rt_report_ready — print every finished test from $_rt_done+1 upward,
+  # stopping at the first one still running. A result file is written under
+  # a temp name and moved into place, so a file that EXISTS is complete.
+  _rt_done=0
+  _rt_report_ready() {
+    while [ "$_rt_done" -lt "$_rt_num" ]; do
+      _rr_next=$((_rt_done + 1))
+      [ -f "$_rt_resdir/$_rr_next" ] || return 0
+      _rr_name=$(sed -n '1p' "$_rt_resdir/$_rr_next")
+      _rr_rc=$(sed -n '2p' "$_rt_resdir/$_rr_next")
+      _rr_reason=$(sed -n '3,$p' "$_rt_resdir/$_rr_next")
+      if [ "$_rr_rc" = 0 ] && [ -z "$_rr_reason" ]; then
+        printf 'ok %s - %s\n' "$_rr_next" "$_rr_name"
+        _rt_pass=$((_rt_pass + 1))
+      else
+        printf 'not ok %s - %s\n    # %s\n' "$_rr_next" "$_rr_name" "$_rr_reason"
+        _rt_fail=$((_rt_fail + 1))
+        _rt_failed_names="$_rt_failed_names $_rr_name"
+      fi
+      _rt_done=$_rr_next
+    done
+    return 0
+  }
+
   _rt_num=0
+  _rt_live=0
+  _rt_pids=""
   for _rt_name in $_rt_all_tests; do
     _rt_num=$((_rt_num + 1))
     _rt_casedir="$_rt_workdir/$_rt_name"
     rm -rf "$_rt_casedir" 2>/dev/null
-    mkdir -p "$_rt_casedir"
-    _rt_out=$(mktemp "${TMPDIR:-/tmp}/${US}.rtout.XXXXXX")
-    _rt_err=$(mktemp "${TMPDIR:-/tmp}/${US}.rterr.XXXXXX")
-    _rt_reason_file=$(mktemp "${TMPDIR:-/tmp}/${US}.rtreason.XXXXXX")
-    : > "$_rt_reason_file"
+    mkdir "$_rt_casedir"
     (
+      _rt_slot=$_rt_num
+      _rt_out="$_rt_casedir/.rtout"
+      _rt_err="$_rt_casedir/.rterr"
+      _rt_reason_file="$_rt_casedir/.rtreason"
+      : > "$_rt_reason_file"
+      # Its own global gitconfig: same seed, separate writes.
+      if cp "$GIT_CONFIG_GLOBAL" "$_rt_casedir/gitconfig.global" 2>/dev/null; then
+        GIT_CONFIG_GLOBAL="$_rt_casedir/gitconfig.global"
+        export GIT_CONFIG_GLOBAL
+      fi
       cd "$_rt_casedir" || exit 1
       "$_rt_name"
-    )
-    _rt_rc=$?
-    _rt_reason=$(cat "$_rt_reason_file" 2>/dev/null)
-    if [ "$_rt_rc" -eq 0 ] && [ -z "$_rt_reason" ]; then
-      printf 'ok %s - %s\n' "$_rt_num" "$_rt_name"
-      _rt_pass=$((_rt_pass + 1))
-    else
-      printf 'not ok %s - %s\n    # %s\n' "$_rt_num" "$_rt_name" "$_rt_reason"
-      _rt_fail=$((_rt_fail + 1))
-      _rt_failed_names="$_rt_failed_names $_rt_name"
-    fi
-    rm -f "$_rt_out" "$_rt_err" "$_rt_reason_file"
+      _rt_rc=$?
+      { printf '%s\n%s\n' "$_rt_name" "$_rt_rc"
+        cat "$_rt_reason_file" 2>/dev/null; } > "$_rt_resdir/.tmp.$_rt_slot"
+      mv -f "$_rt_resdir/.tmp.$_rt_slot" "$_rt_resdir/$_rt_slot"
+    ) &
+    _rt_pids="$_rt_pids $!"
+    _rt_live=$((_rt_live + 1))
+    while [ "$_rt_live" -ge "$_rt_jobs" ]; do
+      # Free a slot as soon as ANY test ends, not when the oldest does:
+      # dash has no 'wait -n', and waiting for the oldest leaves every
+      # other finished slot idle until it returns -- measured at 220% CPU
+      # where there was room for far more. 'kill -0' asks who is still
+      # alive; the 0.05s sleep keeps the polling off the CPU the tests want.
+      _rt_alive=""
+      _rt_live=0
+      for _rt_p in $_rt_pids; do
+        if kill -0 "$_rt_p" 2>/dev/null; then
+          _rt_alive="$_rt_alive $_rt_p"
+          _rt_live=$((_rt_live + 1))
+        else
+          wait "$_rt_p" 2>/dev/null
+        fi
+      done
+      _rt_pids=$_rt_alive
+      _rt_report_ready
+      [ "$_rt_live" -ge "$_rt_jobs" ] && sleep 0.05
+    done
   done
+  wait
+  _rt_report_ready
 
   echo
   log_major "self-test: $_rt_pass passed, $_rt_fail failed (of $((_rt_pass + _rt_fail)))"
