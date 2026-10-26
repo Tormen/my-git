@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="80b4ab4"
+SCRIPT_COMMIT="7063e5d"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-21-g80b4ab4"
+SCRIPT_RELEASE="v2.0-22-g7063e5d"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -10826,6 +10826,210 @@ _purge_survives_elsewhere() {
   return 1
 }
 
+# ─── zip: a one-off, read-only export ───────────────────────────────────
+# ONE .zip and nothing else: no marker, no commit, no ref, no .git moved.
+# That is what separates it from 'flatten --zip' / 'unflatten --zip', which
+# archive a repo's .git IN PLACE and change the tree. It only ADDS a file,
+# so it needs no 'go', like every verb that reads or adds.
+#
+# What goes in: the files git TRACKS under PATH (--all takes everything on
+# disk), with every symlink RESOLVED -- a zip handed to someone else is no
+# use if half of it points at paths only this machine has -- plus a working
+# .git FOLDER, so unzipping gives a ready repo rather than a bundle to
+# restore by hand.
+
+# _zip_copy_one <src> <dest-dir> <rel>   — copy one path INTO the staging
+# tree with symlinks resolved. A link to a file becomes the file; a link to
+# a directory becomes that directory's files, even from outside the repo.
+# ZIP_WARNED counts what could not be taken, so the run can end non-zero
+# instead of reporting a zip with holes as complete.
+_zip_copy_one() {
+  _zc_src=$1; _zc_stage=$2; _zc_rel=$3
+  _zc_dst="$_zc_stage/$_zc_rel"
+  case "${_zc_rel##*/}" in .DS_Store) return 0 ;; esac
+  if [ -L "$_zc_src" ]; then
+    if [ ! -e "$_zc_src" ]; then
+      log_warn "zip: $_zc_rel -> $(readlink "$_zc_src" 2>/dev/null): dangling link, left out"
+      ZIP_SKIPPED=$((ZIP_SKIPPED + 1)); return 0
+    fi
+    # A link pointing at a directory that CONTAINS it would copy for ever.
+    _zc_tgt=$(cd "$(dirname "$_zc_src")" 2>/dev/null && cd "$(readlink "$_zc_src")" 2>/dev/null && pwd -P)
+    if [ -n "$_zc_tgt" ]; then
+      _zc_here=$(cd "$(dirname "$_zc_src")" 2>/dev/null && pwd -P)
+      case "$_zc_here/" in "$_zc_tgt"/*)
+        log_warn "zip: $_zc_rel -> $_zc_tgt: the link points at a directory it lives in, not followed again"
+        ZIP_SKIPPED=$((ZIP_SKIPPED + 1)); return 0 ;;
+      esac
+    fi
+    ZIP_LINKS=$((ZIP_LINKS + 1))
+    [ -d "$_zc_src" ] && ZIP_LINKDIRS=$((ZIP_LINKDIRS + 1))
+  fi
+  mkdir -p "$(dirname "$_zc_dst")" 2>/dev/null
+  if cp -RL -- "$_zc_src" "$_zc_dst" 2>/dev/null; then
+    ZIP_FILES=$((ZIP_FILES + 1)); return 0
+  fi
+  log_warn "zip: $_zc_rel: could not be read, left out"
+  ZIP_WARNED=$((ZIP_WARNED + 1))
+  return 0
+}
+
+# _zip_history <stage/<name>> <path> <owner-repo> — give the staged copy a
+# working .git, from whichever of the four sources this path has.
+# Prints what it used, for the summary.
+_zip_history() {
+  _zh_dir=$1; _zh_path=$2; _zh_owner=$3
+  _zh_rel=${_zh_path#"$_zh_owner"/}
+  # 1. Its own .git: the whole thing, minus what a copy must not carry.
+  if [ -d "$_zh_path/.git" ]; then
+    cp -R -- "$_zh_path/.git" "$_zh_dir/.git" 2>/dev/null || return 1
+    rm -rf -- "$_zh_dir/.git/hooks" 2>/dev/null
+    rm -f  -- "$_zh_dir/.git/index" 2>/dev/null
+    find "$_zh_dir/.git" -name '*.lock' -exec rm -f -- {} + 2>/dev/null
+    printf 'own .git (%s commit(s))' \
+      "$(run_as_owner_capture "$_zh_path" git rev-list --count HEAD 2>/dev/null || echo '?')"
+    return 0
+  fi
+  # 2/3. History the enclosing repo PRESERVED for this path: a merged repo's
+  #      (refs/my-git/merged/...) or a shadowed local-only repo's
+  #      (refs/my-git/shadowed/...), whichever is there.
+  _zh_src=""
+  for _zh_root in "$MERGED_REFS_ROOT/$_zh_rel" "$SHADOWED_REFS_ROOT/$_zh_rel"; do
+    _zh_ref=$(run_as_owner_capture "$_zh_owner" git for-each-ref --count=1 \
+                --format='%(refname)' "$_zh_root" 2>/dev/null)
+    [ -n "$_zh_ref" ] && { _zh_src=$_zh_ref; break; }
+  done
+  if [ -n "$_zh_src" ]; then
+    _zh_br=${_zh_src##*/}
+    git init -q "$_zh_dir" 2>/dev/null || return 1
+    # Park HEAD on a name nothing will fetch into: git REFUSES to fetch
+    # into the branch HEAD points at, and 'git init' points it at the
+    # default branch -- which is exactly the name we are about to fill.
+    git -C "$_zh_dir" symbolic-ref HEAD refs/heads/__my-git-zip-staging 2>/dev/null
+    if git -C "$_zh_dir" fetch -q "$_zh_owner" "$_zh_src:refs/heads/$_zh_br" 2>/dev/null; then
+      git -C "$_zh_dir" symbolic-ref HEAD "refs/heads/$_zh_br" 2>/dev/null
+      rm -rf -- "$_zh_dir/.git/hooks" 2>/dev/null
+      printf 'preserved in %s (%s)' "$_zh_owner" "$_zh_src"
+      return 0
+    fi
+    rm -rf -- "$_zh_dir/.git" 2>/dev/null
+  fi
+  # 4. No history of its own: the enclosing repo's, for this subtree only --
+  #    the same reconstruction 'unflatten --merge' makes, in a temp place.
+  # The split happens in a THROWAWAY CLONE, for two reasons: 'zip' writes
+  # nothing but its archive, so it must not leave a ref in the user's repo;
+  # and the split commit is reachable from no ref, which is exactly what a
+  # fetch by sha refuses ('want ... not valid'). In the clone it can have a
+  # branch name, and the fetch of that branch copies real objects into the
+  # staged repo. '--shared' keeps the clone cheap -- no object is copied
+  # until the fetch, which packs them properly.
+  _zh_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.zipsplit.XXXXXX" 2>/dev/null) || _zh_tmp=""
+  # Each step says why it failed, on stderr: a zip whose history is silently
+  # 'none' is the kind of hole this command refuses to report as complete.
+  if [ -n "$_zh_tmp" ] \
+     && { git clone -q --shared --no-checkout "$_zh_owner" "$_zh_tmp/c" 2>"$_zh_tmp/err" \
+          || { log_warn "zip: could not clone $_zh_owner to split its history: $(tail -n 1 "$_zh_tmp/err" 2>/dev/null)"; false; }; } \
+     && { git -C "$_zh_tmp/c" subtree split -q --prefix="$_zh_rel" -b zipsplit >/dev/null 2>"$_zh_tmp/err" \
+          || { log_warn "zip: 'subtree split --prefix=$_zh_rel' failed: $(tail -n 1 "$_zh_tmp/err" 2>/dev/null)"; false; }; }; then
+    git init -q "$_zh_dir" 2>/dev/null || { rm -rf "$_zh_tmp"; return 1; }
+    git -C "$_zh_dir" symbolic-ref HEAD refs/heads/__my-git-zip-staging 2>/dev/null
+    if git -C "$_zh_dir" fetch -q "$_zh_tmp/c" zipsplit:refs/heads/main 2>"$_zh_tmp/err"; then
+      git -C "$_zh_dir" symbolic-ref HEAD refs/heads/main 2>/dev/null
+      rm -rf -- "$_zh_dir/.git/hooks" 2>/dev/null
+      _zh_n=$(git -C "$_zh_dir" rev-list --count refs/heads/main 2>/dev/null)
+      rm -rf "$_zh_tmp"
+      printf 'split from %s:%s (%s commit(s))' "$_zh_owner" "$_zh_rel" "${_zh_n:-?}"
+      return 0
+    fi
+    log_warn "zip: could not fetch the split history: $(tail -n 1 "$_zh_tmp/err" 2>/dev/null)"
+    rm -rf -- "$_zh_dir/.git" 2>/dev/null
+  fi
+  [ -n "$_zh_tmp" ] && rm -rf "$_zh_tmp"
+  printf 'none (no history found for this path)'
+  return 0
+}
+
+cmd_zip() {
+  _z_all=0; _z_out=""; _z_path_raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)  _z_all=1 ;;
+      --out)  shift; _z_out=${1:-} ;;
+      --out=*) _z_out=${1#--out=} ;;
+      -*)     fatal "zip: unknown option '$1' (see '$US --help zip')" 2 ;;
+      *)      if [ -z "$_z_path_raw" ]; then _z_path_raw=$1
+              else fatal "zip: one PATH at a time (got '$_z_path_raw' and '$1')" 2; fi ;;
+    esac
+    shift
+  done
+  [ -n "$_z_path_raw" ] || fatal "zip: needs a PATH (a repo, a shadowed or merged path, or any folder in the tree)" 2
+  [ -d "$_z_path_raw" ] || fatal "zip: '$_z_path_raw' is not a directory" 2
+  _z_path=$(cd "$_z_path_raw" 2>/dev/null && pwd -P) || fatal "zip: cannot reach '$_z_path_raw'" 2
+  _z_name=${_z_path##*/}
+
+  # Never overwrite: a zip is somebody's copy of something.
+  [ -n "$_z_out" ] || _z_out="$PWD/$_z_name-$(date +%Y-%m-%d_%H%M).zip"
+  case "$_z_out" in /*) ;; *) _z_out="$PWD/$_z_out" ;; esac
+  [ -e "$_z_out" ] && fatal "zip: '$_z_out' exists — name another with --out" 2
+
+  # Who tracks these files: the repo itself when it has one, else the repo
+  # that carries the path (a shadowed or merged path's container).
+  _z_owner=$(tracking_repo_of "$_z_path" 2>/dev/null)
+  [ -n "$_z_owner" ] || _z_owner=$(git_toplevel_of "$_z_path" 2>/dev/null)
+  _z_self=0
+  [ -e "$_z_path/.git" ] && { _z_self=1; _z_owner=$(git_toplevel_of "$_z_path" 2>/dev/null); }
+
+  ZIP_FILES=0; ZIP_LINKS=0; ZIP_LINKDIRS=0; ZIP_WARNED=0; ZIP_SKIPPED=0
+  _z_stage=$(mktemp -d "${TMPDIR:-/tmp}/${US}.zip.XXXXXX") || fatal "zip: mktemp -d failed" 1
+  _z_root="$_z_stage/$_z_name"
+  mkdir "$_z_root"
+
+  # The file list. Tracked (default) comes from the repo that owns the path,
+  # so a shadowed repo's own tracking counts; --all takes what is on disk.
+  if [ "$_z_all" = 1 ]; then
+    _z_list=$( cd "$_z_path" && find . \( -name .git -o -name .git.real \) -prune -o -type f -print 2>/dev/null \
+               | sed 's|^\./||' )
+    _z_list="$_z_list
+$( cd "$_z_path" && find . -type l 2>/dev/null | sed 's|^\./||' )"
+  elif [ "$_z_self" = 1 ]; then
+    _z_list=$(run_as_owner_capture "$_z_path" git ls-files 2>/dev/null)
+  else
+    _z_rel=${_z_path#"$_z_owner"/}
+    _z_list=$(run_as_owner_capture "$_z_owner" git ls-files -- "$_z_rel" 2>/dev/null \
+              | sed "s|^$(printf '%s' "$_z_rel" | sed 's|[/.*]|\\&|g')/||")
+  fi
+
+  log_major "zip: $_z_path  ->  $_z_out"
+  while IFS= read -r _z_f; do
+    [ -n "$_z_f" ] || continue
+    case "$_z_f" in .git/*|*/.git/*|.git) continue ;; esac
+    [ -e "$_z_path/$_z_f" ] || [ -L "$_z_path/$_z_f" ] || continue
+    _zip_copy_one "$_z_path/$_z_f" "$_z_root" "$_z_f"
+  done <<_Z_EOF
+$_z_list
+_Z_EOF
+
+  _z_hist=$(_zip_history "$_z_root" "$_z_path" "$_z_owner")
+  log_medium "zip: history: $_z_hist"
+
+  if ! ( cd "$_z_stage" && run zip -qr "$_z_out" "$_z_name" ); then
+    rm -rf "$_z_stage"
+    fatal "zip: could not write '$_z_out'" 1
+  fi
+  _z_size=$(du -sh -- "$_z_out" 2>/dev/null | awk '{print $1}')
+  rm -rf "$_z_stage"
+  _z_skip=""
+  [ "$ZIP_SKIPPED" -gt 0 ] && _z_skip=", $ZIP_SKIPPED link(s) left out (named above)"
+  log_ok "zip: $_z_out — $ZIP_FILES file(s), $ZIP_LINKS symlink(s) resolved ($ZIP_LINKDIRS dir)$_z_skip, history: $_z_hist, ${_z_size:-?}"
+  # A dangling link or a loop is an expected shape, named and skipped. Only
+  # something that could not be READ leaves a hole, and a hole must never be
+  # reported as a complete archive.
+  if [ "$ZIP_WARNED" -gt 0 ]; then
+    log_warn "zip: $ZIP_WARNED item(s) could NOT be read (named above) — the archive is INCOMPLETE"
+    return 1
+  fi
+  return 0
+}
+
 cmd_purge() {
   _pg_mode=analyze
   _pg_force=0
@@ -13409,6 +13613,52 @@ Options:
 EOF
 }
 
+show_help_zip() {
+  cat <<EOF
+my-git zip
+
+usage: $US [-V] zip [--all] [--out <FILE>] <PATH>
+
+WHICH REPO does this touch?
+  READS          <PATH> and the repo that tracks it. Writes ONE .zip and
+                 NOTHING else: no marker, no commit, no ref, no .git moved.
+                 That is the difference from 'flatten --zip' / 'unflatten
+                 --zip', which archive a repo's .git IN PLACE. It only
+                 adds a file, so it takes no 'go'.
+
+WHAT GOES IN
+  Files          what git TRACKS under <PATH> (in the repo that owns each
+                 path, so a shadowed repo's own tracking counts), as they
+                 are on disk now. --all takes everything there instead,
+                 untracked and ignored included. Always left out: .git
+                 internals (the history comes as a .git, see below) and
+                 .DS_Store.
+  Symlinks       RESOLVED -- no link ends up in the zip, because a link is
+                 no use on the machine that unpacks it. A link to a file
+                 becomes the file's content under the link's name; a link
+                 to a directory becomes a real directory with the target's
+                 files, even from outside the repo. A link back into a
+                 directory being copied is not followed again (named); a
+                 dangling one is left out (named).
+  History        a working .git FOLDER, so unzipping gives a ready repo,
+                 from whichever source this path has:
+                   its own .git            a clean copy (no hooks, no
+                                           index, no locks)
+                   a merged path           refs/my-git/merged/<path>/...
+                   a shadowed local-only   refs/my-git/shadowed/<path>/...
+                    repo with no .git
+                   a plain folder          'git subtree split' of the
+                                           enclosing repo, built in a temp
+                                           place, never on disk in the tree
+
+RULES
+  Never overwrites an existing file. Default name: <name>-<date_HHMM>.zip
+  in the current directory; --out names another. A file that cannot be read
+  is a WARN that names it, and the run ends NON-ZERO -- a zip with holes is
+  never reported as complete.
+EOF
+}
+
 show_help_purge() {
   cat <<EOF
 my-git purge
@@ -14183,6 +14433,7 @@ show_help() {
     shadow|sh)           show_help_shadow ;;
     unshadow|unsh)       show_help_unshadow ;;
     purge)               show_help_purge ;;
+    zip)                 show_help_zip ;;
     diff)                show_help_diff ;;
     rehydrate)           show_help_rehydrate ;;
     stamp-version)       show_help_stamp_version ;;
@@ -23681,6 +23932,119 @@ PYDRV
     return 0
   }
 
+  test_zip_exports_the_tracked_files_resolved_and_the_repos_own_history() {
+    # 'zip' is the one-off export: ONE .zip, nothing else touched. The files
+    # are what git tracks, with every symlink RESOLVED -- a link is no use
+    # on the machine that unpacks the archive -- and a working .git comes
+    # with them, so unzipping gives a ready repo rather than a bundle.
+    _rt_repo proj
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    mkdir outside && printf 'from outside\n' > outside/far.md
+    cd proj || return 1
+    printf 'a\n' > a.md
+    ln -s a.md link-to-file
+    ln -s ../outside link-to-dir
+    ln -s nowhere.md dangling
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm one >/dev/null 2>&1
+    printf 'untracked\n' > untracked.md   # AFTER the commit: git never saw it
+
+    _rt_ok "zip the repo" _rt_my_git zip --out "$PWD/../out.zip" . || return 1
+    _rt_exists "the archive is there" "$PWD/../out.zip" || return 1
+    ( cd .. && mkdir -p un && cd un && unzip -qq ../out.zip ) >/dev/null 2>&1
+
+    [ -z "$(find ../un -type l 2>/dev/null)" ] \
+      || { _rt_fail "a symlink reached the archive -- it must be resolved"; return 1; }
+    _rt_contains "a link to a file became the file" "../un/proj/link-to-file" "a" || return 1
+    _rt_contains "a link to a directory outside the repo became its files" \
+      "../un/proj/link-to-dir/far.md" "from outside" || return 1
+    _rt_absent "the dangling link is left out" "../un/proj/dangling" || return 1
+    _rt_absent "an untracked file is left out by default" "../un/proj/untracked.md" || return 1
+    _rt_zn=$(git -C ../un/proj rev-list --count HEAD 2>/dev/null)
+    [ -n "$_rt_zn" ] && [ "$_rt_zn" -ge 1 ] \
+      || { _rt_fail "the archive carries no working .git (rev-list said '$_rt_zn')"; return 1; }
+    [ "$_rt_zn" = "$(git rev-list --count HEAD 2>/dev/null)" ] \
+      || { _rt_fail "the archive's history is not the repo's ($_rt_zn vs $(git rev-list --count HEAD))"; return 1; }
+    _rt_ok "links resolved, tracked files only, history ready to use" true || return 1
+
+    # --all takes what git does not track; and nothing was changed on disk.
+    _rt_ok "zip --all" _rt_my_git zip --all --out "$PWD/../all.zip" . || return 1
+    ( cd .. && mkdir -p una && cd una && unzip -qq ../all.zip ) >/dev/null 2>&1
+    _rt_exists "--all takes the untracked file too" "../una/proj/untracked.md" || return 1
+    # The repo is deliberately dirty (the untracked file --all was for), so
+    # 'clean' is the wrong question: ask whether zip changed anything.
+    [ "$(git status --porcelain)" = "?? untracked.md" ] \
+      || { _rt_fail "zip changed the repo (status: $(git status --porcelain | tr '\n' ' '))"; return 1; }
+    _rt_ok "zip changed nothing in the repo" true || return 1
+
+    # It never overwrites: the archive is somebody's copy of something.
+    _rt_my_git zip --out "$PWD/../out.zip" . > "$_rt_out" 2>"$_rt_err"
+    _rt_contains "it refuses an existing output file" "$_rt_err" "exists" || return 1
+    _rt_ok "an existing archive is never overwritten" true || return 1
+    return 0
+  }
+
+  test_zip_builds_history_for_a_path_that_has_none_of_its_own() {
+    # A plain folder inside a repo has no history of its own. The archive
+    # still gets one: the enclosing repo's, for that subtree only, built in
+    # a temp clone so the user's repo is not written to (zip writes its
+    # archive and nothing else).
+    _rt_repo proj
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd proj || return 1
+    mkdir sub && printf 'b\n' > sub/b.md
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm one >/dev/null 2>&1
+    printf 'c\n' >> sub/b.md
+    git -c user.name=T -c user.email=t@t commit -qam two >/dev/null 2>&1
+    _rt_refs_before=$(git for-each-ref --format='%(refname)' | sort)
+
+    _rt_ok "zip the plain folder" _rt_my_git zip --out "$PWD/../sub.zip" sub || return 1
+    ( cd .. && mkdir -p uns && cd uns && unzip -qq ../sub.zip ) >/dev/null 2>&1
+    [ "$(git -C ../uns/sub rev-list --count HEAD 2>/dev/null)" -ge 1 ] \
+      || { _rt_fail "the archive of a plain folder carries no history"; return 1; }
+    _rt_exists "its files are there" "../uns/sub/b.md" || return 1
+    [ "$(git for-each-ref --format='%(refname)' | sort)" = "$_rt_refs_before" ] \
+      || { _rt_fail "zip left a ref behind in the repo -- it writes its archive and nothing else"; return 1; }
+    _rt_ok "history split from the enclosing repo, and no ref left behind" true || return 1
+    return 0
+  }
+
+  test_zip_uses_the_history_the_container_preserved_for_a_local_only_repo() {
+    # The fourth source: a shadowed repo with no remote whose .git is gone
+    # (a fresh clone of the container has the files only). Its branch is in
+    # the container under refs/my-git/shadowed/<path>/..., and that is what
+    # the archive is given.
+    _rt_repo container
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    cd container || return 1
+    _rt_repo_file kid k.md
+    ( cd kid && git branch -q -M main ) >/dev/null 2>&1
+    _rt_ok "shadow the local-only repo" _rt_my_git shadow go kid || return 1
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm "carry kid" >/dev/null 2>&1
+    [ -n "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed 2>/dev/null)" ] \
+      || { _rt_fail "nothing preserved -- the test proves nothing"; return 1; }
+    # The kid's OWN commit sha. The fallback (a subtree split of the
+    # container) would rebuild a different lineage with different shas, so
+    # this is what tells the two sources apart -- without it the test passes
+    # either way, which is what the first version of it did.
+    _rt_kidsha=$(git -C kid rev-parse HEAD)
+
+    # the repo's own .git is gone; the files stay, as on a fresh clone
+    rm -rf kid/.git
+    _rt_ok "zip the repo whose .git is gone" _rt_my_git zip --out "$PWD/../kid.zip" kid || return 1
+    ( cd .. && mkdir -p unk && cd unk && unzip -qq ../kid.zip ) >/dev/null 2>&1
+    [ "$(git -C ../unk/kid rev-list --count HEAD 2>/dev/null)" -ge 1 ] \
+      || { _rt_fail "the archive has no history, though the container preserved it"; return 1; }
+    [ "$(git -C ../unk/kid symbolic-ref --short HEAD 2>/dev/null)" = main ] \
+      || { _rt_fail "the archive's repo is not on the branch that was preserved"; return 1; }
+    [ "$(git -C ../unk/kid rev-parse HEAD 2>/dev/null)" = "$_rt_kidsha" ] \
+      || { _rt_fail "the archive carries a REBUILT history, not the one the container preserved"; return 1; }
+    _rt_ok "the preserved branch became the archive's history" true || return 1
+    return 0
+  }
+
   test_flatten_zip_unflatten_zip_round_trip() {
     # 'flatten --zip' archives a sidecar's git dir to .git.real.zip (st shows
     # [zipped]); 'unflatten' auto-detects the zip and restores it LOSSLESSLY
@@ -25574,7 +25938,7 @@ _RT_GUARD_EOF
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
-  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_shadow_hook_leaves_a_spelling_only_remote_difference_alone test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_version_says_whether_these_bytes_are_the_release test_version_ignores_a_foreign_repos_tags test_version_answers_live_in_every_clone_of_its_own_repo test_stamp_version_never_amends_someone_elses_commit test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_container_commit_refuses_what_the_child_has_not_committed test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_shadow_hook_stamps_a_pathspec_commit_too test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_names_the_commits_it_pushes test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_push_heals_forced_refspecs_and_refuses_a_foreign_plus test_push_preserved_refs_never_overwrites_a_pin test_st_warns_when_your_github_remote_is_https test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_unshadow_undoes_a_shadowed_path_whose_repo_is_gone test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_only_machine_independent_fields test_st_flags_shadow_marker_whose_mirror_is_gone test_st_measures_the_rows_that_have_no_repo_of_their_own test_st_names_dirty_and_out_of_step_together test_st_colours_the_state_by_what_it_asks_of_you test_st_hides_an_ignored_repo_unless_V test_st_V_is_the_default_tree_with_more_on_it test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_preserved_refspecs_heal test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_toplevel_across_a_symlink_into_another_repo test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_st_inside_an_intermediate_repo_keeps_the_block_the_container_needs test_shadow_excludes_retire_from_the_container_itself test_shadow_marker_rewrite_is_byte_identical_when_nothing_changed test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_restamps_only_the_marker_whose_content_it_commits test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_never_commits_the_repos_own_marker test_shadow_hook_leaves_a_marker_it_does_not_mirror_alone test_shadow_hook_drops_the_obsolete_fields_from_an_old_marker test_shadow_hook_marker_merges_cleanly_between_two_machines test_shadow_hook_lives_only_in_a_repo_that_mirrors_something test_container_keeps_the_history_of_a_shadowed_repo_with_no_remote test_st_says_when_a_local_only_repos_history_is_kept_nowhere test_container_keeps_no_history_for_a_shadowed_repo_that_has_a_remote test_container_never_forces_a_preserved_branch_backwards test_st_puts_a_submodule_a_pull_detached_back_on_its_branch test_st_leaves_a_detached_submodule_commit_the_branch_lacks_alone test_st_restores_the_x_bit_a_chmod_rule_took_off_a_hook test_st_refreshes_an_outdated_shadow_hook test_st_replaces_a_shadow_hook_installed_under_an_older_begin_line test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write test_git_ssh_never_becomes_a_connection_master
+  test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_shadow_hook_leaves_a_spelling_only_remote_difference_alone test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_version_says_whether_these_bytes_are_the_release test_version_ignores_a_foreign_repos_tags test_version_answers_live_in_every_clone_of_its_own_repo test_stamp_version_never_amends_someone_elses_commit test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_container_commit_refuses_what_the_child_has_not_committed test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_shadow_hook_stamps_a_pathspec_commit_too test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_names_the_commits_it_pushes test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_push_heals_forced_refspecs_and_refuses_a_foreign_plus test_push_preserved_refs_never_overwrites_a_pin test_st_warns_when_your_github_remote_is_https test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_unshadow_undoes_a_shadowed_path_whose_repo_is_gone test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_only_machine_independent_fields test_st_flags_shadow_marker_whose_mirror_is_gone test_st_measures_the_rows_that_have_no_repo_of_their_own test_st_names_dirty_and_out_of_step_together test_st_colours_the_state_by_what_it_asks_of_you test_st_hides_an_ignored_repo_unless_V test_st_V_is_the_default_tree_with_more_on_it test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_preserved_refspecs_heal test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_toplevel_across_a_symlink_into_another_repo test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_zip_exports_the_tracked_files_resolved_and_the_repos_own_history test_zip_builds_history_for_a_path_that_has_none_of_its_own test_zip_uses_the_history_the_container_preserved_for_a_local_only_repo test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_st_inside_an_intermediate_repo_keeps_the_block_the_container_needs test_shadow_excludes_retire_from_the_container_itself test_shadow_marker_rewrite_is_byte_identical_when_nothing_changed test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_restamps_only_the_marker_whose_content_it_commits test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_never_commits_the_repos_own_marker test_shadow_hook_leaves_a_marker_it_does_not_mirror_alone test_shadow_hook_drops_the_obsolete_fields_from_an_old_marker test_shadow_hook_marker_merges_cleanly_between_two_machines test_shadow_hook_lives_only_in_a_repo_that_mirrors_something test_container_keeps_the_history_of_a_shadowed_repo_with_no_remote test_st_says_when_a_local_only_repos_history_is_kept_nowhere test_container_keeps_no_history_for_a_shadowed_repo_that_has_a_remote test_container_never_forces_a_preserved_branch_backwards test_st_puts_a_submodule_a_pull_detached_back_on_its_branch test_st_leaves_a_detached_submodule_commit_the_branch_lacks_alone test_st_restores_the_x_bit_a_chmod_rule_took_off_a_hook test_st_refreshes_an_outdated_shadow_hook test_st_replaces_a_shadow_hook_installed_under_an_older_begin_line test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write test_git_ssh_never_becomes_a_connection_master
   test_run_list_registers_every_defined_test"
   _rt_registered=$_rt_all_tests   # the unfiltered list, for the guard test
 
@@ -25838,6 +26202,7 @@ main() {
     shadow|sh)                  cmd_shadow "$@" ;;
     unshadow|unsh)              cmd_unshadow "$@" ;;
     purge)                      cmd_purge "$@" ;;
+    zip)                        cmd_zip "$@" ;;
     diff)                       cmd_diff "$@" ;;
     rehydrate)                  cmd_rehydrate "$@" ;;
     stamp-version)              cmd_stamp_version "$@" ;;
