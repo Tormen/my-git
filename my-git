@@ -1659,6 +1659,70 @@ _rejected_refs() {
   printf '%s\n' "$1" | awk '$1 == "!" && $2 == "[rejected]" { print $3 }'
 }
 
+# prune_dead_kept_refs <repo> <remote> [analyze]
+#   A kept branch ($SHADOWED_REFS_ROOT/<rel>/heads/<br>) carries the history
+#   of a SHADOWED repo that has NO REMOTE -- the one case where this repo is
+#   the only place those commits exist. It is DEAD as soon as either half
+#   stops holding: the repo gained a remote of its own (it travels by it
+#   now), or the path is no longer mirrored here at all.
+#
+#   Both sides go in ONE operation, which is why this lives on the push path
+#   and not in the commit hook: the fetch refspec recreates every ref the
+#   remote still holds, so deleting only the local copy brings it straight
+#   back on the next fetch -- measured on the real tree, where a kept branch
+#   returned twice after being deleted.
+#
+#   A ref the remote holds at a DIFFERENT sha is left alone and reported:
+#   that is another machine's copy of something this one does not have, and
+#   the same reason pins are never overwritten.
+prune_dead_kept_refs() {
+  # A repo with NO remote of its own needs only the local half: nothing can
+  # fetch the ref back into it.
+  _pdk_repo=$1; _pdk_remote=${2:-}; _pdk_mode=${3:-}
+  _pdk_n=0
+  while IFS= read -r _pdk_ref; do
+    [ -n "$_pdk_ref" ] || continue
+    _pdk_rest=${_pdk_ref#"$SHADOWED_REFS_ROOT"/}
+    _pdk_rel=${_pdk_rest%/heads/*}
+    [ -n "$_pdk_rel" ] && [ "$_pdk_rel" != "$_pdk_rest" ] || continue
+    # ALIVE while this repo still mirrors the path AND that repo has no
+    # remote. Asked of the tree, never of the marker's recorded url: the
+    # marker is a record, the repo's config is the fact.
+    _pdk_alive=0
+    if [ -n "$(run_as_owner_capture "$_pdk_repo" git ls-files -- "$_pdk_rel/.git.shadow.status" 2>/dev/null)" ]; then
+      [ -n "$(run_as_owner_capture "$_pdk_repo/$_pdk_rel" git config --get remote.origin.url 2>/dev/null)" ] \
+        || _pdk_alive=1
+    fi
+    [ "$_pdk_alive" = 1 ] && continue
+    _pdk_here=$(run_as_owner_capture "$_pdk_repo" git rev-parse "$_pdk_ref" 2>/dev/null)
+    _pdk_there=""
+    [ -n "$_pdk_remote" ] \
+      && _pdk_there=$(run_as_owner_capture "$_pdk_repo" git ls-remote "$_pdk_remote" "$_pdk_ref" 2>/dev/null | awk '{print $1; exit}')
+    if [ -n "$_pdk_there" ] && [ "$_pdk_there" != "$_pdk_here" ]; then
+      log_warn "$_pdk_repo: $_pdk_ref is dead here but '$_pdk_remote' holds a DIFFERENT commit ($(printf '%.8s' "$_pdk_there") vs ours $(printf '%.8s' "$_pdk_here")) — left alone, it may be another machine's only copy"
+      continue
+    fi
+    if [ "$_pdk_mode" = analyze ]; then
+      log_medium "$_pdk_repo: would stop keeping $_pdk_ref (its repo has a remote, or is no longer mirrored here)"
+      _pdk_n=$((_pdk_n + 1))
+      continue
+    fi
+    # THERE first: a local delete that is not propagated comes back.
+    if [ -n "$_pdk_there" ] \
+       && ! _pdk_err=$(run_as_owner "$_pdk_repo" git push -q "$_pdk_remote" --delete "$_pdk_ref" 2>&1); then
+      log_warn "$_pdk_repo: could not stop '$_pdk_remote' keeping $_pdk_ref, so it stays here too (a fetch would bring it back): $(printf '%s' "$_pdk_err" | tail -n 1)"
+      continue
+    fi
+    run_as_owner "$_pdk_repo" git update-ref -d "$_pdk_ref" >/dev/null 2>&1 \
+      && _pdk_n=$((_pdk_n + 1)) \
+      && log_medium "$_pdk_repo: no longer keeps $_pdk_ref — its repo has a remote, or is no longer mirrored here"
+  done <<_PDK_EOF
+$(run_as_owner_capture "$_pdk_repo" git for-each-ref --format='%(refname)' "$SHADOWED_REFS_ROOT" 2>/dev/null)
+_PDK_EOF
+  PDK_N=$_pdk_n
+  return 0
+}
+
 # push_preserved_refs <repo>
 #   'git push --all' means refs/heads/* ONLY — it does not honour a
 #   configured push refspec and never carries $MERGED_REFS_ROOT. mc's
@@ -1674,6 +1738,10 @@ push_preserved_refs() {
   _ppr_remote=$(run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | grep -x origin || \
                 run_as_owner_capture "$_ppr_repo" git remote 2>/dev/null | head -n 1)
   [ -n "$_ppr_remote" ] || return 0
+  # Dead ones go BEFORE the live ones are pushed: this is the only moment
+  # both sides are in reach, and pushing a ref we are about to delete would
+  # be work done twice.
+  prune_dead_kept_refs "$_ppr_repo" "$_ppr_remote"
   if _ppr_out=$(run_as_owner "$_ppr_repo" git push -q "$_ppr_remote" \
                   "$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*" \
                   "$SHADOWED_REFS_ROOT/*:$SHADOWED_REFS_ROOT/*" 2>&1); then
@@ -5394,6 +5462,7 @@ push_one() {
         push_preserved_refs "$_r" || true
       else
         ensure_preserved_refspec "$_r" analyze
+        prune_dead_kept_refs "$_r" "${_up%%/*}" analyze
         log_major "$(printf '%-60s %s' "$_r" "up to date, but it carries preserved history -> would push it")"
       fi
     fi
@@ -5417,8 +5486,10 @@ push_one() {
   _ps_rem=${_up%%/*}
   if [ "$DRY_RUN" = 1 ]; then
     ensure_preserved_refspec "$_r" analyze
+    prune_dead_kept_refs "$_r" "$_ps_rem" analyze
   else
     ensure_preserved_refspec "$_r"
+    prune_dead_kept_refs "$_r" "$_ps_rem"
   fi
   _ps_plus=$(_forced_push_specs "$_r" "$_ps_rem")
   if [ -n "$_ps_plus" ]; then
@@ -9777,28 +9848,19 @@ _MGS_MARKERS_EOF
     # up-to-date ref costs one local fetch, and a MISSING one (an older
     # repo, a fresh clone) is what needs filling in.
     #
-    # ONE rule, enforced in BOTH directions: the container keeps a branch
-    # exactly while the repo has no remote. So a repo that has GAINED one
-    # has its kept branches pruned here -- whether 'remote go' gave it the
-    # remote or someone set it with plain git, and whether or not that
-    # one-shot delete raced a commit like this one. Without the second
-    # half, a stale second copy of a history that now has a home sits in
-    # the container for ever, and nothing says why.
-    _mgs_rel=${_mgs_kid#"$_mgs_top"/}
+    # A kept branch that has gone DEAD -- its repo gained a remote, or the
+    # path is no longer mirrored -- is NOT pruned here. A commit cannot
+    # reach the remote, and the fetch refspec recreates whatever the remote
+    # still holds, so a local-only delete returns on the next fetch and the
+    # prune churns for ever. 'push' owns that, deleting both sides at once.
     if [ -z "$_mgs_url" ] && [ -n "$_mgs_br" ] && [ -n "$_mgs_ci" ]; then
+      _mgs_rel=${_mgs_kid#"$_mgs_top"/}
       _mgs_pref="refs/my-git/shadowed/$_mgs_rel/heads/$_mgs_br"
       if ! git -C "$_mgs_top" fetch -q "$_mgs_kid" \
              "refs/heads/$_mgs_br:$_mgs_pref" 2>/dev/null; then
         printf 'my-git: %s: could not preserve %s in this repo -- it has no remote, so its history stays on this machine (a ref that would move backwards is never forced)\n' \
           "$_mgs_rel" "$_mgs_br" >&2
       fi
-    elif [ -n "$_mgs_url" ]; then
-      for _mgs_dead in $(git -C "$_mgs_top" for-each-ref \
-                           --format='%(refname)' "refs/my-git/shadowed/$_mgs_rel" 2>/dev/null); do
-        git -C "$_mgs_top" update-ref -d "$_mgs_dead" 2>/dev/null \
-          && printf 'my-git: %s: no longer kept here (%s) -- its remote is the route now\n' \
-               "$_mgs_rel" "${_mgs_dead##*/}" >&2
-      done
     fi
     # Staged content is the right gate for 'commit' -- it records which
     # commit this mirror was last taken from. It is the wrong gate for
@@ -12111,29 +12173,26 @@ _remote_set_one() {
     return 1
   fi
   # The branches the container kept for it are now a second copy of a history
-  # that has a home. Retire them, in the repo that TRACKS this path.
+  # that has a home. Retiring them is the push path's one owner, because the
+  # delete has to reach the container's REMOTE as well: the fetch refspec
+  # recreates whatever the remote still holds.
   _rs_track=$(tracking_repo_of "$_rs_p" 2>/dev/null)
-  _rs_n=0; _rs_left=0
+  PDK_N=0; _rs_left=0
   if [ -n "$_rs_track" ]; then
     _rs_rel=${_rs_p#"$_rs_track"/}
-    while IFS= read -r _rs_ref; do
-      [ -n "$_rs_ref" ] || continue
-      run_as_owner "$_rs_track" git update-ref -d "$_rs_ref" >/dev/null 2>&1 && _rs_n=$((_rs_n + 1))
-    done <<_RS_EOF
-$(run_as_owner_capture "$_rs_track" git for-each-ref --format='%(refname)' "$SHADOWED_REFS_ROOT/$_rs_rel" 2>/dev/null)
-_RS_EOF
-    # MEASURED, never assumed: a container commit running at this moment
-    # re-keeps the branch from the repo it still read as remote-less, so a
-    # delete that succeeded can be undone a second later. The next commit's
-    # hook prunes it (it enforces the same rule the other way round), so
-    # this says what is true NOW rather than claiming the end state.
+    _rs_rem=$(run_as_owner_capture "$_rs_track" git remote 2>/dev/null | grep -x origin || \
+              run_as_owner_capture "$_rs_track" git remote 2>/dev/null | head -n 1)
+    prune_dead_kept_refs "$_rs_track" "$_rs_rem"
+    # MEASURED, never assumed: nothing here claims an end state it has not
+    # looked at. A container with no remote of its own, or one that refused
+    # the delete, still keeps the branch -- and says so.
     _rs_left=$(run_as_owner_capture "$_rs_track" git for-each-ref --count=1 \
                  --format='%(refname)' "$SHADOWED_REFS_ROOT/$_rs_rel" 2>/dev/null)
     [ -n "$_rs_left" ] && _rs_left=1 || _rs_left=0
   fi
-  log_ok "remote go: $_rs_p — origin=$_rs_u, '$_rs_br' pushed and tracking; $_rs_n kept branch(es) retired in ${_rs_track:-no tracking repo} [left $_rs_left]"
+  log_ok "remote go: $_rs_p — origin=$_rs_u, '$_rs_br' pushed and tracking; ${PDK_N:-0} kept branch(es) retired in ${_rs_track:-no tracking repo} [left $_rs_left]"
   [ "$_rs_left" = 1 ] \
-    && log_warn "remote go: $_rs_track still keeps a branch for $_rs_rel — a commit running right now re-took it; the next commit there prunes it"
+    && log_warn "remote go: $_rs_track still keeps a branch for $_rs_rel — its next '$US push go' retires it, there as well as here"
   # The marker records the remote; the next container commit re-reads it.
   log_medium "remote go: commit $_rs_track so its marker records the new remote"
   return 0
@@ -13328,9 +13387,10 @@ Modes:
                     (ada's /LINKS/gits is root's tree; its own NEW-REPO.sh
                     makes one), and this does the half that is yours.
                     Afterwards the branches the container kept for it are
-                    retired -- it keeps one only WHILE a repo has no remote,
-                    so the next commit there prunes any that a commit
-                    running at the same moment re-took.
+                    retired -- there as well as here, because a ref the
+                    remote still holds comes back on the next fetch. A
+                    container that has no remote of its own, or refuses the
+                    delete, says so; its next 'push go' finishes the job.
                     REFUSES a repo that already has a remote (that is plain
                     git's business), a detached HEAD, and a public forge
                     (--force if you really mean to publish there). A push
@@ -14519,6 +14579,12 @@ What it will NOT do:
   * replace a pin. A refs/my-git/merged/* ref the remote holds differently
     may be the only copy of another machine's merge: it is left there,
     named, and counted as 'pin-rejected'. The commits still go out.
+
+It also RETIRES the branches this repo keeps for a shadowed repo that has
+none of its own, once that repo has gained a remote or is no longer mirrored
+here -- here AND on the remote in one go, because the fetch refspec brings
+back any ref the remote still holds. One the remote holds at a different
+commit is reported, never deleted.
 EOF
 }
 
@@ -25418,33 +25484,46 @@ PYDRV
   }
 
   test_container_prunes_a_kept_branch_once_the_repo_has_a_remote() {
-    # The rule is ONE rule, both ways round: the container keeps a branch
-    # exactly WHILE the repo has no remote. A repo that gains one -- from
-    # 'remote go', or from plain git, or where 'remote go' deleted the ref
-    # and a commit running at that moment re-took it -- has its kept
-    # branches pruned by the next commit here. Otherwise a second copy of a
-    # history that now has a home stays in the container for ever.
+    # The rule is ONE rule, both ways round: a branch is kept exactly WHILE
+    # the repo has no remote. A repo that gains one -- by 'remote go' or by
+    # plain git -- has its kept branches retired by 'push', HERE and on the
+    # remote in one operation. Only the remote half makes it stick: the
+    # fetch refspec recreates every ref the remote holds, so a local-only
+    # delete is undone by the next fetch, which is what happened on the
+    # real tree.
     _rt_repo_file up_o a.md
-    _rt_repo container
+    git init -q --bare cup.git >/dev/null 2>&1
+    git clone -q cup.git container >/dev/null 2>&1
     _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
     cd container || return 1
+    _rt_repo_file base b.md
+    git add -A >/dev/null 2>&1
+    git -c user.name=T -c user.email=t@t commit -qm base >/dev/null 2>&1
+    git push -q -u origin HEAD >/dev/null 2>&1
     _rt_repo_file kid k.md
     ( cd kid && git branch -q -M main ) >/dev/null 2>&1
     _rt_ok "shadow a local-only repo" _rt_my_git shadow go kid || return 1
     git add -A >/dev/null 2>&1
     git -c user.name=T -c user.email=t@t commit -qm "carry kid" >/dev/null 2>&1
+    _rt_ok "the container pushes what it keeps" _rt_my_git push go || return 1
     [ -n "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed 2>/dev/null)" ] \
-      || { _rt_fail "nothing was kept for the local-only kid -- the test proves nothing"; return 1; }
-    _rt_ok "its branch is kept while it has no remote" true || return 1
+      && [ -n "$(git ls-remote origin 'refs/my-git/shadowed/*' 2>/dev/null)" ] \
+      || { _rt_fail "nothing was kept here and there for the local-only kid -- the test proves nothing"; return 1; }
+    _rt_ok "its branch is kept here AND on the remote while it has no remote of its own" true || return 1
     # it gains a remote, by plain git -- not through 'remote go'
     ( cd kid && git remote add origin "$PWD/../../up_o" ) >/dev/null 2>&1
-    printf 'more\n' >> kid/k.md
-    ( cd kid && git -c user.name=T -c user.email=t@t commit -qam second ) >/dev/null 2>&1
-    git add -A >/dev/null 2>&1
-    git -c user.name=T -c user.email=t@t commit -qm "carry kid again" >/dev/null 2>&1
+    _rt_ok "push again" _rt_my_git push go || return 1
     [ -z "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed 2>/dev/null)" ] \
-      || { _rt_fail "the container still keeps $(git for-each-ref --format='%(refname)' refs/my-git/shadowed | tr '\n' ' ') for a repo that now has a remote"; return 1; }
-    _rt_ok "the next commit prunes it" true || return 1
+      || { _rt_fail "it still keeps $(git for-each-ref --format='%(refname)' refs/my-git/shadowed | tr '\n' ' ') for a repo that now has a remote"; return 1; }
+    [ -z "$(git ls-remote origin 'refs/my-git/shadowed/*' 2>/dev/null)" ] \
+      || { _rt_fail "the REMOTE still keeps it, so the next fetch brings it back"; return 1; }
+    _rt_ok "push retires it on both sides" true || return 1
+    # The one that bit on the real tree: deleting only the local copy is
+    # undone by the very next fetch, silently.
+    git fetch -q origin >/dev/null 2>&1
+    [ -z "$(git for-each-ref --format='%(refname)' refs/my-git/shadowed 2>/dev/null)" ] \
+      || { _rt_fail "a fetch brought the retired branch back -- the delete never reached the remote"; return 1; }
+    _rt_ok "and a fetch does not bring it back" true || return 1
     return 0
   }
 

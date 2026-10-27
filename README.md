@@ -450,12 +450,19 @@ still goes through — a commit is not the place to lose somebody's history.
 and its history is in this one .git`); one commit in the container fixes it,
 or give the repo a remote.
 
-**One rule, both ways round: the container keeps a branch exactly WHILE the
-repo has no remote.** A repo that gains one has its kept branches pruned by
-the next commit in the container — however it got that remote (`remote go`,
-or plain git), and whether or not `remote go`'s own delete raced a commit
-that re-took the branch a second later. Otherwise a second copy of a history
-that now has a home would sit there for ever, with nothing saying why.
+**One rule, both ways round: a branch is kept exactly WHILE the repo has no
+remote.** A repo that gains one — by `remote go` or by plain git — or a path
+that stops being mirrored has its kept branches retired by **`push`**,
+*here and on the remote in one operation*. Otherwise a second copy of a
+history that now has a home would sit there for ever.
+
+The remote half is what makes it stick, and leaving it out is a bug this had:
+the fetch refspec recreates every ref the remote still holds, so a ref that
+is only deleted locally is back on the next fetch — measured on the real
+tree, where a kept branch returned twice. It is therefore the PUSH path that
+owns the prune, not the commit hook: a commit cannot reach the remote. A ref
+the remote holds at a *different* commit is never deleted, only reported —
+same reason a pin is never overwritten.
 
 ```sh
 my-git remote go py/thing my-gits:/LINKS/gits/thing.git
