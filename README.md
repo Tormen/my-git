@@ -346,7 +346,7 @@ my-git unflatten go embkid --merge    # reconstruct a merged (git-deleted) path 
 | `unsm`          | `unsub`        | whole-tree | Reverse of `sm`: de-register a submodule back to a `raw-nested-git` — drops `.gitmodules`+gitlink, **de-absorbs** its gitdir (`.git/modules/<name>` → `<path>/.git`); the repo stays live, history intact |
 | `ignore` / `unignore` | —        | whole-tree (`unignore`); PATH (`ignore`) | Toggle the **generic** `.git/my-git.ignore` marker — honoured by every subcommand (`st` won't descend, `sm` won't register, `mc` won't commit, `flatten` won't touch) |
 | `sync`          | `syn`          | opt-in `-R` | Composite: `sm` → `pull` → `mc`, each phase scoped like the verb itself — this repo, or with `-R` the whole tree in one command |
-| `remote`        | `rem`          | tree-wide   | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…)  |
+| `remote`        | `rem`          | tree-wide   | List / audit git remotes; `--check` flags suspicious urls (file://, http, ./…); `go <PATH> <URL>` gives a local-only repo its private remote |
 | `flatten`       | `fl`           | single-repo (or `-i`/PATH-scoped) | Nested repo → parent content; **3 equal modes** for its git dir, all history-preserving: `--merge` (history moves into the parent, `refs/my-git/merged/<path>/`), `--sidecar` (`.git.real`), `--zip` (`.git.zip`/`.git.real.zip`); `--rm-git` is the one destructive option and demands typing `I am sure`; `-i`/PATH for per-item or forced-mode control |
 | `unflatten`     | `unfl`         | single-repo (or PATH-scoped) | Reverse of `flatten`: rebuild a live `.git` — `--sidecar`/`--zip`/`--merge` all exact (merge restores the preserved history, branches and tags); falls back to best-effort `git subtree split` only for snapshots written before preservation existed; auto-detects the mode per path |
 | `shadow`        | `sh`           | single-repo (or `-i`/PATH-scoped) | Content-mirror: keep the nested **live `.git`** AND make the parent track its files too (move-aside bootstrap); analyze / `go` / `-i` |
@@ -449,6 +449,24 @@ still goes through — a commit is not the place to lose somebody's history.
 `st` says when a local-only repo's history is kept nowhere yet (`no remote,
 and its history is in this one .git`); one commit in the container fixes it,
 or give the repo a remote.
+
+**One rule, both ways round: the container keeps a branch exactly WHILE the
+repo has no remote.** A repo that gains one has its kept branches pruned by
+the next commit in the container — however it got that remote (`remote go`,
+or plain git), and whether or not `remote go`'s own delete raced a commit
+that re-took the branch a second later. Otherwise a second copy of a history
+that now has a home would sit there for ever, with nothing saying why.
+
+```sh
+my-git remote go py/thing my-gits:/LINKS/gits/thing.git
+#  SUCCESS: … 'main' pushed and tracking; 1 kept branch(es) retired in /LINKS/src [left 0]
+```
+
+`remote go` gives a local-only repo its PRIVATE remote and pushes it: it
+refuses a public forge (publishing is a deliberate act, done with plain git),
+refuses to move a remote that already exists, and removes the remote again if
+the push fails, so nothing is left half-set. The bare repo itself is root's
+half — `/LINKS/gits` is root's tree — so it is made by a `my-rollout` step.
 
 **Getting it back on another machine:** `rehydrate` restores such a repo from
 those refs — the same commits with the same shas, not a rebuilt lineage. A
