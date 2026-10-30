@@ -464,6 +464,15 @@ owns the prune, not the commit hook: a commit cannot reach the remote. A ref
 the remote holds at a *different* commit is never deleted, only reported —
 same reason a pin is never overwritten.
 
+A machine that only pulls never runs that push, so it keeps such branches for
+good. `st` counts them, read-only, in one line at the very bottom — only when
+there are any, and the same set `push` would retire (one predicate serves
+both; a container with no remote is left out, since push never retires there):
+
+```
+  >> kept branches no longer needed (refs/my-git/shadowed/): 2  ·  to clear: my-git push go /LINKS/src
+```
+
 ```sh
 my-git remote go py/thing my-gits:/LINKS/gits/thing.git
 #  SUCCESS: … 'main' pushed and tracking; 1 kept branch(es) retired in /LINKS/src [left 0]
