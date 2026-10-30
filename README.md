@@ -487,10 +487,14 @@ the push fails, so nothing is left half-set.
 ### Setting a repo up: once, properly — then my-fix-permissions keeps it
 
 my-git runs every git command as the owner of the repository it acts on, and
-**what it creates belongs to the owner of the tree it creates it in** — the
-worktree, its gitdir, and the bare remote. A submodule restored under
-`/LINKS/global` comes back as root's, not as yours, where before git would
-refuse it as dubiously-owned on the next run.
+**a repo it creates is held as its bare remote is** — owner and group, asked
+of the bare over ssh or read from a path here. The bare repos are the record:
+when one is root's and the next yours, each clone follows its own, whoever ran
+the command. A repo whose origin is a public forge, that has none, or whose
+far side does not answer (said in a WARN), belongs to the owner of the
+directory it goes into instead: a submodule restored under `/LINKS/global`
+comes back as root's, not as yours, where before git would refuse it as
+dubiously-owned on the next run.
 
 `remote go` **makes the bare repo when it is not there**, so publishing a
 local-only project is one command instead of a root step on the far host
@@ -633,8 +637,9 @@ that root comes from:
  >>> --install: 4 root(s) -- ready=1 would-clone=1 would-set-remote=1 needs-you=1 skipped=0 failed=0
 ```
 
-- **missing** (or an empty directory): cloned from its pair's URL, owned by
-  the owner of the directory it goes into. No pair: NEEDS YOU.
+- **missing** (or an empty directory): cloned from its pair's URL, and held
+  as that bare repo is (see [Setting a repo up](#setting-a-repo-up-once-properly--then-my-fix-permissions-keeps-it)).
+  No pair: NEEDS YOU.
 - **a repo with no remote**: given its pair's URL, exactly as `remote go` does
   (the bare repo there is made when missing). No pair: ready.
 - **a repo with a remote**: ready. A remote that differs from the pair is
