@@ -284,6 +284,7 @@ config file.
 | Variable                              | Default                                  | Meaning                                                                     |
 |---------------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | `GIT_REPOS`                           | see default config                       | Fallback super-repo list (used only when no repo is scoped via CWD or args) |
+| `GIT_REPOS_REMOTES`                   | empty                                    | `<path>=<url>` pairs: where [`--install`](#--install--this-machines-repos-as-its-config-says) clones a `GIT_REPOS` root from, or the remote it gives one that has none |
 | `COMMIT_MSG_LAST_N`                   | `3`                                      | Number of recent log entries in auto-commit body                            |
 | `COMMIT_MSG_DIFF_MAX_FILES`           | `10`                                     | Above this count, commit body shows file list instead of diffs              |
 | `PRIV_POLICY_USER_TO_ROOT`            | `warn`                                   | Non-root caller vs. a root-owned repo — see [Privilege](#privilege-sudo--su--policy) |
@@ -607,6 +608,44 @@ container (see [`unflatten --merge`](#unflatten--rebuild-a-live-git)).
 Day to day you rarely need it: `pull go` realigns a lagging HEAD on its own,
 and so does `st`. `rehydrate` is for the case only it can fix — a project
 with no `.git` at all.
+
+### `--install` — this machine's repos, as its config says
+
+One command puts a machine's repos in place: on a new machine after its trees
+arrived, and safely on one that is already set up. Like every command that
+writes, it shows first and acts on `go`:
+
+```sh
+my-git --install            # what it would do; changes nothing
+my-git --install go         # do it
+```
+
+It looks at each `GIT_REPOS` root, and at `GIT_REPOS_REMOTES` (one
+`<path>=<url>` pair per root, the path spelled as in `GIT_REPOS`) for where
+that root comes from:
+
+```
+ >>> /srv/notes      would clone host:/srv/git/notes.git (then rehydrate its shadowed projects)
+ >>> /srv/work       would set origin host:/srv/git/work.git ('remote go': made there if missing, then pushed)
+ >>> /srv/scratch    ready (no remote, and GIT_REPOS_REMOTES names none)
+ >>> /srv/old        NEEDS YOU -- has content but no .git; never cloned over
+
+ >>> --install: 4 root(s) -- ready=1 would-clone=1 would-set-remote=1 needs-you=1 skipped=0 failed=0
+```
+
+- **missing** (or an empty directory): cloned from its pair's URL, owned by
+  the owner of the directory it goes into. No pair: NEEDS YOU.
+- **a repo with no remote**: given its pair's URL, exactly as `remote go` does
+  (the bare repo there is made when missing). No pair: ready.
+- **a repo with a remote**: ready. A remote that differs from the pair is
+  NEEDS YOU and left as it is.
+- **content and no `.git`**, or a dangling link: NEEDS YOU, never cloned over.
+- **another owner's repo**: SKIPPED under the cross-user policy; run as root.
+
+Then `rehydrate` runs, with its own output, in every root that carries
+shadowed projects. `--mode` applies as for `remote go`. A second `go` right
+after the first changes nothing and says so; the exit status is 0 only when
+every root is as the config says.
 
 ### Why recursion is opt-in for `mc` and `sm`
 
