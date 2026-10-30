@@ -481,8 +481,43 @@ my-git remote go py/thing my-gits:/LINKS/gits/thing.git
 `remote go` gives a local-only repo its PRIVATE remote and pushes it: it
 refuses a public forge (publishing is a deliberate act, done with plain git),
 refuses to move a remote that already exists, and removes the remote again if
-the push fails, so nothing is left half-set. The bare repo itself is root's
-half — `/LINKS/gits` is root's tree — so it is made by a `my-rollout` step.
+the push fails, so nothing is left half-set.
+
+### Setting a repo up: once, properly — then my-fix-permissions keeps it
+
+my-git runs every git command as the owner of the repository it acts on, and
+**what it creates belongs to the owner of the tree it creates it in** — the
+worktree, its gitdir, and the bare remote. A submodule restored under
+`/LINKS/global` comes back as root's, not as yours, where before git would
+refuse it as dubiously-owned on the next run.
+
+`remote go` **makes the bare repo when it is not there**, so publishing a
+local-only project is one command instead of a root step on the far host
+followed by an adoption here:
+
+```sh
+my-git remote go /LINKS/src/py/thing my-gits:/LINKS/gits/thing.git
+my-git remote go --mode 500 /LINKS/global/etc/ssh/keys root@ada:/LINKS/gits/keys.git
+```
+
+A plain `git init --bare` over ssh, so the new remote starts **empty** — a
+template carries whatever its last editor left in it. It belongs to the
+account in the URL, because that account created it, so nothing is ever
+chowned on a machine my-git only reaches as a client. A path that already
+holds a repository is used as it is, never re-initialised; a far side that
+cannot be made leaves `origin` unset, so nothing is half-done.
+
+`--mode <MODE>` is the one number for both sides, applied **once**, to
+directories only — never to the files, because my-fix-permissions owns every
+permission from setup onwards and two enforcers churn against each other. The
+bare gets that mode **plus the owner's write bit**, which it cannot work
+without: a bare at `500` refuses the very first push (`cannot lock ref
+'refs/heads/main': Unable to create '…/HEAD.lock': Permission denied`), so
+`--mode 500` leaves the keys worktree read-only and makes the bare `700`.
+Without `--mode`, a repo keeps the mode of the directory it sits in and the
+bare whatever `git init` gives it. `sm go` and `rehydrate go` take the same
+flag; `SETUP_SSH_CONNECT_TIMEOUT` bounds the one command my-git runs on
+another machine.
 
 **Getting it back on another machine:** `rehydrate` restores such a repo from
 those refs — the same commits with the same shas, not a rebuilt lineage. A
