@@ -637,14 +637,16 @@ that root comes from:
  >>> --install: 4 root(s) -- ready=1 would-clone=1 would-set-remote=1 needs-you=1 skipped=0 failed=0
 ```
 
-- **missing** (or an empty directory): cloned from its pair's URL, and held
+- **missing** (or an empty directory, or a link to an empty folder -- cloned
+  into the folder, the link stays): cloned from its pair's URL, and held
   as that bare repo is (see [Setting a repo up](#setting-a-repo-up-once-properly--then-my-fix-permissions-keeps-it)).
   No pair: NEEDS YOU.
 - **a repo with no remote**: given its pair's URL, exactly as `remote go` does
   (the bare repo there is made when missing). No pair: ready.
 - **a repo with a remote**: ready. A remote that differs from the pair is
   NEEDS YOU and left as it is.
-- **content and no `.git`**, or a dangling link: NEEDS YOU, never cloned over.
+- **content and no `.git`** (behind a link too), or a dangling link: NEEDS
+  YOU, never cloned over, and the folder a dangling link names is not created.
 - **another owner's repo**: SKIPPED under the cross-user policy; run as root.
 
 Then `rehydrate` runs, with its own output, in every root that carries
