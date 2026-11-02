@@ -17716,7 +17716,33 @@ _CS_EOF
           rm -f "$_errlog"
           printf 'ADD      %s  <-  %s   [reusing the gitdir an earlier run left at %s: same remote]\n' \
             "$_sp" "$_url" "$_sm_gd"
+          # 'submodule add --force' only checks out what the gitdir already
+          # holds; it fetches nothing. A gitdir cloned while the remote was
+          # still EMPTY holds no objects and a HEAD on a branch yet to be
+          # born, so that checkout fails on every run. Bring it up to the
+          # remote first, as a fresh clone would: fetch, and point an unborn
+          # HEAD at the remote's default branch.
+          # Its core.worktree names <path>, which is moved aside right now; none
+          # of these calls needs a worktree, so the gitdir stands in for one.
           _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+          if ! run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" fetch -q origin 2>"$_errlog"; then
+            cat "$_errlog" >&2
+            rm -f "$_errlog"
+            printf 'ERROR  git submodule add failed for %s (reason: gitdir of the same repo, and fetching into it failed)\n' "$_sp" >&2
+            _sm_swap_in_backup
+            return 1
+          fi
+          if ! git --git-dir="$_sm_gd" --work-tree="$_sm_gd" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+            _sm_gd_br=$(git --git-dir="$_sm_gd" --work-tree="$_sm_gd" ls-remote --symref origin HEAD 2>/dev/null \
+              | awk '$1 == "ref:" { sub("^refs/heads/", "", $2); print $2; exit }')
+            if [ -n "$_sm_gd_br" ] \
+               && git --git-dir="$_sm_gd" --work-tree="$_sm_gd" rev-parse -q --verify "refs/remotes/origin/$_sm_gd_br" >/dev/null 2>&1; then
+              run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" update-ref "refs/heads/$_sm_gd_br" "refs/remotes/origin/$_sm_gd_br"
+              run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" symbolic-ref HEAD "refs/heads/$_sm_gd_br"
+              printf '    > its HEAD was a branch yet to be born (cloned while the remote was empty): fetched, %s now at origin/%s\n' \
+                "$_sm_gd_br" "$_sm_gd_br"
+            fi
+          fi
           _sm_safe_git "$_sm_toplevel" submodule add --force "$_url" "$_sp" 2>"$_errlog"
           _rc=$?
           if [ "$_rc" -eq 0 ]; then
@@ -18809,6 +18835,39 @@ _RT_CONF_EOF
     grep -q 'path = etc/secrets' .gitmodules 2>/dev/null \
       || { _rt_fail "etc/secrets was not registered: a gitdir of its OWN repo blocked it"; return 1; }
     _rt_ok "the gitdir of the same repo was reused, not called stale" true || return 1
+    return 0
+  }
+
+  test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty() {
+    # The shape horse's secrets step left: the first attempt ran while the
+    # remote was still EMPTY, so its clone into .git/modules/<path> holds no
+    # objects and a HEAD on a branch yet to be born. The remote has its
+    # branch now -- but reusing the gitdir as it is checks out that unborn
+    # HEAD ("You are on a branch yet to be born") and the step fails on
+    # every run. Reuse must first bring the gitdir up to the remote.
+    git init -q --bare bare.git
+    _rt_repo global
+    _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+    _rt_url="$PWD/bare.git"
+    ( cd global && mkdir etc
+      # the attempt against the empty remote: it fails, its gitdir stays
+      git -c protocol.file.allow=always submodule add -q "$_rt_url" etc/secrets
+      git rm -q --cached etc/secrets; git rm -q -f .gitmodules; rm -rf etc/secrets
+      cd .. && _rt_repo_file work s.txt && cd work && git push -q "$_rt_url" HEAD:refs/heads/main \
+        && git -C "$_rt_url" symbolic-ref HEAD refs/heads/main
+      cd ../global && git clone -q "$_rt_url" etc/secrets ) >/dev/null 2>&1
+    cd global || return 1
+    # the premise: a gitdir of this repo whose HEAD resolves to nothing
+    [ -f .git/modules/etc/secrets/config ] \
+      || { _rt_fail "no leftover gitdir -- the test proves nothing"; return 1; }
+    if git --git-dir=.git/modules/etc/secrets rev-parse -q --verify HEAD >/dev/null; then
+      _rt_fail "the leftover gitdir has a HEAD -- the test proves nothing"; return 1
+    fi
+    _rt_ok "sm go etc/secrets" _rt_my_git sm go etc/secrets || return 1
+    grep -q 'path = etc/secrets' .gitmodules 2>/dev/null \
+      || { _rt_fail "etc/secrets was not registered: the unborn HEAD of the leftover gitdir blocked it"; return 1; }
+    _rt_contains "it says what it did to the gitdir" "$_rt_out" "fetched" || return 1
+    _rt_exists "the remote's content is checked out" etc/secrets/s.txt || return 1
     return 0
   }
 
@@ -27691,7 +27750,7 @@ _RT_GUARD_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
