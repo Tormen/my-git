@@ -870,7 +870,8 @@ design.
 | unregistered with url, path already tracked in index (embedded)              | `UNTRACK` (`git ls-files -z` piped into `git update-index -z --force-remove --stdin`) + `git submodule add` | same |
 | url looks suspicious (unusual scheme)                                        | add anyway (warn only, counted)                   | extra `[U]se / [E]dit / [S]kip / [I]gnore perm / [A]bort` prompt first |
 | path matches a `.gitignore` pattern (pre-checked with `git check-ignore`)    | silent skip — `.gitignore` IS the marker (no `add` run) | prompt `[N]egate / [F]orce / [S]kip / [A]bort` — `[N]` appends `!<rel>/` to the matching `.gitignore`, then adds |
-| stale `.git/modules/<name>/` from an interrupted prior run                   | **ERROR** + skip                                  | same; `--force` reuses the stale gitdir and adds     |
+| leftover `.git/modules/<name>/` whose origin **is** the url being added       | reuse it (`--force`), saying so — the same repo, left by an earlier attempt | same (no prompt) |
+| stale `.git/modules/<name>/` of a **different** repo                         | **ERROR** + skip                                  | `[R]euse --force / [D]elete / [S]kip / [I]gnore perm / [A]bort` |
 | `git submodule add` fails for an unclassified reason (unreachable host, repo not found, auth failure, timeout) | skip **this item only**, continue with the rest of the plan | `[R]etry new URL / [S]kip / [I]gnore perm / [A]bort` |
 
 The last row matters more than it looks: a single bad/unreachable remote
