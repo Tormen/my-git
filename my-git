@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="3d3ecd6"
+SCRIPT_COMMIT="3e6cc3d"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-42-g3d3ecd6"
+SCRIPT_RELEASE="v2.0-43-g3e6cc3d"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -143,7 +143,7 @@ exec 3>&2
 # ─── Runtime flags ───────────────────────────────────────────────────────
 VRB=0; VERYVRB=0; DBG=0; DEEPDBG=0
 CONFIG_FILE=""
-CONFIG_SEARCH_ORDER="/LINKS/default/my-git.conf $HOME/.my-git.conf /etc/my-git.conf /usr/local/etc/my-git.conf"
+SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
 DRY_RUN=0
 INTERACTIVE=0
 RECURSIVE=0
@@ -743,11 +743,66 @@ git_ssh_setup() {
   export GIT_SSH_COMMAND MYGIT_OWN_GIT_SSH
 }
 
+# read_site -- the site's values for every tool, from SITE_CONF, the one site
+# path this tool knows, read before its own config: where a config is searched
+# and where one is offered. The neutral values first, so an exported variable
+# never takes their place; then the file, plain KEY="value" lines, when it is
+# there. my-git keeps no state or logs, so it uses DATA_BASE_DIR and
+# LOG_BASE_DIR for nothing.
+read_site() {
+  DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+  CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+  [ -e "$SITE_CONF" ] || return 0
+  # there but unreadable: an error, never the neutral values -- this user
+  # would silently read another config than everyone else
+  [ -r "$SITE_CONF" ] || fatal "cannot read '$SITE_CONF' -- the site's values for every tool; its group must include $ME"
+  # shellcheck disable=SC1090  # the site file's path is a variable (the tests point it elsewhere)
+  . "$SITE_CONF" || fatal "'$SITE_CONF' failed to load"
+}
+
+# config_search_paths -- one path per line, first existing wins: the site's
+# search directory (both spellings, .conf first), then ~, /etc, /usr/local/etc.
+config_search_paths() {
+  [ -z "$CONFIG_SEARCH_DIR" ] || printf '%s\n' "$CONFIG_SEARCH_DIR/my-git.conf" "$CONFIG_SEARCH_DIR/my-git"
+  printf '%s\n' "$HOME/.my-git.conf" /etc/my-git.conf /usr/local/etc/my-git.conf
+}
+
+# config_offer_paths -- where "no config found" offers to write one, most
+# common place first, each a path the search reads: the site's offer
+# directory -- only where the site's search directory is searched, which a
+# file there reaches as CONFIG_OFFER_NOTE says; never the search directory
+# itself, a generated farm -- then /etc, then ~.
+config_offer_paths() {
+  if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then printf '%s\n' "$CONFIG_OFFER_DIR/my-git.conf"; fi
+  for _cop in /etc/my-git.conf "$HOME/.my-git.conf"; do
+    config_search_paths | grep -qxF -e "$_cop" && printf '%s\n' "$_cop"
+  done
+  return 0
+}
+
+# no_config_offer -- "no config found": each offered place a paste-ready
+# line, the site's note beside its own place.
+no_config_offer() {
+  printf '!!! no config found -- write one, most common place first:\n'
+  while IFS= read -r _nco; do
+    [ -n "$_nco" ] || continue
+    if [ "$_nco" = "$CONFIG_OFFER_DIR/my-git.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+      printf '    > %s --create-config > %s   (%s)\n' "$US" "$_nco" "$CONFIG_OFFER_NOTE"
+    else
+      printf '    > %s --create-config > %s\n' "$US" "$_nco"
+    fi
+  done <<_NCO_EOF
+$(config_offer_paths)
+_NCO_EOF
+  printf '    (%s --help config: the full search order)\n' "$US"
+}
+
 load_config() {
   # $MY_GIT_CONFIG first, then --config, then the search order -- the order
   # '--help config' and the README state. The variable outranks the flag so
   # that a test harness or a CI job can redirect EVERY my-git a script runs,
   # including the ones whose command line it does not write.
+  read_site
   _cf=""
   if [ -n "${MY_GIT_CONFIG:-}" ]; then
     [ -f "$MY_GIT_CONFIG" ] || fatal "\$MY_GIT_CONFIG: no such file: $MY_GIT_CONFIG"
@@ -756,18 +811,14 @@ load_config() {
     [ -f "$CONFIG_FILE" ] || fatal "--config: no such file: $CONFIG_FILE"
     _cf=$CONFIG_FILE
   else
-    for _c in $CONFIG_SEARCH_ORDER; do
+    while IFS= read -r _c; do
       if [ -f "$_c" ]; then _cf=$_c; break; fi
-    done
+    done <<_LC_EOF
+$(config_search_paths)
+_LC_EOF
   fi
   if [ -z "$_cf" ]; then
-    log_major "no config file found"
-    printf '  >> searched (in order):\n'
-    for _c in $CONFIG_SEARCH_ORDER; do
-      printf '    > %s\n' "$_c"
-    done
-    printf '  >> run:  my-git --create-config\n'
-    printf '  >> or:   my-git --config /path/to/your.conf <subcommand>\n'
+    no_config_offer >&2
     exit 2
   fi
   log_dbg_med "config: $_cf"
@@ -14972,10 +15023,13 @@ my-git configuration
 Search order (first existing wins):
   1.  \$MY_GIT_CONFIG env var, if set
   2.  --config <FILE>
-  3.  /LINKS/default/my-git.conf
+  3.  \$CONFIG_SEARCH_DIR/my-git.conf, then \$CONFIG_SEARCH_DIR/my-git
   4.  ~/.my-git.conf
   5.  /etc/my-git.conf
   6.  /usr/local/etc/my-git.conf
+$SITE_CONF, when there, is read first: the site's
+CONFIG_SEARCH_DIR (without the file, step 3 is skipped). There but
+unreadable: an error.
 
 Commands:
   $US --create-config            Print default config to stdout
@@ -15074,9 +15128,9 @@ values come from the user's config):
                               in 'sm' (default 30). Applied via GIT_SSH_COMMAND
                               unless the user already set that env var.
 
-Missing config file triggers guidance + exit 2 on any subcommand.
-To see shipped defaults: run 'my-git --create-config' (writes to first
-writable location; shows path) or inspect '_default_config_content' in my-git.
+No config found: any subcommand offers where to write one, most common
+place first (the site's CONFIG_OFFER_DIR, then /etc, then ~), and exits 2.
+To see the shipped defaults: '$US --create-config' prints them.
 EOF
 }
 
@@ -18993,6 +19047,71 @@ _RT_CONF_EOF
     }
     _rt_contains "it refuses, naming the variable" "$PWD/env.err" 'MY_GIT_CONFIG' || return 1
     _rt_ok "the variable outranks the flag" true || return 1
+    return 0
+  }
+
+  test_site_conf_gives_the_search_and_the_offer() {
+    # The site file: its values when it is there, the neutral ones when it is
+    # not -- an exported variable never in their place -- an error when it is
+    # there but unreadable. The search reads its directory first, .conf before
+    # the bare name; the offer names its offer directory with the note, never
+    # the search directory (a generated farm).
+    SITE_CONF="$PWD/site.conf"
+    _ts_o=$( (CONFIG_SEARCH_DIR="$PWD/farm"; export CONFIG_SEARCH_DIR; read_site
+              printf '%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR") 2>&1)
+    [ "$_ts_o" = "/var/db|/var/log|" ] || { _rt_fail "without the file: '$_ts_o'"; return 1; }
+    mkdir "$PWD/farm"
+    printf '%s\n' 'DATA_BASE_DIR="/srv/data"' "CONFIG_SEARCH_DIR=\"$PWD/farm\"" \
+      "CONFIG_OFFER_DIR=\"$PWD/global\"" 'CONFIG_OFFER_NOTE="linked there by a run"' > "$SITE_CONF"
+    printf 'GIT_REPOS="bare"\n' > "$PWD/farm/my-git"
+    _ts_o=$( (CONFIG_FILE=""; unset MY_GIT_CONFIG; load_config
+              printf '%s|%s|%s' "$_cf" "$GIT_REPOS" "$DATA_BASE_DIR") 2>&1)
+    [ "$_ts_o" = "$PWD/farm/my-git|bare|/srv/data" ] || { _rt_fail "the bare name in the search directory: '$_ts_o'"; return 1; }
+    printf 'GIT_REPOS="dotconf"\n' > "$PWD/farm/my-git.conf"
+    _ts_o=$( (CONFIG_FILE=""; unset MY_GIT_CONFIG; load_config
+              printf '%s|%s' "$_cf" "$GIT_REPOS") 2>&1)
+    [ "$_ts_o" = "$PWD/farm/my-git.conf|dotconf" ] || { _rt_fail ".conf before the bare name: '$_ts_o'"; return 1; }
+    _ts_o=$( (read_site; no_config_offer) 2>&1)
+    case "$_ts_o" in *"--create-config > $PWD/farm/"*) _rt_fail "offered the farm: '$_ts_o'"; return 1 ;; esac
+    case "$_ts_o" in
+      *"    > $US --create-config > $PWD/global/my-git.conf   (linked there by a run)"*"/etc/my-git.conf"*"$HOME/.my-git.conf"*) ;;
+      *) _rt_fail "offer: '$_ts_o'"; return 1 ;;
+    esac
+    chmod 000 "$SITE_CONF"
+    _ts_o=$( (read_site) 2>&1); _ts_rc=$?
+    chmod 600 "$SITE_CONF"
+    case "$_ts_rc|$_ts_o" in
+      1"|"*"cannot read '$SITE_CONF'"*) ;;
+      *) _rt_fail "unreadable: rc $_ts_rc '$_ts_o'"; return 1 ;;
+    esac
+    return 0
+  }
+
+  test_config_offer_names_only_searched_paths() {
+    # Every offered path is searched, or is the site's offer directory while
+    # the site's search directory is searched; the search directory itself is
+    # never offered. "offer-only": an offer directory with no search directory
+    # -- a file written there would be read from nowhere, so it is not offered.
+    SITE_CONF="$PWD/site.conf"
+    printf '%s\n' "CONFIG_SEARCH_DIR=\"$PWD/farm\"" "CONFIG_OFFER_DIR=\"$PWD/global\"" > "$SITE_CONF"
+    _ts_bad=""
+    for _ts_with in site offer-only none; do
+      [ "$_ts_with" = offer-only ] && printf '%s\n' "CONFIG_OFFER_DIR=\"$PWD/global\"" > "$SITE_CONF"
+      [ "$_ts_with" = none ] && command rm -f "$SITE_CONF"
+      read_site
+      while IFS= read -r _ts_p; do
+        [ -n "$_ts_p" ] || continue
+        case "$_ts_p" in
+          "$PWD/farm/"*) _ts_bad="$_ts_bad $_ts_p(the farm)" ;;
+          "$PWD/global/my-git.conf") config_search_paths | grep -qxF -e "$PWD/farm/my-git.conf" || _ts_bad="$_ts_bad $_ts_p" ;;
+          *) config_search_paths | grep -qxF -e "$_ts_p" || _ts_bad="$_ts_bad $_ts_p" ;;
+        esac
+      done <<_TS_EOF
+$(config_offer_paths)
+_TS_EOF
+      [ "$_ts_with" != site ] || config_offer_paths | grep -qxF -e "$PWD/global/my-git.conf" || _ts_bad="$_ts_bad (site offer missing)"
+    done
+    [ -z "$_ts_bad" ] || { _rt_fail "offered but not searched:$_ts_bad"; return 1; }
     return 0
   }
 
@@ -27842,7 +27961,7 @@ _RT_GUARD_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty test_sm_keeps_a_second_gitdir_that_holds_commits_the_original_lacks test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_config_env_var_outranks_the_config_flag test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty test_sm_keeps_a_second_gitdir_that_holds_commits_the_original_lacks test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_config_env_var_outranks_the_config_flag test_site_conf_gives_the_search_and_the_offer test_config_offer_names_only_searched_paths test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git

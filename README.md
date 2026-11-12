@@ -270,14 +270,22 @@ Search order (first existing wins):
 
 1. `$MY_GIT_CONFIG` env var (escape hatch)
 2. `--config <FILE>` on the CLI
-3. `/LINKS/default/my-git.conf`
+3. `$CONFIG_SEARCH_DIR/my-git.conf`, then `$CONFIG_SEARCH_DIR/my-git`
 4. `~/.my-git.conf`
 5. `/etc/my-git.conf`
 6. `/usr/local/etc/my-git.conf`
 
-If none exist, `my-git` prints the search list and exits `2` with guidance
-to run `--create-config`. Help and `--create-config` always work without a
-config file.
+`CONFIG_SEARCH_DIR` comes from the site file `/LINKS/default/site.conf` --
+plain `KEY="value"` lines, read before the config when it exists -- and step 3
+is skipped without it. A site file that exists but cannot be read is an error.
+The site file may also set `CONFIG_OFFER_DIR` and `CONFIG_OFFER_NOTE`: where
+a missing config is offered, and the note beside it.
+
+If no config exists, `my-git` offers where to write one, most common place
+first -- `$CONFIG_OFFER_DIR/my-git.conf` (only while `CONFIG_SEARCH_DIR` is
+set), then `/etc/my-git.conf`, then `~/.my-git.conf` -- each as a paste-ready
+`my-git --create-config > <FILE>` line, and exits `2`. Help and
+`--create-config` always work without a config file.
 
 ### Variables (all optional; defaults shown)
 
