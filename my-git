@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="3e6cc3d"
+SCRIPT_COMMIT="be9b406"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-43-g3e6cc3d"
+SCRIPT_RELEASE="v2.0-44-gbe9b406"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -743,6 +743,22 @@ git_ssh_setup() {
   export GIT_SSH_COMMAND MYGIT_OWN_GIT_SSH
 }
 
+# sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+site_absent() {
+	_sa_p=$1
+	[ -e "$_sa_p" ] && return 1
+	[ -L "$_sa_p" ] && return 2
+	while :; do
+		_sa_d=$(dirname -- "$_sa_p")
+		[ "$_sa_d" = "$_sa_p" ] && return 0
+		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
+			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
+			return 2
+		fi
+		_sa_p=$_sa_d
+	done
+}
+
 # read_site -- the site's values for every tool, from SITE_CONF, the one site
 # path this tool knows, read before its own config: where a config is searched
 # and where one is offered. The neutral values first, so an exported variable
@@ -752,9 +768,15 @@ git_ssh_setup() {
 read_site() {
   DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
   CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
-  [ -e "$SITE_CONF" ] || return 0
-  # there but unreadable: an error, never the neutral values -- this user
-  # would silently read another config than everyone else
+  # there but unreadable, or cannot tell (a link to nothing, a folder on the
+  # way this user cannot search -- where [ -e ] says "no"): an error, never
+  # the neutral values -- this user would silently read another config than
+  # everyone else
+  site_absent "$SITE_CONF"
+  case $? in
+    0) return 0 ;;
+    2) fatal "cannot tell whether '$SITE_CONF' is there (a link to nothing, or a folder on the way it cannot search) -- the site's values for every tool; its group must include $ME" ;;
+  esac
   [ -r "$SITE_CONF" ] || fatal "cannot read '$SITE_CONF' -- the site's values for every tool; its group must include $ME"
   # shellcheck disable=SC1090  # the site file's path is a variable (the tests point it elsewhere)
   . "$SITE_CONF" || fatal "'$SITE_CONF' failed to load"
@@ -19087,6 +19109,29 @@ _RT_CONF_EOF
     return 0
   }
 
+  test_site_conf_there_but_unreadable_is_an_error() {
+    # The site file behind a folder this user cannot search, or a link to
+    # nothing: an error, never the neutral values -- [ -e ] answers "no"
+    # there. Absent: the neutral values.
+    mkdir "$PWD/locked"
+    printf '%s\n' 'DATA_BASE_DIR="/srv/data"' > "$PWD/locked/site.conf"
+    ln -s "$PWD/nowhere" "$PWD/link.conf"
+    chmod 000 "$PWD/locked"
+    _ts_bad=""
+    for _ts_w in "$PWD/locked/site.conf" "$PWD/link.conf"; do
+      _ts_o=$( (SITE_CONF=$_ts_w; read_site; printf '%s' "$DATA_BASE_DIR") 2>&1); _ts_rc=$?
+      case "$_ts_rc|$_ts_o" in
+        1"|"*"cannot tell whether '$_ts_w' is there"*) ;;
+        *) _ts_bad="$_ts_bad $_ts_w: rc $_ts_rc '$_ts_o';" ;;
+      esac
+    done
+    chmod 700 "$PWD/locked"
+    _ts_o=$( (SITE_CONF="$PWD/absent/site.conf"; read_site; printf '%s' "$DATA_BASE_DIR") 2>&1)
+    [ "$_ts_o" = /var/db ] || _ts_bad="$_ts_bad absent: '$_ts_o'"
+    [ -z "$_ts_bad" ] || { _rt_fail "cannot tell, not the error:$_ts_bad"; return 1; }
+    return 0
+  }
+
   test_config_offer_names_only_searched_paths() {
     # Every offered path is searched, or is the site's offer directory while
     # the site's search directory is searched; the search directory itself is
@@ -27961,7 +28006,7 @@ _RT_GUARD_EOF
     return 0
   }
 
-  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty test_sm_keeps_a_second_gitdir_that_holds_commits_the_original_lacks test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_config_env_var_outranks_the_config_flag test_site_conf_gives_the_search_and_the_offer test_config_offer_names_only_searched_paths test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
+  _rt_all_tests="test_st_comma_naming_pruning test_flatten_nested_submodule_both_visible test_flatten_realize_old_style_submodule test_flatten_realize_ambiguous_dual_git_refuses test_flatten_realize_gitfile_pointer_embedded test_flatten_partial_apply_graceful test_flatten_followup_run_completes test_flatten_same_path_orphan_embedded_overlap test_flatten_auto_convert_embedded test_flatten_auto_convert_submodules test_flatten_ignore_marker_respected test_sm_clean_stale_whole_tree test_sm_no_enclosing_cascade test_sm_bad_url_skip_not_abort test_sm_untrack_then_add test_sm_registers_a_gitlink_already_committed_in_head test_sm_reuses_a_gitdir_of_the_same_repo_an_earlier_run_left test_sm_reuses_a_gitdir_cloned_while_the_remote_was_empty test_sm_keeps_a_second_gitdir_that_holds_commits_the_original_lacks test_sm_refuses_a_gitdir_of_a_DIFFERENT_repo test_config_env_var_outranks_the_config_flag test_site_conf_gives_the_search_and_the_offer test_site_conf_there_but_unreadable_is_an_error test_config_offer_names_only_searched_paths test_sm_refuses_to_untrack_a_nested_repo_with_uncommitted_work test_sm_path_scoped_registers_only_target test_sm_path_registers_into_immediate_enclosing_repo test_sm_converts_published_sidecar_skips_local_only test_sm_operates_on_sidecared_parent test_sm_sidecared_submodule_not_flagged_stale test_sm_path_scope_suppresses_stale_sweep test_sm_kid_of_merged_src_registers_into_global test_flatten_subdir_invocation test_st_shows_realized_tag test_flatten_realize_order_deepest_first test_flatten_realize_parent_shields_untouched_children test_flatten_realize_child_after_parent_already_realized test_flatten_ignored_orphan_gitlink_left_untouched test_flatten_realize_genuinely_lost_history_not_a_bug test_flatten_plan_marks_dead_pointers_upfront test_st_diagnoses_dead_pointer_proactively test_flatten_ignores_gitignore_for_deliberate_targets test_flatten_never_tracks_git_real_internals test_flatten_sidecar_flag_path_scoped test_flatten_merge_flag_forces_registered_submodule test_flatten_path_scope_excludes_unrelated_ignore_marker test_flatten_path_scope_ignored_target_needs_force test_unflatten_sidecar_restores_live_git test_unflatten_sidecar_commits_tracked_gitreal_teardown test_unflatten_merge_reconstructs_history test_unflatten_analyze_names_the_path_and_mode_it_was_given test_unflatten_merge_keeps_a_shadow_marker_out_of_the_childs_history test_rehydrate_names_the_route_for_a_shadowed_repo_with_no_remote test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept test_push_carries_preserved_history_when_the_branch_is_up_to_date test_remote_go_gives_a_local_only_repo_its_private_remote test_unflatten_bulk_discovers_nothing_gracefully test_unflatten_bulk_discovers_both_sidecar_and_merged test_flatten_sidecar_status_file_fields test_verbose_trace_survives_stderr_redirect test_verbosity_axes_V_vs_VV_vs_D test_st_verbose_shows_origin_remote test_flatten_merge_writes_and_removes_gitignore test_st_shows_merged_tag test_st_shows_a_shadowed_repo_whose_git_is_missing test_st_foreign_scope_shows_sidecars_without_R test_flatten_merge_unflatten_merge_full_round_trip test_sidecar_is_ordinary_content_not_a_gitlink test_flatten_merge_deletes_and_snapshots_even_with_nothing_new_to_stage test_create_config_emits_renamed_sidecar_variables test_st_local_only_flag_on_sidecar test_rem_reads_sidecar_remote test_st_and_rem_accept_sidecar_path test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests test_sidecar_exclude_is_tracked_gitignore_and_persists_across_clone test_flatten_merge_direct_from_sidecar test_flatten_merge_stale_config_missing_sidecar_dirname_does_not_destroy_live_repo test_flatten_merge_transfers_sub_submodule_history test_sm_detects_and_repairs_a_registration_without_a_gitlink test_unshadow_refuses_to_deregister_a_submodule test_shadow_converts_a_gitlink_into_a_real_mirror test_pull_fast_forwards_a_worktree_with_unrelated_dirt test_pull_records_the_strategy_globally_but_never_overrides_one
   test_pull_merges_a_diverged_branch_instead_of_skipping_it
   test_pull_leaves_a_conflict_in_place_and_names_the_paths
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
