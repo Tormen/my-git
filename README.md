@@ -1615,12 +1615,13 @@ my-git --run-tests --titles F   # exactly the tests whose titles file F lists, o
 Each test is a function of its own at the top level (`test_...() {` down to
 its `}` at column 0), registered once in the run list, `_rt_list`. Its title
 is its name, except a test that reads the source only: its title starts
-`the suite:`. A commit of `sh/my-git` in `/LINKS/src` passes my-rollout's
-commit gate first (`my-rollout gate sh/my-git`), which runs only the tests
-the change needs, through `--list` and `--titles`: those whose function
-names a definition the change touched, those `my-git.tests.links` ties to
-one (each verb's `cmd_*` entry to the tests that run that verb), and the
-`the suite:` ones (py/my-rollout's README, "A tool adopts the commit gate").
+`the suite:`. `--list` and `--titles` are what my-rollout's commit gate
+needs to run only the tests a change needs: those whose function names a
+definition the change touched, those the tool's `<launcher>.tests.links`
+ties to one, and the `the suite:` ones (py/my-rollout's README, "A tool
+adopts the commit gate"). my-git has no links file yet, so its commits are
+not gated: the gate cannot yet test a project that has a repository of its
+own inside `/LINKS/src`.
 
 No separate group-definition table — test names follow
 `test_<area>_<specific-behavior>`, so a bare area name (`flatten`,
