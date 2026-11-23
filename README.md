@@ -1619,9 +1619,9 @@ is its name, except a test that reads the source only: its title starts
 needs to run only the tests a change needs: those whose function names a
 definition the change touched, those the tool's `<launcher>.tests.links`
 ties to one, and the `the suite:` ones (py/my-rollout's README, "A tool
-adopts the commit gate"). my-git has no links file yet, so its commits are
-not gated: the gate cannot yet test a project that has a repository of its
-own inside `/LINKS/src`.
+adopts the commit gate"). `my-git.tests.links` links each verb's `cmd_*`
+entry to the tests that run that verb, so a commit of `sh/my-git` in
+`/LINKS/src` passes `my-rollout gate sh/my-git` first.
 
 No separate group-definition table — test names follow
 `test_<area>_<specific-behavior>`, so a bare area name (`flatten`,
