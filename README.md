@@ -307,6 +307,7 @@ set), then `/etc/my-git.conf`, then `~/.my-git.conf` -- each as a paste-ready
 | `AUTOHEAL_PULL_CONFIG`                | `1`                                      | `st`/`pull` record `PULL_STRATEGY` in the repo owner's **global** gitconfig — only when it states nothing |
 | `AUTOHEAL_SUBMODULE_ON_ITS_BRANCH`    | `1`                                      | `st` puts a submodule a pull left DETACHED back on the branch `.gitmodules` names — only when that branch already contains the commit and the submodule is clean |
 | `MC_NEW_NESTED_REPO`                  | `warn`                                   | What `mc go` does with a nested repo whose relationship to its parent is unrecorded: `warn` / `shadow` / `ignore` |
+| `MY_ROLLOUT`                          | `my-rollout`                             | The my-rollout that gates a commit of a tool folder holding a `<launcher>.tests.links` -- see [Commits into a gated tree](#commits-into-a-gated-tree) |
 
 ## Quick start
 
@@ -694,6 +695,27 @@ separately:
 `git commit --only` guarantees the two buckets become two separate
 commits; user state is never dragged into the my-git-caused commit, and
 my-git-caused state is never dragged into the user commit.
+
+### Commits into a gated tree
+
+A tool folder holding a `<launcher>.tests.links` is gated: `/LINKS/src`'s
+pre-commit hook refuses a commit that changes its code (a `.md` and the
+links file never count) without a passing `my-rollout gate` of exactly those
+bytes. Every commit my-git makes -- `mc`, `commit`, `shadow`'s mirror,
+`flatten`, `unflatten`, `unshadow`, `sm`, `unsm`, `repair`, `stamp-version`
+-- runs `$MY_ROLLOUT gate <the paths it commits>` first, once per gated
+folder, as the repo's owner, and says so in one line:
+
+```
+ >>> /LINKS/src: commit gate: sh/my-git: ok (my-rollout gate, 1 path(s))
+ERROR: /LINKS/src: commit gate: sh/my-git: FAILED -- test_a; -- nothing of this repo committed; see: (cd /LINKS/src && my-rollout gate sh/my-git/my-git)
+```
+
+A failing gate stops that repo and commits nothing of it; no commit ever
+skips the hook (`--no-verify`). Without `MY_ROLLOUT` on this machine one line
+says so and the hook decides. A links file at a repository's root is a
+tool's own repository (sh/my-git's): its commits run no gate, the container
+that tracks the folder does.
 
 ### Interactive mode for `mc go`
 

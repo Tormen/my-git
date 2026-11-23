@@ -15,13 +15,13 @@ SCRIPT_VERSION=2.0
 # amend, which is unavoidable and is not a bug to "fix". Empty means the copy
 # you are running was never stamped. It is a literal on purpose: a deployed
 # copy needs neither git nor a repository to answer '--version'.
-SCRIPT_COMMIT="5b976c2"
+SCRIPT_COMMIT="a3e3e7a"
 # What git said about this build when it was stamped: 'git describe --tags
 # --long', i.e. <nearest tag>-<commits since it>-g<short sha>. It answers the
 # question SCRIPT_VERSION cannot -- whether these bytes ARE that release or
 # work on top of it -- and it answers it on a machine with no git and no
 # repository, which is the whole point of a literal.
-SCRIPT_RELEASE="v2.0-46-g5b976c2"
+SCRIPT_RELEASE="v2.0-50-ga3e3e7a"
 
 # _sv_blank_stamp  (a copy of this file on stdin)
 #   Blank the two stamped lines, so two copies can be compared for "has
@@ -649,6 +649,14 @@ SM_SSH_CONNECT_TIMEOUT=30
 # yet. A host that does not answer must fail, not hang.
 SETUP_SSH_CONNECT_TIMEOUT=15
 
+# ─── Commit gate ────────────────────────────────────────────────────────
+# The my-rollout that gates a commit my-git makes into a repo whose tool
+# folders carry a <launcher>.tests.links (/LINKS/src: its pre-commit hook
+# refuses a commit of such a folder's code without a passing 'my-rollout
+# gate' of those bytes). my-git runs '$MY_ROLLOUT gate <paths>' first and
+# commits only on a pass. Not found: said, and the commit is left to the hook.
+MY_ROLLOUT=my-rollout
+
 # ─── Self-test ──────────────────────────────────────────────────────────
 # How many tests '--run-tests' runs at a time. 0 = one per CPU, which is
 # what the suite is built for: every test works in its own case directory
@@ -858,6 +866,7 @@ _LC_EOF
   # Back-compat defaults for vars newer than a user's existing config file.
   # New knobs: keep them conservative so upgrades don't surprise users.
   : "${MC_AUTO_COMMIT_UNTRACKED:=1}"
+  : "${MY_ROLLOUT:=my-rollout}"
   : "${ST_EXCLUDE_DIRS:=.cache node_modules .npm .venv .tox __pycache__ .cargo .gradle .m2 .yarn Library .Trash}"
   # GIT_SIDECAR_DIRNAME: was GIT_REAL_DIRNAME before this variable was
   # renamed. A config file written before that rename (or missing the
@@ -1719,6 +1728,7 @@ ensure_sidecar_exclude() {
   ( cd "$_ese_repo" || exit 0
     printf '**/%s\n' "$_ese_grd" >> .gitignore
     run_echoed git add -f -- .gitignore >/dev/null 2>&1
+    _commit_gate "$_ese_repo" .gitignore || exit 0
     run_echoed git commit -q -m "my-git: track **/$_ese_grd exclusion in .gitignore" -- .gitignore >/dev/null 2>&1
   )
 }
@@ -4507,6 +4517,8 @@ _mc_auto_commit_my_git_changes() {
   # Commit ONLY these paths; --only ignores any other staged changes
   # (which would be user-dirt that the user may later want to prompt on).
   # shellcheck disable=SC2086
+  _commit_gate "$_ac_r" $_ac_all || return 1
+  # shellcheck disable=SC2086
   if ! run_as_owner "$_ac_r" git commit --only -m "$_ac_cm" -- $_ac_all >/dev/null 2>&1; then
     log_error "$_ac_r: auto-commit failed"
     return 1
@@ -4833,6 +4845,55 @@ _mc_marked_files() {
     grep -q -e '^>>>>>>> ' -- "$_mm_r/$_mm_p" 2>/dev/null || continue
     printf '%s\n' "$_mm_p"
   done
+}
+
+# _commit_gate REPO [-a | PATH...]
+#   Before my-git commits into REPO: for each gated tool folder the commit
+#   changes -- a sub-folder whose <launcher>.tests.links REPO tracks; a .md
+#   and the links file never count -- run '$MY_ROLLOUT gate <its paths>' as the
+#   repo's owner, so REPO's pre-commit hook (/LINKS/src's) finds a pass for
+#   exactly those bytes. PATH...: what 'git commit -- PATH...' takes; -a:
+#   what 'commit -a' takes; none: the index. One line per gated folder: ok,
+#   or FAILED naming the failing tests and the command -- then it returns 1
+#   and the caller commits nothing of REPO. MY_ROLLOUT not found: said, 0,
+#   and the hook decides. Never a way past the hook: that stays its call.
+#   A links file at REPO's root is a tool's OWN repository (sh/my-git's):
+#   the gate's hook lives in the container that tracks the folder, not there.
+_commit_gate() {
+  _cg_r=$1; shift
+  _cg_links=$(run_as_owner_capture "$_cg_r" git ls-files -- ':(glob)*/**/*.tests.links' 2>/dev/null)
+  [ -n "$_cg_links" ] || return 0
+  case "${1:-}" in
+    -a) _cg_chg=$(run_as_owner_capture "$_cg_r" git diff --no-renames --name-only HEAD 2>/dev/null) ;;
+    '') _cg_chg=$(run_as_owner_capture "$_cg_r" git diff --no-renames --name-only --cached HEAD 2>/dev/null) ;;
+    *)  _cg_chg=$(run_as_owner_capture "$_cg_r" git diff --no-renames --name-only HEAD -- "$@" 2>/dev/null) ;;
+  esac
+  [ -n "$_cg_chg" ] || return 0
+  _cg_rc=0
+  for _cg_l in $_cg_links; do
+    _cg_f=${_cg_l%/*}
+    _cg_paths=$(printf '%s\n' "$_cg_chg" | awk -v f="$_cg_f" -v l="$_cg_l" '
+      $0 == l || /\.md$/ { next }
+      index($0, f "/") == 1 { printf "%s ", $0 }')
+    _cg_paths=${_cg_paths% }
+    [ -n "$_cg_paths" ] || continue
+    _cg_cmd=$(command -v "$MY_ROLLOUT" 2>/dev/null)
+    if [ -z "$_cg_cmd" ]; then
+      log_warn "$_cg_r: commit gate: $_cg_f: $MY_ROLLOUT not found -- the commit is left to the pre-commit hook"
+      continue
+    fi
+    _cg_out=$(mktemp_shared commitgate) || { log_error "$_cg_r: commit gate: $_cg_f: mktemp failed -- nothing committed"; return 1; }
+    # shellcheck disable=SC2086  # one word per path: tool paths hold no blanks
+    if run_as_owner "$_cg_r" "$_cg_cmd" gate $_cg_paths > "$_cg_out" 2>&1; then
+      log_major "$_cg_r: commit gate: $_cg_f: ok ($MY_ROLLOUT gate, $(printf '%s\n' $_cg_paths | wc -l | tr -d ' ') path(s))"
+    else
+      _cg_fail=$(sed -n 's/^not ok [0-9]* - //p' "$_cg_out" | sed -n '1,3p' | tr '\n' ';')
+      log_error "$_cg_r: commit gate: $_cg_f: FAILED -- ${_cg_fail:-$(tail -n 1 "$_cg_out")} -- nothing of this repo committed; see: (cd $_cg_r && $MY_ROLLOUT gate $_cg_paths)"
+      _cg_rc=1
+    fi
+    rm -f "$_cg_out"
+  done
+  return "$_cg_rc"
 }
 
 commit_one() {
@@ -5204,6 +5265,7 @@ _MC_EOF
     fi
   fi
 
+  _commit_gate "$_r" -a || { rm -f "$_msgfile"; MC_N_ERROR=$((MC_N_ERROR + 1)); return 1; }
   # -F: literal message from file (no editor). -a: also include modified tracked files.
   run_as_owner "$_r" git commit -q -a -F "$_msgfile" || {
     log_error "$_r: git commit failed"
@@ -8398,7 +8460,8 @@ _FL_EMB_REALIZE_EOF
       log_major "$_fl_top: $_fl_scope_path merged (nothing left to commit — it was already fully tracked as a sidecar)"
       exit 0
     fi
-    if ! run_echoed git commit -q -m "my-git flatten --merge: $_fl_scope_path converted directly from sidecar (.git.merged written)" -- "$_fl_scope_path"; then
+    if ! _commit_gate "$_fl_top" "$_fl_scope_path" \
+       || ! run_echoed git commit -q -m "my-git flatten --merge: $_fl_scope_path converted directly from sidecar (.git.merged written)" -- "$_fl_scope_path"; then
       _fl_unshield_dir "$_fms_shield_manifest"; runq rm -rf "$_fms_shield_save"
       fatal "flatten: commit for merged sidecar $_fl_scope_path failed" 1
     fi
@@ -9280,7 +9343,7 @@ _FL_EOF
     _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
     _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
     # shellcheck disable=SC2086
-    if run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
+    if _commit_gate "$_fl_top" && run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
       rm -f "$_fl_commit_log" "$_fl_msgfile"
       rm -rf "$_fl_save_root"
       trap - INT TERM HUP
@@ -9389,7 +9452,7 @@ _FL_EOF
   _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
   _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
   # shellcheck disable=SC2086
-  if ! run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
+  if ! _commit_gate "$_fl_top" || ! run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
     log_error "flatten commit failed:"
     cat "$_fl_commit_log" >&2
     rm -f "$_fl_commit_log" "$_fl_msgfile"
@@ -9979,7 +10042,8 @@ cmd_unflatten() {
     _ufl_cmsg_sub="my-git unflatten: restored $_ufl_n_ok nested repo(s) to a live .git"
     [ "$_ufl_n_fail" -gt 0 ] && _ufl_cmsg_sub="$_ufl_cmsg_sub ($_ufl_n_fail failed)"
     _ufl_cmsg_body="Restored each nested repo to a live .git (renamed $GIT_SIDECAR_DIRNAME -> .git, reconstructed merged path(s), and/or unzipped .git.zip archive(s)), then dropped the parent's now-obsolete tracking of the sidecar snapshot(s), the .status marker(s), the .git.merged snapshot(s), and the .git.zip archive(s). Nested repo history is intact in the restored live .git. Committed by my-git so unflatten leaves the parent clean, mirroring how flatten/gz commit their own artifacts."
-    eval "run_echoed git commit -q -m \"\$_ufl_cmsg_sub\" -m \"\$_ufl_cmsg_body\" -- $_ufl_commit_paths" >/dev/null 2>&1 || \
+    { eval "_commit_gate \"\$PWD\" $_ufl_commit_paths" \
+      && eval "run_echoed git commit -q -m \"\$_ufl_cmsg_sub\" -m \"\$_ufl_cmsg_body\" -- $_ufl_commit_paths" >/dev/null 2>&1; } || \
       log_warn "unflatten: self-contained teardown commit failed — the removed $GIT_SIDECAR_DIRNAME/.status/.git.merged entries are left STAGED for manual commit"
   fi
 
@@ -10977,7 +11041,9 @@ cmd_shadow() {
     # its marker rewrite (which would otherwise leave the index dirty, since
     # this commit uses a pathspec).
     _sh_cerr=$(mktemp_shared shcommit) || _sh_cerr=""
-    if ! eval "run_as_owner \"\$_sh_top\" env MY_GIT_SHADOW_SELF_COMMIT=1 git commit -q -m \"my-git shadow: content-mirror into the parent (live .git kept)\" -- $_sh_commit" \
+    if ! eval "_commit_gate \"\$_sh_top\" $_sh_commit"; then
+      log_warn "shadow: not committed -- the commit gate failed (above); staged content left for a commit once it passes"
+    elif ! eval "run_as_owner \"\$_sh_top\" env MY_GIT_SHADOW_SELF_COMMIT=1 git commit -q -m \"my-git shadow: content-mirror into the parent (live .git kept)\" -- $_sh_commit" \
            >/dev/null 2>"${_sh_cerr:-/dev/null}"; then
       log_warn "shadow: commit failed — staged content left for manual commit"
       # git's own reason, not swallowed. This warning used to arrive with
@@ -11179,7 +11245,7 @@ cmd_unshadow() {
       : # only stale markers were cleaned -- nothing was staged, nothing to commit
     elif [ -n "$_ush_pre_staged" ]; then
       log_warn "unshadow: your index already had staged changes before this ran — NOT committing the removal automatically (it would sweep them in). Commit/reset your index, the removal is staged and ready."
-    elif run_echoed git commit -q -m "my-git unshadow: stop mirroring into the parent (live .git kept)" >/dev/null 2>&1; then
+    elif _commit_gate "$PWD" && run_echoed git commit -q -m "my-git unshadow: stop mirroring into the parent (live .git kept)" >/dev/null 2>&1; then
       :
     else
       log_warn "unshadow: commit failed — staged removal left for manual commit"
@@ -12023,6 +12089,7 @@ cmd_stamp_version() {
     || { rm -f "$_sv_tmp"; fatal "stamp-version: could not move the stamped file into place" 1; }
   run_echoed git -c safe.directory='*' -C "$_sv_top" add -- "$_sv_rel" \
     || fatal "stamp-version: could not stage $_sv_rel" 1
+  _commit_gate "$_sv_top" "$_sv_rel" || fatal "stamp-version: the commit gate failed (above) -- not amended" 1
   run_echoed git -c safe.directory='*' -C "$_sv_top" commit -q --amend --no-edit \
     || fatal "stamp-version: could not amend the release commit" 1
   _sv_new=$(git -c safe.directory='*' -C "$_sv_top" rev-parse --short HEAD 2>/dev/null)
@@ -13314,7 +13381,7 @@ _do_sidecar_audit() {
             done
             # plain commit: index holds ONLY our staged removals (verified
             # clean above), so nothing unrelated can ride along.
-            run_echoed git commit -q -m "my-git repair: stop tracking sidecar internals as content" >/dev/null 2>&1 || true )
+            _commit_gate "$PWD" && run_echoed git commit -q -m "my-git repair: stop tracking sidecar internals as content" >/dev/null 2>&1 || true )
           log_major "  fixed: untracked $_sa_bd sidecar object-DB dir(s) from the parent index (committed; files kept on disk)"
         fi
       else
@@ -13378,7 +13445,7 @@ _do_sidecar_audit() {
         if [ "$_sa_apply" = 1 ]; then
           ( cd "$_sa_top" 2>/dev/null || exit 0
             run_echoed git add -- "$_sc" >/dev/null 2>&1
-            run_echoed git commit -q -m "my-git repair: track sidecar content in the parent" -- "$_sc" >/dev/null 2>&1 || true )
+            _commit_gate "$PWD" "$_sc" && run_echoed git commit -q -m "my-git repair: track sidecar content in the parent" -- "$_sc" >/dev/null 2>&1 || true )
           log_major "  fixed: $_sc: staged+committed $_sa_untracked_n untracked sidecar file(s)$_sa_status_note"
         else
           log_major "  ISSUE: $_sc: $_sa_untracked_n file(s) under it NOT tracked by the parent$_sa_status_note — sidecar content not fully captured (repair 'git add's them)"
@@ -15158,6 +15225,10 @@ values come from the user's config):
   SM_SSH_CONNECT_TIMEOUT      SSH ConnectTimeout (seconds) for clone/fetch
                               in 'sm' (default 30). Applied via GIT_SSH_COMMAND
                               unless the user already set that env var.
+  MY_ROLLOUT                  The my-rollout that gates a commit of a tool
+                              folder holding a <launcher>.tests.links: my-git
+                              runs '$MY_ROLLOUT gate <paths>' before it and
+                              commits only on a pass (default my-rollout).
 
 No config found: any subcommand offers where to write one, most common
 place first (the site's CONFIG_OFFER_DIR, then /etc, then ~), and exits 2.
@@ -16131,7 +16202,7 @@ _sm_autocommit_if_safe() {
   _files=$(printf '%s\n' "$_porc" | awk '{print substr($0,4)}' | sort -u)
   _msg=$(printf '%s\n' "$_files" | paste -sd, - | sed 's/,/, /g')
   printf '    auto-commit (tracked-file mods only): %s\n' "$_msg"
-  _sm_safe_git "$_ac_sp" -C "$_ac_sp" commit -a -q -m "$_msg" >/dev/null 2>&1 || {
+  { _commit_gate "$_ac_sp" -a && _sm_safe_git "$_ac_sp" -C "$_ac_sp" commit -a -q -m "$_msg" >/dev/null 2>&1; } || {
     printf '    auto-commit failed — falling back to warn\n' >&2
     return 2
   }
@@ -16505,7 +16576,7 @@ _unsm_flush_parent() {
   if [ -n "$_un_cur_pre" ]; then
     log_warn "unsm: $_un_cur had pre-existing staged changes — de-registration left STAGED (commit it yourself so nothing unrelated is swept in)"
   else
-    ( cd "$_un_cur" && run_echoed git commit -q -m "my-git unsm: de-registered submodule(s) -> raw-nested-git (dropped .gitmodules + gitlink, de-absorbed .git)" >/dev/null 2>&1 ) \
+    ( cd "$_un_cur" && _commit_gate "$_un_cur" && run_echoed git commit -q -m "my-git unsm: de-registered submodule(s) -> raw-nested-git (dropped .gitmodules + gitlink, de-absorbed .git)" >/dev/null 2>&1 ) \
       || log_warn "unsm: commit in $_un_cur failed — de-registration left staged"
   fi
   _un_cur=""; _un_cur_changed=0
@@ -16860,7 +16931,7 @@ _CS_EOF
       if git diff --cached --quiet 2>/dev/null; then
         printf '    nothing to commit in %s (no net diff vs HEAD)\n' "$(pwd -P)" >&2
       else
-        run_echoed git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)" || \
+        { _commit_gate "$PWD" && run_echoed git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)"; } || \
           { log_error "commit failed in $(pwd -P)"; echo 0; return 1; }
         printf '    committed in %s\n' "$(pwd -P)" >&2
       fi
@@ -18437,7 +18508,7 @@ _CS_EOF
             printf '#   %s\n' "$_p"
           done
         } > "$_cmmsg"
-        if git commit --only -F "$_cmmsg" -- "$@" >"$_cmlog" 2>&1; then
+        if _commit_gate "$PWD" "$@" && git commit --only -F "$_cmmsg" -- "$@" >"$_cmlog" 2>&1; then
           _sha=$(git rev-parse --short HEAD 2>/dev/null)
           printf '\n >>> sm: committed my-git''s changes only (%s)\n' "$_sha"
           printf '  >> %s\n' "$_cm_subject"
@@ -18723,12 +18794,18 @@ _rt_list() {
   test_pull_reports_a_blocked_merge_without_the_wall_of_git
   test_git_repos_roots_that_nest_are_walked_once test_st_states_the_strategy_like_pull_does test_autoheal_shadow_excludes_knob_disables_it test_sync_warns_when_a_tracked_gitignore_negates_the_exclude test_st_reheals_nested_shadow_excludes_and_keeps_user_lines test_shadow_hides_a_nested_repo_from_its_enclosing_repo test_shadow_hook_refreshes_the_remote_the_marker_records test_st_warns_when_a_marker_records_a_stale_remote test_shadow_hook_leaves_a_spelling_only_remote_difference_alone test_marker_remote_drift_ignores_spelling_and_names_both_sides test_rehydrate_gives_a_fresh_clone_back_its_project_repos test_rehydrate_leaves_the_restored_repo_clean_not_holding_its_own_marker test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes test_pathspec_commit_leaves_no_stale_marker_staged test_st_says_when_the_commit_is_simply_not_fetched_yet test_st_realigns_a_shadowed_head_left_behind test_st_does_not_realign_a_repo_nobody_shadows test_st_heals_a_stale_index_entry_on_my_gits_own_marker test_st_never_heals_a_marker_that_really_changed test_st_heals_the_marker_even_when_other_files_are_edited test_st_never_heals_someone_elses_staged_work test_st_writes_no_tracked_file_while_self_healing test_st_says_index_stale_not_a_checkout_lagging_zero test_st_says_what_to_type_next test_stamp_version_restamps_a_new_release test_pull_analyze_fetches_so_behind_is_not_stale test_pull_reports_a_fetch_that_failed test_pull_realigns_a_shadowed_child_instead_of_blocking test_pull_leaves_a_real_local_edit_alone test_version_identifies_the_exact_bytes test_version_says_whether_these_bytes_are_the_release test_version_ignores_a_foreign_repos_tags test_version_answers_live_in_every_clone_of_its_own_repo test_stamp_version_never_amends_someone_elses_commit test_stamp_version_refuses_to_widen_someone_elses_commit test_rehydrate_matches_a_commit_that_tracks_an_ignored_file test_container_commit_refuses_what_the_child_has_not_committed test_shadow_hook_stamps_the_commit_the_mirror_was_taken_from test_shadow_hook_stamps_a_pathspec_commit_too test_rehydrate_places_a_repo_from_the_commit_the_marker_records test_rehydrate_excludes_the_containers_force_add_veto test_rehydrate_names_a_repo_it_cannot_place test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit test_rehydrate_puts_a_repo_back_on_the_branch_and_remote_the_marker_records test_rehydrate_repairs_EVERY_misplaced_repo_not_just_the_first test_st_reheals_a_shadowed_repos_own_marker_exclusion test_pull_and_mc_walk_the_whole_tree_not_just_submodules test_pull_acts_on_the_repo_you_are_in_and_R_walks_below test_push_acts_on_the_repo_you_are_in_and_R_walks_below test_pp_and_sync_take_the_same_scope test_a_hint_for_a_nested_repo_says_where_to_run_it test_mc_refuses_an_unfinished_merge test_mc_refuses_a_file_that_still_carries_conflict_markers test_mc_refuses_to_commit_what_the_mirror_delivered test_mc_names_the_commits_it_pushes test_mc_says_pull_first_instead_of_committing_into_a_rejected_push test_push_reports_what_is_ahead_and_refuses_to_invent_an_upstream test_pp_does_both_halves_across_the_tree test_push_leaves_foreign_remotes_alone_but_never_on_a_blank_config test_push_adopts_an_existing_remote_branch_but_never_creates_one test_push_heals_forced_refspecs_and_refuses_a_foreign_plus test_push_preserved_refs_never_overwrites_a_pin test_st_warns_when_your_github_remote_is_https test_paths_print_as_the_name_you_typed_not_the_resolved_one test_diff_writes_both_sides_with_names_that_say_which_is_which test_diff_handles_a_side_that_does_not_exist test_st_says_old_checkout_not_dirty_when_nothing_was_edited test_container_carries_the_local_files_a_child_hides test_mc_carries_a_local_file_created_after_the_shadow test_force_add_patterns_do_not_match_lookalike_names test_force_add_negation_beats_a_matching_glob test_a_container_without_the_patterns_file_carries_nothing_extra test_force_add_reports_under_analyze_and_stages_nothing test_st_rows_stay_short_and_status_files_carry_the_detail test_clean_stale_catches_an_entry_inside_another_submodule test_st_inside_a_shadowed_repo_names_its_mirror test_plan_says_forced_mode_converts_registered_submodules test_unflatten_merge_restores_the_remote_too test_merge_refuses_a_shallow_clone_instead_of_losing_it test_merge_refuses_when_no_refs_were_pinned test_no_user_facing_text_claims_merge_loses_history test_the_tap_stream_numbers_every_test_once test_remote_go_makes_the_bare_repo_when_it_is_not_there test_remote_go_says_which_account_owns_the_bare_it_made test_a_bare_remote_go_made_can_be_cloned test_remote_go_leaves_an_existing_bare_repo_alone test_remote_go_sets_nothing_when_the_far_side_cannot_be_made test_remote_go_never_removes_an_origin_it_did_not_add test_a_repo_my_git_sets_up_gets_the_mode_asked_for test_what_my_git_creates_belongs_to_the_tree_it_is_in test_a_gitlink_is_not_a_content_mirror test_unshadow_cleans_a_stale_marker_instead_of_failing test_unshadow_undoes_a_shadowed_path_whose_repo_is_gone test_banner_names_the_status_file_and_its_location test_purge_analyze_is_read_only_and_names_the_repo test_purge_refuses_when_content_survives_nowhere test_purge_requires_from_when_two_repos_qualify test_purge_go_rewrites_history_behind_the_gate test_purge_aborts_on_anything_but_the_exact_phrase test_shadow_marker_records_only_machine_independent_fields test_st_flags_shadow_marker_whose_mirror_is_gone test_st_measures_the_rows_that_have_no_repo_of_their_own test_st_names_dirty_and_out_of_step_together test_st_colours_the_state_by_what_it_asks_of_you test_st_hides_an_ignored_repo_unless_V test_st_V_is_the_default_tree_with_more_on_it test_st_does_not_claim_preserved_history_that_is_not_there test_target_repo_banner_names_the_receiving_repo test_st_live_git_beats_stale_git_merged_marker test_flatten_merge_preserves_history_in_parent test_unflatten_merge_restores_full_preserved_history test_flatten_merge_never_deletes_when_preserve_fails test_flatten_trash_history_flag_points_at_rm_git test_flatten_merge_adds_preserved_refspecs_to_remote test_flatten_merge_preserved_refspecs_heal test_flatten_merge_direct_from_sidecar_transfers_sub_submodule_too test_flatten_merge_snapshot_uncorrupted_under_verbose test_unflatten_merge_restores_only_the_gitignore_block test_unflatten_commit_does_not_sweep_unrelated_staged_changes test_flatten_merge_old_style_registered_submodule_writes_marker test_flatten_analyze_is_read_only_even_with_pending_sidecar_exclude test_flatten_merge_sidecar_containing_embedded_repos test_flatten_merge_sidecar_with_embedded_repo_only_no_false_success test_scope_walks_up_to_unreadable_enclosing_repo_not_git_repos test_st_local_only_flag_column test_st_flag_counts_in_summary test_ignore_marks_the_repo_you_name_from_anywhere test_toplevel_across_a_symlink_into_another_repo test_ignore_says_where_it_takes_effect test_ignore_unignore_toggles_marker test_unsm_deregisters_submodule_to_raw_nested_git test_unsm_proceeds_with_orphan_absorbed_gitdir test_st_no_double_listing_under_merged_parent test_run_as_owner_capture_warns_on_mixed_ownership test_st_upstream_on_other_branch_message test_st_broken_gitdir_not_masquerade_as_parent test_audit_and_repair_sidecar_setup test_repair_sidecar_does_not_sweep_pre_staged_work test_st_nested_sidecar_not_doubled test_st_shows_zipped_git_dirs test_zip_exports_the_tracked_files_resolved_and_the_repos_own_history test_zip_builds_history_for_a_path_that_has_none_of_its_own test_zip_uses_the_history_the_container_preserved_for_a_local_only_repo test_flatten_zip_unflatten_zip_round_trip test_flatten_zip_keep_and_plain_git test_vv_traces_discovery_finds test_flatten_go_without_mode_refused test_flatten_go_refuses_dirty_index test_flatten_local_only_is_generic test_flatten_zip_local_only test_flatten_zip_bulk_includes_plain_live_repos test_flatten_i_zip_choice_archives_via_menu test_flatten_go_i_nothing_to_flatten_is_concise test_flatten_sidecar_local_only test_flatten_hints_zip_when_nothing_to_flatten test_repair_summary_and_bare_repair test_audit_repair_sidecar_untracked_content test_audit_sidecar_flags_empty_sidecar test_shadow_keeps_git_live_and_parent_tracks test_shadow_does_not_mirror_what_the_child_ignores test_shadow_go_refreshes_an_already_shadowed_repo test_st_inside_an_intermediate_repo_keeps_the_block_the_container_needs test_shadow_excludes_retire_from_the_container_itself test_shadow_marker_rewrite_is_byte_identical_when_nothing_changed test_unshadow_stops_parent_tracking test_flatten_skips_shadowed_repos test_shadow_bulk_and_refuses_toplevel test_shadow_hook_restamps_only_the_marker_whose_content_it_commits test_st_reinstalls_the_shadow_hook_a_clone_never_carries test_shadow_hook_never_commits_the_repos_own_marker test_shadow_hook_leaves_a_marker_it_does_not_mirror_alone test_shadow_hook_drops_the_obsolete_fields_from_an_old_marker test_shadow_hook_marker_merges_cleanly_between_two_machines test_shadow_hook_lives_only_in_a_repo_that_mirrors_something test_container_keeps_the_history_of_a_shadowed_repo_with_no_remote test_st_says_when_a_local_only_repos_history_is_kept_nowhere test_container_keeps_no_history_for_a_shadowed_repo_that_has_a_remote test_container_prunes_a_kept_branch_once_the_repo_has_a_remote test_st_counts_the_kept_branches_push_would_retire test_st_says_nothing_of_kept_branches_still_needed test_container_never_forces_a_preserved_branch_backwards test_st_puts_a_submodule_a_pull_detached_back_on_its_branch test_st_leaves_a_detached_submodule_commit_the_branch_lacks_alone test_st_restores_the_x_bit_a_chmod_rule_took_off_a_hook test_st_refreshes_an_outdated_shadow_hook test_st_replaces_a_shadow_hook_installed_under_an_older_begin_line test_shadow_go_carries_only_the_ignored_files_below_its_path test_shadow_hook_preserves_foreign_precommit test_mc_leaves_a_new_nested_repo_for_you_to_classify test_mc_never_gitlinks_an_ignored_nested_repo test_mc_shadows_a_new_nested_repo_when_told_to test_mc_marks_a_new_nested_repo_ignored_when_told_to test_mc_new_nested_repo_defaults_to_warn test_mc_analyze_classifies_nothing_even_when_told_to_shadow test_mc_leaves_an_already_classified_nested_repo_alone test_st_counts_an_unclassified_nested_repo test_mc_fills_in_a_blank_marker_but_never_overrules_a_real_one test_safe_directory_exception_is_one_shot_and_never_written_to_the_owner test_audit_and_repair_search_only_where_they_may test_bulk_verbs_refuse_R_because_they_already_act_on_the_whole_tree test_always_recursive_verbs_refuse_R_in_either_position test_discovered_nesting_needs_permission_but_declared_never_does test_sm_searches_only_where_it_may_but_a_named_path_always_works test_sm_R_walks_however_it_is_spelled test_mc_commits_only_the_repo_you_are_in test_mc_R_walks_the_nested_repos test_mc_refuses_a_path_and_names_the_alternative test_an_unknown_subcommand_passes_through_to_git test_RR_implies_R_like_DD_implies_D test_R_on_an_always_recursive_command_names_RR test_foreign_discovery_needs_RR_and_is_inert_in_a_managed_scope test_commit_uses_your_message_where_mc_generates_one test_commit_analyzes_before_it_writes test_commit_without_a_message_names_mc test_add_carries_a_force_added_local_file_that_plain_git_add_strands test_add_stages_only_what_you_named_from_where_you_stand test_add_never_stages_a_new_nested_repo_as_a_gitlink test_add_refuses_what_it_cannot_do_honestly test_commit_carries_a_force_added_local_file_that_plain_git_would_strand test_guarded_verbs_refuse_only_what_breaks_a_rule test_branch_lists_the_tree_and_refuses_to_write test_git_ssh_never_becomes_a_connection_master
   test_install_clones_a_missing_root_and_rehydrates_its_projects test_install_never_clones_over_a_tree_with_content test_install_leaves_a_ready_root_alone test_install_never_changes_a_remote_that_differs_from_its_pair test_install_plain_run_changes_nothing test_a_new_repo_takes_the_owner_and_group_of_its_bare_remote test_install_clones_into_the_empty_folder_a_root_links_to
+  test_mc_commits_a_gated_folders_code_after_its_gate_passes test_mc_holds_a_gated_folder_when_its_gate_fails
+  test_a_commit_that_changes_no_gated_code_runs_no_gate test_commit_gate_leaves_the_commit_to_the_hook_without_my_rollout
+  test_shadow_go_gates_a_gated_tool_before_its_mirror_commit test_a_tools_own_repository_is_not_gated
+  test_my_git_never_commits_past_a_hook
   test_run_tests_titles_runs_exactly_the_tests_it_names
   test_run_list_registers_every_defined_test"
   for _rl_fn in $_rl_all; do
     case "$_rl_fn" in
       test_run_list_registers_every_defined_test)
         _rl_title="the suite: every test function is in the run list once, every title unique" ;;
+      test_my_git_never_commits_past_a_hook)
+        _rl_title="the suite: my-git never passes --no-verify to a git commit" ;;
       *) _rl_title=$_rl_fn ;;
     esac
     printf '%s\t%s\n' "$_rl_title" "$_rl_fn"
@@ -18756,6 +18833,7 @@ SM_SSH_CONNECT_TIMEOUT=5
 GIT_SIDECAR_DIRNAME=.git.real
 AUTO_SIDECAR_SUBMODULES=0
 AUTO_SIDECAR_EMBEDDED=0
+MY_ROLLOUT=/nonexistent/my-rollout
 _RT_CONF_EOF
 }
 _rt_conf_auto_sub() { _rt_conf "$1"; printf 'AUTO_SIDECAR_SUBMODULES=1\n' >> "$1"; }
@@ -28188,6 +28266,153 @@ test_install_clones_into_the_empty_folder_a_root_links_to() {
   _rt_contains "and is reported" go.out "has content but no .git; never cloned over" || return 1
   _rt_absent "a missing target is not created" real/gone || return 1
   _rt_contains "and is reported" go.out "a link to real/gone, which does not exist" || return 1
+  return 0
+}
+
+_rt_gated_src() {
+  # A stand-in for /LINKS/src: 'src' tracks a tool folder 'tool' whose
+  # tool.tests.links opts it in to the commit gate. Its pre-commit hook
+  # does what src's does -- refuses a commit that changes tool/'s code (a
+  # .md and the links file never count) unless a gate passed -- and
+  # records that it ran, so a commit made with --no-verify shows. The fake
+  # my-rollout's 'gate' records its arguments, then passes (and leaves the
+  # pass the hook asks for) or, with fake/gate.fails, fails naming a test.
+  # $1: 'shadowed' makes 'tool' a repository of its own, not yet mirrored.
+  mkdir -p fake
+  cat > fake/my-rollout <<'_RT_FAKE_EOF'
+#!/bin/sh
+[ "$1" = gate ] || exit 9
+shift
+d=$(cd "$(dirname "$0")" && pwd)
+echo "$*" >> "$d/gate.calls"
+if [ -f "$d/gate.fails" ]; then
+  echo "not ok 2 - tool: breaks"
+  echo " >>> gate: tool: its tests FAILED [rc 1] -- nothing recorded"
+  exit 1
+fi
+touch "$(git rev-parse --git-dir)/gate.green"
+echo " >>> gate: tool: ok -- recorded for these bytes"
+_RT_FAKE_EOF
+  chmod +x fake/my-rollout
+  _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+  printf 'MY_ROLLOUT=%s\n' "$PWD/fake/my-rollout" >> "$_rt_conf_path"
+  _rt_repo src
+  if [ "${1:-}" = shadowed ]; then
+    _rt_repo_file src/tool tool
+    ( cd src/tool && printf 'tool_main\tt_one\tthe case\n' > tool.tests.links \
+      && git add tool.tests.links && git commit -q -m links )
+  else
+    mkdir -p src/tool && echo v1 > src/tool/tool && echo doc > src/tool/README.md
+    printf 'tool_main\tt_one\tthe case\n' > src/tool/tool.tests.links
+    ( cd src && git add tool && git commit -q -m tool )
+  fi
+  cat > src/.git/hooks/pre-commit <<'_RT_HOOK_EOF'
+#!/bin/sh
+g=$(git rev-parse --git-dir)
+echo ran >> "$g/hook.ran"
+if git diff --cached --name-only | grep -v '\.md$' | grep -v '\.tests\.links$' | grep -q '^tool/'; then
+  [ -f "$g/gate.green" ] || { echo "my-rollout commit gate: tool: REFUSED -- no passing run of these bytes" >&2; exit 1; }
+  rm -f "$g/gate.green"
+fi
+exit 0
+_RT_HOOK_EOF
+  chmod +x src/.git/hooks/pre-commit
+  cd src || return 1
+}
+
+test_mc_commits_a_gated_folders_code_after_its_gate_passes() {
+  # src's pre-commit hook refuses a commit of a gated tool's code without
+  # a passing 'my-rollout gate' of those bytes. my-git commits into src
+  # itself (mc, commit, shadow, ...), so it runs the gate first -- through
+  # _commit_gate -- and commits on a pass, through the hook, never past it.
+  _rt_gated_src || return 1
+  echo v2 > tool/tool
+  _rt_ok "mc go" _rt_my_git mc go || return 1
+  _rt_contains "says the gate passed" "$_rt_out" "commit gate: tool: ok" || return 1
+  [ -z "$(git status --porcelain -- tool)" ] \
+    || { _rt_fail "the gated change was not committed: $(git status --porcelain -- tool | tr '\n' ' ')"; return 1; }
+  grep -qx 'tool/tool' ../fake/gate.calls \
+    || { _rt_fail "my-rollout gate was not given the path it commits: $(cat ../fake/gate.calls 2>/dev/null)"; return 1; }
+  [ -s .git/hook.ran ] || { _rt_fail "the commit skipped the pre-commit hook (--no-verify?)"; return 1; }
+  return 0
+}
+
+test_mc_holds_a_gated_folder_when_its_gate_fails() {
+  # A failing gate stops that repo: one line naming the failing test and
+  # the gate command, and NOTHING of it committed -- not even past the hook.
+  _rt_gated_src || return 1
+  touch ../fake/gate.fails
+  echo v2 > tool/tool
+  _rt_head=$(git rev-parse HEAD)
+  _rt_my_git mc go > mc.out 2> mc.err
+  [ "$(git rev-parse HEAD)" = "$_rt_head" ] \
+    || { _rt_fail "a commit was made after a failing gate"; return 1; }
+  [ -n "$(git status --porcelain -- tool/tool)" ] || { _rt_fail "the change is gone"; return 1; }
+  [ ! -e .git/hook.ran ] || { _rt_fail "a commit was attempted after a failing gate"; return 1; }
+  _rt_contains "names the failing test" mc.err "tool: breaks" || return 1
+  _rt_contains "names the gate command" mc.err "my-rollout gate tool/tool" || return 1
+  return 0
+}
+
+test_a_commit_that_changes_no_gated_code_runs_no_gate() {
+  # A .md and the links file never count, nor anything outside the gated
+  # folder: no gate, the commit as before.
+  _rt_gated_src || return 1
+  echo more >> tool/README.md
+  echo y > other.txt
+  _rt_ok "mc go" _rt_my_git mc go || return 1
+  [ ! -e ../fake/gate.calls ] || { _rt_fail "a gate ran for no code: $(cat ../fake/gate.calls)"; return 1; }
+  [ -z "$(git status --porcelain)" ] || { _rt_fail "not committed: $(git status --porcelain | tr '\n' ' ')"; return 1; }
+  return 0
+}
+
+test_commit_gate_leaves_the_commit_to_the_hook_without_my_rollout() {
+  # No my-rollout here: one line says so, and the hook decides -- it
+  # refuses, so nothing is committed and the hook's own reason is shown.
+  _rt_gated_src || return 1
+  printf 'MY_ROLLOUT=%s\n' "$PWD/../no-such/my-rollout" >> "$_rt_conf_path"
+  echo v2 > tool/tool
+  _rt_my_git mc go > mc.out 2> mc.err
+  _rt_contains "says my-rollout is not there" mc.err "no-such/my-rollout not found" || return 1
+  [ -s .git/hook.ran ] || { _rt_fail "the commit was not left to the hook"; return 1; }
+  [ -n "$(git status --porcelain -- tool/tool)" ] || { _rt_fail "committed past the hook"; return 1; }
+  return 0
+}
+
+test_shadow_go_gates_a_gated_tool_before_its_mirror_commit() {
+  # shadow's own container commit mirrors a tool's whole code: a gated
+  # tool's mirror is gated first, like any other commit my-git makes.
+  _rt_gated_src shadowed || return 1
+  _rt_ok "shadow go tool" _rt_my_git shadow go tool || return 1
+  grep -q 'tool/tool' ../fake/gate.calls \
+    || { _rt_fail "the mirror was committed ungated: $(cat ../fake/gate.calls 2>/dev/null)"; return 1; }
+  [ -n "$(git ls-files -- tool/tool)" ] || { _rt_fail "the mirror was not committed"; return 1; }
+  [ -s .git/hook.ran ] || { _rt_fail "the commit skipped the pre-commit hook"; return 1; }
+  return 0
+}
+
+test_a_tools_own_repository_is_not_gated() {
+  # A tool's own repository tracks its links file at its root (sh/my-git's
+  # does), but the gate's hook lives in the container that mirrors it:
+  # a commit there runs no gate.
+  _rt_gated_src || return 1
+  cd tool || return 1
+  git init -q && git config user.email t@t.com && git config user.name t
+  git add -A && git commit -q -m own
+  echo v2 > tool
+  _rt_ok "mc go in the tool's own repo" _rt_my_git mc go || return 1
+  [ ! -e ../../fake/gate.calls ] || { _rt_fail "gated a tool's own repository: $(cat ../../fake/gate.calls)"; return 1; }
+  [ -z "$(git status --porcelain)" ] || { _rt_fail "not committed"; return 1; }
+  return 0
+}
+
+test_my_git_never_commits_past_a_hook() {
+  # 'git commit --no-verify' (or -n) would carry ungated code past src's
+  # commit gate. The tests may (they stand in for what a pull delivers);
+  # my-git itself never does. Reads the source only.
+  _tt_code=$(awk '/^# ─── The self-tests:/ { exit } { print }' "$_rt_self" | grep -v '^[[:space:]]*#' \
+             | grep -E -e 'commit[^|;&]*--no-verify' -e 'git( [^|;&]*)? commit( [^|;&]*)? -[a-mo-zA-Z]*n' | sed -n '1,3p')
+  [ -z "$_tt_code" ] || { _rt_fail "my-git commits past the hook: $_tt_code"; return 1; }
   return 0
 }
 
