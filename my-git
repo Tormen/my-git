@@ -129,11 +129,11 @@ _build_id() {
 ME=$(id -un 2>/dev/null || echo "$USER")
 
 # ─── Dedicated trace channel (fd 3) ──────────────────────────────────────
-# run()'s '-V' command trace must survive callers redirecting stderr to
+# run_echoed()'s '-V' command trace must survive callers redirecting stderr to
 # capture a command's own error output for diagnostics (e.g.
 # 'run git commit ... 2>"$errlog"') — a plain '>&2' trace gets swallowed
 # into that same redirect, silently. Duplicating stderr into fd 3 HERE,
-# before any subcommand ever redirects fd 2 locally, gives run() a
+# before any subcommand ever redirects fd 2 locally, gives run_echoed() a
 # channel no later '2>...' on an individual command can touch. If the
 # whole script's own stderr was itself redirected at invocation (e.g.
 # 'my-git ... 2>logfile'), fd 3 correctly follows it there too — this
@@ -328,11 +328,11 @@ _prompt_ysa() {
   done
 }
 
-# ─── Command trace (run / show) — mirrors my-appleRAID ───────────────────
-# run: echo command in grey at -V, then execute. Preserves exit code.
+# ─── Command trace (run_echoed / show) — mirrors my-appleRAID ───────────────────
+# run_echoed: echo command in grey at -VV, then execute. Preserves exit code.
 # show: print a "would run" command in grey (always shown at callsite —
 #   callsite decides when to use it, e.g. for dry-run illustrations).
-run() {
+run_echoed() {
   # Trace goes to fd 3 (see 'exec 3>&2' near the top) — a dedicated
   # channel duplicated from stderr before startup, so it stays intact
   # even when the CALLER redirects fd 2 for this specific command (e.g.
@@ -347,23 +347,23 @@ run() {
   [ "$VERYVRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
   "$@"
 }
-# runq — like run(), but the trace is gated on -D (DBG), not -VV.
+# runq — like run_echoed(), but the trace is gated on -D (DBG), not -VV.
 # For INTERNAL "noise" commands (temp-file mktemp/rm, other bookkeeping
 # that never touches the user's repo): kept OUT of the -VV command trace
 # (which should read as the meaningful, repo-affecting command stream),
 # but surfaced at -D and above so a debug run really does show EVERY
 # external command my-git executes — including the noise — when you're
 # hunting a problem. (-DD additionally turns on 'set -x' for full
-# line-by-line shell tracing.) Same fd-3 channel + stdout-clean as run().
+# line-by-line shell tracing.) Same fd-3 channel + stdout-clean as run_echoed().
 runq() {
   [ "$DBG" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3
   "$@"
 }
 # trace / traceq — emit a command to the -VV (trace) or -D (traceq) command
-# stream WITHOUT executing it. For commands run() cannot wrap: pipelines and
+# stream WITHOUT executing it. For commands run_echoed() cannot wrap: pipelines and
 # commands inside a subshell ( ... ) — e.g. the discovery 'find' that feeds a
 # 'sed|grep' pipe. Keeps the -VV/-D command stream COMPLETE (every relevant
-# external command shows up), which run() alone can't guarantee. Return 0 so
+# external command shows up), which run_echoed() alone can't guarantee. Return 0 so
 # these never affect the surrounding command's exit status.
 trace()  { [ "$VERYVRB" = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; return 0; }
 traceq() { [ "$DBG"     = 1 ] && printf '%s$ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; return 0; }
@@ -732,7 +732,7 @@ ssh_setup_cmd() {
              -o ConnectTimeout="${SETUP_SSH_CONNECT_TIMEOUT:-15}" -n
   [ -n "$_ssc_port" ] && set -- "$@" -o Port="$_ssc_port"
   set -- "$@" "$_ssc_hp" "$_ssc_cmd"
-  run "$@"
+  run_echoed "$@"
 }
 
 git_ssh_setup() {
@@ -1184,14 +1184,14 @@ _xuser_exec() {
       # with "Author identity unknown". 'su' set HOME for free, which is why
       # this only appeared once the launchctl path replaced it.
       log_dbg_med "launchctl asuser $_xu_uid sudo -H -u $_tgt sh -c \"cd $_repo && $_cmdstr\"  # joins $_tgt's session (keychain) with $_tgt's HOME (gitconfig)"
-      ( cd / && run launchctl asuser "$_xu_uid" sudo -H -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr" )
+      ( cd / && run_echoed launchctl asuser "$_xu_uid" sudo -H -u "$_tgt" sh -c "cd $_repo_q && $_cmdstr" )
       return $?
     fi
     log_dbg_med "su $_tgt -c \"cd $_repo && $_cmdstr\"  # no console session for $_tgt: no keychain"
-    ( cd / && run su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
+    ( cd / && run_echoed su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
   else
     log_dbg_med "sudo su $_tgt -c \"cd $_repo && $_cmdstr\""
-    ( cd / && run sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
+    ( cd / && run_echoed sudo -p "[sudo for $_tgt @ $_repo] password: " su "$_tgt" -c "cd $_repo_q && $_cmdstr" )
   fi
 }
 
@@ -1277,7 +1277,7 @@ setup_mode() {
     # reports work it did not do is one nobody can read a real change out
     # of, and the second run of anything must be silent.
     [ "$_stm_was" = "$_stm_mode" ] && { log_dbg_minor "setup_mode: $_stm_p is already $_stm_mode"; continue; }
-    if _stm_err=$(run chmod "$_stm_mode" "$_stm_p" 2>&1); then
+    if _stm_err=$(run_echoed chmod "$_stm_mode" "$_stm_p" 2>&1); then
       log_medium "$_stm_p: mode $_stm_mode [was $_stm_was]"
     else
       log_warn "$_stm_p: mode $_stm_mode NOT set [was $_stm_was] — needs root: $(printf '%s' "$_stm_err" | tail -n 1)"
@@ -1405,7 +1405,7 @@ give_to_owner() {
       *)   _gto_has=$(file_owner "$_gto_p") ;;
     esac
     [ -n "${_gto_want%%:*}" ] && [ "$_gto_want" != "$_gto_has" ] || continue
-    if _gto_err=$(run chown -R "$_gto_want" "$_gto_p" 2>&1); then
+    if _gto_err=$(run_echoed chown -R "$_gto_want" "$_gto_p" 2>&1); then
       log_medium "$_gto_p: given to $_gto_want — as $_gto_from is held (was $_gto_has)"
     else
       log_warn "$_gto_p: belongs to $_gto_has, not to $_gto_want (as $_gto_from is held) — needs root: $(printf '%s' "$_gto_err" | tail -n 1)"
@@ -1438,7 +1438,7 @@ run_as_owner() {
   _owner=$(file_owner "$_gitdir")
   log_dbg_minor "run_as_owner: repo=$_repo owner=$_owner me=$ME cmd=$*"
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
-    ( cd "$_repo" && run "$@" )
+    ( cd "$_repo" && run_echoed "$@" )
     return $?
   fi
   _xuser_exec "$_owner" "$_repo" "$@"
@@ -1484,7 +1484,7 @@ run_as_owner_capture() {
     _raoc_own=1
   fi
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
-    ( cd "$_repo" && run "$@" ) 2>"${_raoc_err:-/dev/null}"; _raoc_rc=$?
+    ( cd "$_repo" && run_echoed "$@" ) 2>"${_raoc_err:-/dev/null}"; _raoc_rc=$?
   else
     _xuser_exec "$_owner" "$_repo" "$@" 2>"${_raoc_err:-/dev/null}"; _raoc_rc=$?
   fi
@@ -1718,8 +1718,8 @@ ensure_sidecar_exclude() {
   log_dbg_med "ensure_sidecar_exclude: $_ese_repo — adding '**/$_ese_grd' to tracked .gitignore and committing it"
   ( cd "$_ese_repo" || exit 0
     printf '**/%s\n' "$_ese_grd" >> .gitignore
-    run git add -f -- .gitignore >/dev/null 2>&1
-    run git commit -q -m "my-git: track **/$_ese_grd exclusion in .gitignore" -- .gitignore >/dev/null 2>&1
+    run_echoed git add -f -- .gitignore >/dev/null 2>&1
+    run_echoed git commit -q -m "my-git: track **/$_ese_grd exclusion in .gitignore" -- .gitignore >/dev/null 2>&1
   )
 }
 
@@ -1846,7 +1846,7 @@ preserve_merged_history() {
   # from an earlier merge all come across in one go. Refs are cheap;
   # objects are shared, so the duplication costs nothing.
   ( cd "$_pmh_parent" 2>/dev/null \
-    && run git fetch --no-tags -q "$_pmh_gitdir" "+refs/*:$_pmh_ns/*" )
+    && run_echoed git fetch --no-tags -q "$_pmh_gitdir" "+refs/*:$_pmh_ns/*" )
   _pmh_rc=$?
   # Restore BEFORE reacting to the result: on failure the gitdir stays
   # on disk and must still work as the submodule it was.
@@ -2266,11 +2266,11 @@ _zip_gitdir() {
   log_dbg_med "zip: $_zg_p: archiving $_zg_src${_zg_extra:+ + $_zg_extra} -> $_zg_zip (keep=$_zg_keep)"
   ( cd "$_zg_p" || exit 1
     # shellcheck disable=SC2086
-    if run zip -qr "$_zg_zip" "$_zg_src" $_zg_extra && run unzip -tqq "$_zg_zip"; then
+    if run_echoed zip -qr "$_zg_zip" "$_zg_src" $_zg_extra && run_echoed unzip -tqq "$_zg_zip"; then
       if [ "$_zg_keep" != 1 ]; then
         # shellcheck disable=SC2086
         # shellcheck disable=SC2086  # _zg_extra is a deliberate word list
-    run _rm_user "$_zg_src" $_zg_extra
+    run_echoed _rm_user "$_zg_src" $_zg_extra
       fi
     else
       log_error "zip: $_zg_p: zip failed (archive left untouched, originals kept)"
@@ -2302,8 +2302,8 @@ _unzip_gitdir() {
   fi
   log_dbg_med "unzip: $_ug_p: restoring $_ug_restored from $_ug_zip (keep=$_ug_keep)"
   ( cd "$_ug_p" || exit 1
-    if run unzip -q "$_ug_zip"; then
-      [ "$_ug_keep" = 1 ] || run rm -f "$_ug_zip"
+    if run_echoed unzip -q "$_ug_zip"; then
+      [ "$_ug_keep" = 1 ] || run_echoed rm -f "$_ug_zip"
     else
       log_error "unzip: $_ug_p: unzip failed"
       exit 1
@@ -6651,7 +6651,7 @@ _EOF
       # advice.addEmbeddedRepo=false: the content being added can contain a
       # further nested live repo — silence git's long embedded-repo hint
       # (my-git handles nesting deliberately). See shadow for the same.
-      set -- run git -c advice.addEmbeddedRepo=false add -f -- "$_fap"
+      set -- run_echoed git -c advice.addEmbeddedRepo=false add -f -- "$_fap"
       while IFS= read -r _fl_rd; do
         [ -n "$_fl_rd" ] || continue
         set -- "$@" ":(exclude)$_fl_rd"
@@ -6795,7 +6795,7 @@ _FL_ADD_EOF
       printf -- '--- %s content at this time ---\n' "$_cgf_base"
       cat "$_cgf_f" 2>/dev/null
       printf '\n'
-      run _rm_user "$_cgf_f"
+      run_echoed _rm_user "$_cgf_f"
     done
   }
 
@@ -6807,17 +6807,17 @@ _FL_ADD_EOF
     _sst_sub_url=$5
     _sst_file="$_sst_path/$GIT_SIDECAR_DIRNAME.status"
     _sst_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    _sst_branch=$(run git --git-dir="$_sst_gitdir" symbolic-ref --short -q HEAD 2>/dev/null)
-    _sst_commit=$(run git --git-dir="$_sst_gitdir" rev-parse HEAD 2>/dev/null)
+    _sst_branch=$(run_echoed git --git-dir="$_sst_gitdir" symbolic-ref --short -q HEAD 2>/dev/null)
+    _sst_commit=$(run_echoed git --git-dir="$_sst_gitdir" rev-parse HEAD 2>/dev/null)
     if [ -z "$_sst_commit" ]; then
       log_warn "$_sst_path: sidecar status — could not read HEAD commit from gitdir '$_sst_gitdir' (is it a valid git dir?); snapshot will record empty branch/commit"
     fi
     log_dbg_med "sidecar status: $_sst_path (gitdir=$_sst_gitdir branch='$_sst_branch' commit=$_sst_commit was_sub=$_sst_was_sub) -> $_sst_file"
     [ -n "$_sst_branch" ] || _sst_branch="(detached) $_sst_commit"
-    _sst_subject=$(run git --git-dir="$_sst_gitdir" log -1 --pretty=%s 2>/dev/null)
-    _sst_remote=$(run git --git-dir="$_sst_gitdir" config --get remote.origin.url 2>/dev/null)
+    _sst_subject=$(run_echoed git --git-dir="$_sst_gitdir" log -1 --pretty=%s 2>/dev/null)
+    _sst_remote=$(run_echoed git --git-dir="$_sst_gitdir" config --get remote.origin.url 2>/dev/null)
     _sst_dirty=no
-    [ -n "$(run git --git-dir="$_sst_gitdir" --work-tree="$_sst_path" status --porcelain 2>/dev/null)" ] && _sst_dirty=yes
+    [ -n "$(run_echoed git --git-dir="$_sst_gitdir" --work-tree="$_sst_path" status --porcelain 2>/dev/null)" ] && _sst_dirty=yes
     {
       printf '# my-git sidecar snapshot for %s -- written by "flatten --sidecar".\n' "$_sst_path"
       printf '# %s is the authoritative git history; this file is an ordinary,\n' "$GIT_SIDECAR_DIRNAME"
@@ -6844,7 +6844,7 @@ _FL_ADD_EOF
         printf 'was-submodule: no\n\n'
       fi
       printf -- '--- full local git config at sidecar time (git config --local --list) ---\n'
-      run git --git-dir="$_sst_gitdir" config --local --list 2>/dev/null
+      run_echoed git --git-dir="$_sst_gitdir" config --local --list 2>/dev/null
       # Deliberately NOT capturing .gitignore/.gitattributes/.gitmodules
       # here: sidecar mode never removes them (they stay live, ordinary
       # tracked content) — duplicating their content into this snapshot
@@ -6925,11 +6925,11 @@ _FL_ADD_EOF
     _fos_url=$(_sm_safe_git . config -f "$_fos_gitmodules" --get "submodule.$_fos_name.url" 2>/dev/null)
     log_dbg_med "sub-submodule $_fos_sub: AT RISK — gitdir '$_fos_real' lives inside the doomed parent gitdir; relocating to '$_fos_dst' (url=$_fos_url)"
     log_medium "transfer $_fos_sub  (sub-submodule of a path about to lose its own .git — realizing it first so its history survives)"
-    run _rm_user "$_fos_sub/.git" || { log_warn "sub-submodule $_fos_sub: removing the old .git pointer failed — leaving untouched"; return 0; }
-    run mv -- "$_fos_real" "$_fos_dst" || { log_warn "sub-submodule $_fos_sub: mv of gitdir '$_fos_real' -> '$_fos_dst' failed — history NOT relocated"; return 0; }
-    run git config --file "$_fos_dst/config" core.worktree ".." || { log_warn "sub-submodule $_fos_sub: could not set core.worktree on the new sidecar"; return 0; }
-    run git config --file "$_fos_dst/config" --unset core.bare 2>/dev/null || true
-    run mkdir -p "$_fos_dst/info" 2>/dev/null
+    run_echoed _rm_user "$_fos_sub/.git" || { log_warn "sub-submodule $_fos_sub: removing the old .git pointer failed — leaving untouched"; return 0; }
+    run_echoed mv -- "$_fos_real" "$_fos_dst" || { log_warn "sub-submodule $_fos_sub: mv of gitdir '$_fos_real' -> '$_fos_dst' failed — history NOT relocated"; return 0; }
+    run_echoed git config --file "$_fos_dst/config" core.worktree ".." || { log_warn "sub-submodule $_fos_sub: could not set core.worktree on the new sidecar"; return 0; }
+    run_echoed git config --file "$_fos_dst/config" --unset core.bare 2>/dev/null || true
+    run_echoed mkdir -p "$_fos_dst/info" 2>/dev/null
     printf '%s\n%s.status\n' "$GIT_SIDECAR_DIRNAME" "$GIT_SIDECAR_DIRNAME" >> "$_fos_dst/info/exclude" 2>/dev/null
     printf '%s\t%s\t%s\n' "$_fos_name" "$_fos_subrel" "$_fos_url" >> "$_fos_outfile"
   }
@@ -7014,11 +7014,11 @@ _FL_ADD_EOF
     fi
     [ -n "$_msn_xfer_tmp" ] && runq rm -f "$_msn_xfer_tmp"
     _msn_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    _msn_branch=$(run git --git-dir="$_msn_gitdir" symbolic-ref --short -q HEAD 2>/dev/null)
-    _msn_commit=$(run git --git-dir="$_msn_gitdir" rev-parse HEAD 2>/dev/null)
+    _msn_branch=$(run_echoed git --git-dir="$_msn_gitdir" symbolic-ref --short -q HEAD 2>/dev/null)
+    _msn_commit=$(run_echoed git --git-dir="$_msn_gitdir" rev-parse HEAD 2>/dev/null)
     [ -n "$_msn_branch" ] || _msn_branch="(detached) $_msn_commit"
-    _msn_subject=$(run git --git-dir="$_msn_gitdir" log -1 --pretty=%s 2>/dev/null)
-    _msn_remote=$(run git --git-dir="$_msn_gitdir" config --get remote.origin.url 2>/dev/null)
+    _msn_subject=$(run_echoed git --git-dir="$_msn_gitdir" log -1 --pretty=%s 2>/dev/null)
+    _msn_remote=$(run_echoed git --git-dir="$_msn_gitdir" config --get remote.origin.url 2>/dev/null)
 
     # Transplant the object database into the PARENT before anything is
     # deleted. On failure this returns 1 WITHOUT writing the snapshot:
@@ -7071,7 +7071,7 @@ _FL_ADD_EOF
         printf '\n'
       fi
       printf -- '--- full local git config at merge time (git config --local --list) ---\n'
-      run git --git-dir="$_msn_gitdir" config --local --list 2>/dev/null
+      run_echoed git --git-dir="$_msn_gitdir" config --local --list 2>/dev/null
       printf '\n'
       # Merge mode has no live-repo future to preserve (unlike a
       # sidecar, which might be unflattened back to active development)
@@ -7125,8 +7125,8 @@ _FL_ADD_EOF
       log_warn "$_fms_path: left as a sidecar ($GIT_SIDECAR_DIRNAME kept) — nothing was deleted"
       return 1
     }
-    run _rm_user "$_fms_gitreal" || { log_error "$_fms_path: removing $_fms_gitreal failed"; return 1; }
-    [ -f "$_fms_status" ] && { run git rm -q -- "$_fms_status" >/dev/null 2>&1 || run rm -f -- "$_fms_status"; }
+    run_echoed _rm_user "$_fms_gitreal" || { log_error "$_fms_path: removing $_fms_gitreal failed"; return 1; }
+    [ -f "$_fms_status" ] && { run_echoed git rm -q -- "$_fms_status" >/dev/null 2>&1 || run_echoed rm -f -- "$_fms_status"; }
     return 0
   }
 
@@ -7169,7 +7169,7 @@ _FL_ADD_EOF
       _sdn_dst="$_sdn_save/$_sdn_i"
       printf '%s\t%s\n' "$_sdn_en" "$_sdn_dst" >> "$_sdn_manifest"
       log_medium "shield (nested repo inside merged path, left untouched) $_sdn_en  ->  moved aside"
-      run mv -- "$_sdn_en" "$_sdn_dst" || log_warn "shield: mv aside failed for $_sdn_en (git add may still choke on it)"
+      run_echoed mv -- "$_sdn_en" "$_sdn_dst" || log_warn "shield: mv aside failed for $_sdn_en (git add may still choke on it)"
     done < "$_sdn_dedup"
     runq rm -f "$_sdn_dedup"
     return 0
@@ -7184,8 +7184,8 @@ _FL_ADD_EOF
     awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_usd_manifest" \
       | while IFS="$(printf '\t')" read -r _usd_orig _usd_saved; do
           [ -e "$_usd_saved" ] || continue
-          [ -e "$_usd_orig" ] && run _rm_user "$_usd_orig" 2>/dev/null
-          run mv -- "$_usd_saved" "$_usd_orig" 2>/dev/null \
+          [ -e "$_usd_orig" ] && run_echoed _rm_user "$_usd_orig" 2>/dev/null
+          run_echoed mv -- "$_usd_saved" "$_usd_orig" 2>/dev/null \
             || log_warn "unshield: restore failed: $_usd_saved -> $_usd_orig (nested repo left in the save dir — recover it by hand)"
         done
   }
@@ -7243,7 +7243,7 @@ _FL_ADD_EOF
       # path itself — same handling as a plain embedded repo, just an
       # in-place rename. Nothing to pull from .git/modules/<n> at all.
       log_medium "sidecar  $_rz_path  (old-style submodule, .git already self-contained -> $_rz_dst)"
-      if ! run mv -- "$_rz_path/.git" "$_rz_dst"; then
+      if ! run_echoed mv -- "$_rz_path/.git" "$_rz_dst"; then
         log_error "sidecar: $_rz_path: mv $_rz_path/.git -> $_rz_dst failed"
         return 1
       fi
@@ -7252,8 +7252,8 @@ _FL_ADD_EOF
       _rz_src="$_rz_parent_gitdir/modules/$_rz_name"
       [ -d "$_rz_src" ] || { log_error "sidecar: $_rz_path: no such gitdir at $_rz_src. If this was never initialized, run 'git submodule update --init' first. Otherwise this usually means the underlying git history genuinely no longer exists (e.g. it was already permanently removed by an earlier 'sm --clean-stale' or a manual deregistration) — not something 'sidecar' can recover. Choose 'flatten' instead to track the current on-disk files as plain content, or 'delete' to also remove the dead registration."; return 1; }
       log_medium "sidecar  $_rz_path  ($_rz_src -> $_rz_dst)"
-      run rm -f -- "$_rz_path/.git" || { log_error "sidecar: $_rz_path: removing gitfile pointer failed unexpectedly"; return 1; }
-      if ! run mv -- "$_rz_src" "$_rz_dst"; then
+      run_echoed rm -f -- "$_rz_path/.git" || { log_error "sidecar: $_rz_path: removing gitfile pointer failed unexpectedly"; return 1; }
+      if ! run_echoed mv -- "$_rz_src" "$_rz_dst"; then
         log_error "sidecar: $_rz_path: mv $_rz_src -> $_rz_dst failed"
         return 1
       fi
@@ -7270,11 +7270,11 @@ _FL_ADD_EOF
     # the .git/modules/<name>/ location, meaningless once relocated
     # anywhere else (including back to a plain <path>/.git — see
     # _unfl_restore_sidecar, which just unsets both instead).
-    run git config --file "$_rz_dst/config" core.worktree ".." || {
+    run_echoed git config --file "$_rz_dst/config" core.worktree ".." || {
       log_error "sidecar: $_rz_path: fixing core.worktree failed"
       return 1
     }
-    run git config --file "$_rz_dst/config" --unset core.bare 2>/dev/null || true
+    run_echoed git config --file "$_rz_dst/config" --unset core.bare 2>/dev/null || true
 
     # The realized dir must ignore itself (else 'git --git-dir=$_rz_dst
     # status', run from inside $_rz_path, reports $GIT_SIDECAR_DIRNAME as
@@ -7282,7 +7282,7 @@ _FL_ADD_EOF
     # Some older/hand-built .git dirs never got an info/ subdir (git
     # normally creates it on init, but not universally) — mkdir -p
     # first so this never fails with a shell-level redirection error.
-    run mkdir -p "$_rz_dst/info" 2>/dev/null
+    run_echoed mkdir -p "$_rz_dst/info" 2>/dev/null
     if ! grep -qxF "$GIT_SIDECAR_DIRNAME" "$_rz_dst/info/exclude" 2>/dev/null; then
       printf '%s\n%s.status\n' "$GIT_SIDECAR_DIRNAME" "$GIT_SIDECAR_DIRNAME" >> "$_rz_dst/info/exclude" 2>/dev/null || \
         log_warn "sidecar: $_rz_path: could not write self-exclude (cosmetic only, not fatal)"
@@ -7406,14 +7406,14 @@ _FL_ADD_EOF
         log_medium "sidecar  $_rze_path  (pointer's enclosing repo was already sidecared — resolved via $GIT_SIDECAR_DIRNAME instead)"
       log_medium "sidecar  $_rze_path  (gitfile pointer -> $_rze_real -> $_rze_dst)"
       log_warn "$_rze_path: this was a submodule of its OWN enclosing repo (not this scope) — that enclosing repo's own .gitmodules/index entry for it will now be inconsistent (its git history moved out from under it) unless the enclosing repo is also flattened/sidecared"
-      run _rm_user "$_rze_src" || { log_error "sidecar: $_rze_path: removing gitfile pointer failed"; return 1; }
-      if ! run mv -- "$_rze_real" "$_rze_dst"; then
+      run_echoed _rm_user "$_rze_src" || { log_error "sidecar: $_rze_path: removing gitfile pointer failed"; return 1; }
+      if ! run_echoed mv -- "$_rze_real" "$_rze_dst"; then
         log_error "sidecar: $_rze_path: mv $_rze_real -> $_rze_dst failed"
         return 1
       fi
     elif [ -d "$_rze_src" ]; then
       log_medium "sidecar  $_rze_path  ($_rze_src -> $_rze_dst)"
-      if ! run mv -- "$_rze_src" "$_rze_dst"; then
+      if ! run_echoed mv -- "$_rze_src" "$_rze_dst"; then
         log_error "sidecar: $_rze_path: mv $_rze_src -> $_rze_dst failed"
         return 1
       fi
@@ -7422,13 +7422,13 @@ _FL_ADD_EOF
       return 1
     fi
 
-    run git config --file "$_rze_dst/config" core.worktree ".." || {
+    run_echoed git config --file "$_rze_dst/config" core.worktree ".." || {
       log_error "sidecar: $_rze_path: fixing core.worktree failed"
       return 1
     }
-    run git config --file "$_rze_dst/config" --unset core.bare 2>/dev/null || true
+    run_echoed git config --file "$_rze_dst/config" --unset core.bare 2>/dev/null || true
 
-    run mkdir -p "$_rze_dst/info" 2>/dev/null
+    run_echoed mkdir -p "$_rze_dst/info" 2>/dev/null
     if ! grep -qxF "$GIT_SIDECAR_DIRNAME" "$_rze_dst/info/exclude" 2>/dev/null; then
       printf '%s\n%s.status\n' "$GIT_SIDECAR_DIRNAME" "$GIT_SIDECAR_DIRNAME" >> "$_rze_dst/info/exclude" 2>/dev/null || \
         log_warn "sidecar: $_rze_path: could not write self-exclude (cosmetic only, not fatal)"
@@ -7903,7 +7903,7 @@ _FBC_ORP_EOF
         skip) : ;;  # keep in _fl_registered, no action
         deregister)
           _sm_safe_git . config -f .gitmodules --remove-section "submodule.$_name" >/dev/null 2>&1 || true
-          run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+          run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
             log_warn "update-index --force-remove failed for $_p"
           _fl_index_touched=1
           _fl_registered=$(printf '%s\n' "$_fl_registered" | grep -Fxv "$_p")
@@ -7915,7 +7915,7 @@ _FBC_ORP_EOF
           # not half-deregistered with nothing to show for it.
           if _fl_realize_submodule "$_p" "$_name"; then
             _sm_safe_git . config -f .gitmodules --remove-section "submodule.$_name" >/dev/null 2>&1 || true
-            run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+            run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
               log_warn "update-index --force-remove failed for $_p"
             _fl_index_touched=1
             _fl_realized="$_fl_realized
@@ -7951,7 +7951,7 @@ $_p"
               log_warn "$_p: kept as a live nested repo (files still absorbed as parent content) — nothing was deleted"
           fi
           _sm_safe_git . config -f .gitmodules --remove-section "submodule.$_name" >/dev/null 2>&1 || true
-          run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+          run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
             log_warn "update-index --force-remove failed for $_p"
           _fl_index_touched=1
           _fl_nested="$_fl_nested
@@ -8044,7 +8044,7 @@ $_p"
         # untracked/uncommittable — a real historical bug this
         # closes, not just cosmetic).
         if printf '%s\n' "$_fl_orphan" | grep -Fxq "$_p"; then
-          run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+          run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
             log_warn "update-index --force-remove failed for $_p"
           _fl_index_touched=1
           _fl_orphan=$(printf '%s\n' "$_fl_orphan" | grep -Fxv "$_p")
@@ -8084,12 +8084,12 @@ _FL_EMB_REALIZE_EOF
     if [ -f .gitmodules ] && ! _sm_safe_git . config -f .gitmodules \
          --get-regexp '^submodule\..*\.path$' >/dev/null 2>&1; then
       # No submodule sections remain → remove .gitmodules entirely.
-      run git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
+      run_echoed git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
         log_warn ".gitmodules: update-index --force-remove failed"
-      run _rm_user .gitmodules
+      run_echoed _rm_user .gitmodules
     elif [ -f .gitmodules ]; then
       # Some sections remain → stage the modified .gitmodules.
-      run git add -- .gitmodules >/dev/null 2>&1 || \
+      run_echoed git add -- .gitmodules >/dev/null 2>&1 || \
         log_warn ".gitmodules: git add failed"
     fi
   }
@@ -8388,17 +8388,17 @@ _FL_EMB_REALIZE_EOF
       || fatal "flatten: mktemp -d for shield failed" 1
     _fms_shield_manifest="$_fms_shield_save/.manifest"; : > "$_fms_shield_manifest"
     _fl_shield_dir_nested "$_fl_scope_path" "$_fms_shield_save" "$_fms_shield_manifest"
-    if ! run git add -A -- "$_fl_scope_path"; then
+    if ! run_echoed git add -A -- "$_fl_scope_path"; then
       log_error "flatten: 'git add' failed for $_fl_scope_path even after shielding nested repos — leaving the merge staged for manual inspection (nothing committed)"
       _fl_unshield_dir "$_fms_shield_manifest"; runq rm -rf "$_fms_shield_save"
       fatal "flatten: could not stage merged content for $_fl_scope_path" 1
     fi
-    if run git diff --cached --quiet -- "$_fl_scope_path" 2>/dev/null; then
+    if run_echoed git diff --cached --quiet -- "$_fl_scope_path" 2>/dev/null; then
       _fl_unshield_dir "$_fms_shield_manifest"; runq rm -rf "$_fms_shield_save"
       log_major "$_fl_top: $_fl_scope_path merged (nothing left to commit — it was already fully tracked as a sidecar)"
       exit 0
     fi
-    if ! run git commit -q -m "my-git flatten --merge: $_fl_scope_path converted directly from sidecar (.git.merged written)" -- "$_fl_scope_path"; then
+    if ! run_echoed git commit -q -m "my-git flatten --merge: $_fl_scope_path converted directly from sidecar (.git.merged written)" -- "$_fl_scope_path"; then
       _fl_unshield_dir "$_fms_shield_manifest"; runq rm -rf "$_fms_shield_save"
       fatal "flatten: commit for merged sidecar $_fl_scope_path failed" 1
     fi
@@ -8864,7 +8864,7 @@ _FL_IGNCHK_ORPH_EOF
         # .gitmodules/index exactly as they were, nothing orphaned.
         if _fl_realize_submodule "$_p" "$_name"; then
           _sm_safe_git . config -f .gitmodules --remove-section "submodule.$_name" >/dev/null 2>&1 || true
-          run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+          run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
             log_warn "update-index --force-remove failed for $_p"
           printf '%s\n' "$_p" >> "$_fl_auto_realized_tmp"
         else
@@ -8883,11 +8883,11 @@ _FL_AUTO_EOF
       rm -f "$_fl_auto_realized_tmp" "$_fl_auto_failed_tmp"
       if [ -f .gitmodules ] && ! _sm_safe_git . config -f .gitmodules \
            --get-regexp '^submodule\..*\.path$' >/dev/null 2>&1; then
-        run git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
+        run_echoed git update-index --force-remove -- .gitmodules >/dev/null 2>&1 || \
           log_warn ".gitmodules: update-index --force-remove failed"
-        run _rm_user .gitmodules
+        run_echoed _rm_user .gitmodules
       elif [ -f .gitmodules ]; then
-        run git add -- .gitmodules >/dev/null 2>&1 || log_warn ".gitmodules: git add failed"
+        run_echoed git add -- .gitmodules >/dev/null 2>&1 || log_warn ".gitmodules: git add failed"
       fi
     fi
 
@@ -8931,7 +8931,7 @@ _FL_AUTO_EOF
           # realized content is guaranteed to end up properly tracked
           # rather than silently masked by a leftover 160000 entry.
           if printf '%s\n' "$_fl_orphan" | grep -Fxq "$_p"; then
-            run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+            run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
               log_warn "update-index --force-remove failed for $_p"
             _fl_orphan=$(printf '%s\n' "$_fl_orphan" | grep -Fxv "$_p")
           fi
@@ -9008,7 +9008,7 @@ _FL_AUTO_EMB_EOF
     [ -n "$_fl_pcheck" ] || continue
     if _sm_safe_git . ls-files -s -- "$_fl_pcheck" 2>/dev/null | awk '{print $1}' | grep -qx 160000; then
       log_medium "clearing stale gitlink for $_fl_pcheck before staging as content"
-      run git update-index --force-remove -- "$_fl_pcheck" 2>/dev/null || \
+      run_echoed git update-index --force-remove -- "$_fl_pcheck" 2>/dev/null || \
         log_warn "update-index --force-remove failed for $_fl_pcheck"
     fi
   done
@@ -9059,8 +9059,8 @@ _FL_AUTO_EMB_EOF
     awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$_fl_manifest" \
       | while IFS="$(printf '\t')" read -r _orig _saved; do
           [ -e "$_saved" ] || continue
-          [ -e "$_orig" ] && run _rm_user "$_orig" 2>/dev/null
-          run mv -- "$_saved" "$_orig" 2>/dev/null || \
+          [ -e "$_orig" ] && run_echoed _rm_user "$_orig" 2>/dev/null
+          run_echoed mv -- "$_saved" "$_orig" 2>/dev/null || \
             log_warn "restore failed: $_saved -> $_orig"
         done
   }
@@ -9131,7 +9131,7 @@ _FL_SHIELD_SCAN_EOF
       _fl_save_path="$_fl_save_root/$_fl_i"
       printf '%s\t%s\n' "$_fl_en" "$_fl_save_path" >> "$_fl_manifest"
       log_medium "shield (nested repo inside an add-path, left untouched) $_fl_en  ->  $_fl_save_path"
-      if ! run mv -- "$_fl_en" "$_fl_save_path"; then
+      if ! run_echoed mv -- "$_fl_en" "$_fl_save_path"; then
         log_error "move-out failed for $_fl_en"
         rm -f "$_fl_shield_dedup_tmp"
         return 1
@@ -9148,7 +9148,7 @@ _FL_SHIELD_SCAN_EOF
     if [ "$_fl_index_touched" = 1 ] && [ -n "${_fl_paths_raw:-}" ]; then
       while IFS= read -r _rp; do
         [ -n "$_rp" ] || continue
-        run git restore --staged -- "$_rp" >/dev/null 2>&1 || true
+        run_echoed git restore --staged -- "$_rp" >/dev/null 2>&1 || true
       done <<_FL_ROLLBACK_EOF
 $_fl_paths_raw
 _FL_ROLLBACK_EOF
@@ -9164,7 +9164,7 @@ _FL_ROLLBACK_EOF
     [ -n "$_p" ] || continue
     log_medium "remove   $_p"
     _fl_index_touched=1
-    run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
+    run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || \
       log_warn "git update-index --force-remove failed for $_p"
   done <<_FL_ORPHAN_EOF
 $_fl_orphan
@@ -9186,7 +9186,7 @@ _FL_ORPHAN_EOF
         # stage ONLY the archive that _zip_gitdir just wrote (.git.zip for a
         # plain repo, GIT_SIDECAR_DIRNAME.zip for a sidecar) — never the files.
         if [ -f "$_zp/.git.zip" ]; then _fl_zname=".git.zip"; else _fl_zname="${GIT_SIDECAR_DIRNAME:-.git.real}.zip"; fi
-        if run git add -f -- "$_zp/$_fl_zname" >/dev/null 2>&1; then
+        if run_echoed git add -f -- "$_zp/$_fl_zname" >/dev/null 2>&1; then
           _fl_zipped_staged=1
         else
           log_warn "zip: git add of $_zp/$_fl_zname failed"
@@ -9239,7 +9239,7 @@ _FL_ZIP_EOF
     while IFS= read -r _n; do
       [ -n "$_n" ] || continue
       log_medium "delete   $_n"
-      run _rm_user "$_n" || log_warn "removal failed for $_n"
+      run_echoed _rm_user "$_n" || log_warn "removal failed for $_n"
     done <<_FL_EOF
 $_fl_nested
 _FL_EOF
@@ -9280,7 +9280,7 @@ _FL_EOF
     _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
     _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
     # shellcheck disable=SC2086
-    if run git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
+    if run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
       rm -f "$_fl_commit_log" "$_fl_msgfile"
       rm -rf "$_fl_save_root"
       trap - INT TERM HUP
@@ -9309,7 +9309,7 @@ _FL_EOF
     while IFS= read -r _n; do
       [ -n "$_n" ] || continue
       log_medium "delete   $_n"
-      run rm -rf -- "$_n" || log_warn "rm failed for $_n"
+      run_echoed rm -rf -- "$_n" || log_warn "rm failed for $_n"
     done <<_FL_DEL_EOF
 $_fl_nested_delete
 _FL_DEL_EOF
@@ -9332,7 +9332,7 @@ _FL_DEL_EOF
     _fl_save_path="$_fl_save_root/$_fl_i"
     printf '%s\t%s\n' "$_fl_top/$_n" "$_fl_save_path" >> "$_fl_manifest"
     log_medium "MOVE-OUT $_n  ->  $_fl_save_path"
-    run mv -- "$_n" "$_fl_save_path" || {
+    run_echoed mv -- "$_n" "$_fl_save_path" || {
       log_error "move-out failed for $_n"
       _fl_rollback
       rm -rf "$_fl_save_root"
@@ -9389,7 +9389,7 @@ _FL_EOF
   _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
   _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
   # shellcheck disable=SC2086
-  if ! run git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
+  if ! run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
     log_error "flatten commit failed:"
     cat "$_fl_commit_log" >&2
     rm -f "$_fl_commit_log" "$_fl_msgfile"
@@ -9410,7 +9410,7 @@ _FL_EOF
       [ -n "$_m" ] || continue
       [ -e "$_m" ] || continue
       log_medium "delete   $_m"
-      run rm -rf -- "$_m" || log_warn "rm failed for $_m"
+      run_echoed rm -rf -- "$_m" || log_warn "rm failed for $_m"
     done
   fi
   _fl_warn_broken_pointers
@@ -9475,7 +9475,7 @@ _unfl_restore_sidecar() {
   fi
 
   log_medium "unflatten  $_urs_path  ($_urs_src -> $_urs_dst)"
-  if ! run mv -- "$_urs_src" "$_urs_dst"; then
+  if ! run_echoed mv -- "$_urs_src" "$_urs_dst"; then
     log_error "unflatten: $_urs_path: mv $_urs_src -> $_urs_dst failed"
     return 1
   fi
@@ -9489,21 +9489,21 @@ _unfl_restore_sidecar() {
   # touched them (e.g. inside .git/modules/<name>/ for an absorbed
   # submodule) is meaningless here — that was a different location
   # entirely, not this one.
-  run git config --file "$_urs_dst/config" --unset core.worktree 2>/dev/null || true
-  run git config --file "$_urs_dst/config" --unset core.bare 2>/dev/null || true
+  run_echoed git config --file "$_urs_dst/config" --unset core.worktree 2>/dev/null || true
+  run_echoed git config --file "$_urs_dst/config" --unset core.bare 2>/dev/null || true
 
   # Cosmetic cleanup: drop the self-exclude lines 'flatten --sidecar' added.
   if [ -f "$_urs_dst/info/exclude" ]; then
     _urs_excl_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.uflexcl.XXXXXX")
     grep -vxF -e "$GIT_SIDECAR_DIRNAME" -e "$GIT_SIDECAR_DIRNAME.status" \
       "$_urs_dst/info/exclude" > "$_urs_excl_tmp" 2>/dev/null
-    run mv -f "$_urs_excl_tmp" "$_urs_dst/info/exclude" 2>/dev/null
+    run_echoed mv -f "$_urs_excl_tmp" "$_urs_dst/info/exclude" 2>/dev/null
   fi
 
   # The .status file was ordinary parent-tracked content — its removal
   # needs staging same as any other file the parent tracks.
   if [ -f "$_urs_status" ]; then
-    run git rm -q -- "$_urs_status" >/dev/null 2>&1 || run rm -f -- "$_urs_status"
+    run_echoed git rm -q -- "$_urs_status" >/dev/null 2>&1 || run_echoed rm -f -- "$_urs_status"
   fi
 
   # If the parent was ALSO tracking the sidecar internals themselves
@@ -9517,7 +9517,7 @@ _unfl_restore_sidecar() {
   # from the worktree; --cached only drops the index entries, and
   # --ignore-unmatch makes this a clean no-op in the normal (properly
   # .gitignore-excluded, never-tracked) case.
-  run git rm -r -q --cached --ignore-unmatch -- "$_urs_src" >/dev/null 2>&1 || true
+  run_echoed git rm -r -q --cached --ignore-unmatch -- "$_urs_src" >/dev/null 2>&1 || true
 
   if [ "$_urs_was_sub" = yes ]; then
     log_major "$_urs_path: was a registered submodule (${_urs_sub_name:-name unknown}) before it was sidecared — run 'my-git sm go' if you want it re-registered in .gitmodules"
@@ -9558,7 +9558,7 @@ _urm_restore_gitignore() {
   else
     log_dbg_med "$_urg_path: no .gitignore block in $_urg_snapshot to restore (none was captured at merge time)"
   fi
-  run git rm -q -- "$_urg_snapshot" >/dev/null 2>&1 || run rm -f -- "$_urg_snapshot"
+  run_echoed git rm -q -- "$_urg_snapshot" >/dev/null 2>&1 || run_echoed rm -f -- "$_urg_snapshot"
   return 0
 }
 
@@ -9579,23 +9579,23 @@ _unfl_restore_preserved() {
   _urp_ns=$2
   _urp_tip=$3
   _urp_branch=$4
-  _urp_parent_gitdir=$(run git rev-parse --absolute-git-dir) || return 1
+  _urp_parent_gitdir=$(run_echoed git rev-parse --absolute-git-dir) || return 1
   if [ -z "$(git for-each-ref --format='%(refname)' "$_urp_ns" 2>/dev/null)" ]; then
     log_warn "unflatten: $_urp_path: .git.merged points at '$_urp_ns' but this repo has no such refs — the preserved history is missing here (a plain clone does NOT fetch $MERGED_REFS_ROOT/*; try: git config --replace-all remote.origin.fetch '$MERGED_REFS_ROOT/*:$MERGED_REFS_ROOT/*' '$EPR_MERGED_RE' && git fetch origin)"
     return 1
   fi
   log_medium "unflatten  $_urp_path  (restoring the preserved history from $_urp_ns — full pre-merge history, branches and tags)"
-  run git init -q "$_urp_path" || { log_error "unflatten: $_urp_path: git init failed"; return 1; }
+  run_echoed git init -q "$_urp_path" || { log_error "unflatten: $_urp_path: git init failed"; return 1; }
   # 'git init' leaves HEAD on a branch (main/master), and git flatly
   # REFUSES to fetch into whatever branch is checked out — which is
   # exactly the branch a restore usually needs to write. Park HEAD on a
   # placeholder name nothing can collide with; the real branch is
   # selected below, once every ref has landed.
   if ! ( cd "$_urp_path" \
-         && run git symbolic-ref HEAD "refs/heads/my-git-unflatten-placeholder-$$" \
-         && run git fetch -q "$_urp_parent_gitdir" "+$_urp_ns/*:refs/*" ); then
+         && run_echoed git symbolic-ref HEAD "refs/heads/my-git-unflatten-placeholder-$$" \
+         && run_echoed git fetch -q "$_urp_parent_gitdir" "+$_urp_ns/*:refs/*" ); then
     log_error "unflatten: $_urp_path: could not fetch the preserved refs back out of the parent"
-    run rm -rf -- "$_urp_path/.git"
+    run_echoed rm -rf -- "$_urp_path/.git"
     return 1
   fi
   # Point HEAD at the original branch WITHOUT touching the worktree.
@@ -9603,13 +9603,13 @@ _unfl_restore_preserved() {
   # HEAD and syncs the index while leaving files alone; 'checkout' would
   # overwrite the post-merge content.
   if [ -n "$_urp_branch" ] && git -C "$_urp_path" rev-parse -q --verify "refs/heads/$_urp_branch" >/dev/null 2>&1; then
-    run git -C "$_urp_path" symbolic-ref HEAD "refs/heads/$_urp_branch" \
+    run_echoed git -C "$_urp_path" symbolic-ref HEAD "refs/heads/$_urp_branch" \
       || log_warn "unflatten: $_urp_path: could not point HEAD at '$_urp_branch'"
   elif [ -n "$_urp_tip" ]; then
     log_warn "unflatten: $_urp_path: recorded branch '$_urp_branch' not among the restored refs — leaving HEAD detached at $_urp_tip"
-    run git -C "$_urp_path" update-ref --no-deref HEAD "$_urp_tip" 2>/dev/null || true
+    run_echoed git -C "$_urp_path" update-ref --no-deref HEAD "$_urp_tip" 2>/dev/null || true
   fi
-  run git -C "$_urp_path" reset -q --mixed >/dev/null 2>&1 \
+  run_echoed git -C "$_urp_path" reset -q --mixed >/dev/null 2>&1 \
     || log_warn "unflatten: $_urp_path: index reset failed — 'git status' there may look odd until you run 'git reset'"
   # Restore the REMOTE. The restored .git is a fresh 'git init' plus a fetch,
   # so it has refs but no configuration: remote-tracking refs arrive while
@@ -9619,7 +9619,7 @@ _unfl_restore_preserved() {
     _urp_url=$(sed -n 's|^remote\.origin\.url: ||p' "$_urp_path/.git.merged" | head -n 1)
     if [ -n "$_urp_url" ]; then
       if [ -z "$(git -C "$_urp_path" config --get remote.origin.url 2>/dev/null)" ]; then
-        if run git -C "$_urp_path" remote add origin "$_urp_url" 2>/dev/null; then
+        if run_echoed git -C "$_urp_path" remote add origin "$_urp_url" 2>/dev/null; then
           log_medium "$_urp_path: restored remote origin -> $_urp_url"
         else
           log_warn "$_urp_path: could not restore remote origin ($_urp_url) — set it by hand"
@@ -9644,7 +9644,7 @@ _unfl_restore_preserved() {
   # sidecar/.status/.git.merged artifacts it supersedes.
   git for-each-ref --format='%(refname)' "$_urp_ns" 2>/dev/null | while IFS= read -r _urp_r; do
     [ -n "$_urp_r" ] || continue
-    run git update-ref -d "$_urp_r" 2>/dev/null || log_warn "unflatten: could not drop preserved ref $_urp_r from the parent"
+    run_echoed git update-ref -d "$_urp_r" 2>/dev/null || log_warn "unflatten: could not drop preserved ref $_urp_r from the parent"
   done
   log_medium "$_urp_path: dropped the parent's now-redundant $_urp_ns/* refs (the history lives in $_urp_path/.git now)"
   return 0
@@ -9685,12 +9685,12 @@ _unfl_reconstruct_merge() {
   _urm_branch="my-git-unflatten-tmp-$$"
   log_medium "unflatten  $_urm_path  (reconstructing from this repo's own commit history via git subtree split — history before the original merge is NOT recoverable)"
   log_dbg_med "reconstruct $_urm_path: splitting subtree into temp branch '$_urm_branch' (git subtree split --prefix=$_urm_path)"
-  if ! run git subtree split --prefix="$_urm_path" -b "$_urm_branch" >/dev/null; then
+  if ! run_echoed git subtree split --prefix="$_urm_path" -b "$_urm_branch" >/dev/null; then
     log_error "unflatten: $_urm_path: git subtree split failed — does this path actually have tracked commit history in this repo?"
     return 1
   fi
   log_dbg_med "reconstruct $_urm_path: subtree split OK; branch '$_urm_branch' -> $(git rev-parse --short "$_urm_branch" 2>/dev/null)"
-  _urm_parent_gitdir=$(run git rev-parse --absolute-git-dir)
+  _urm_parent_gitdir=$(run_echoed git rev-parse --absolute-git-dir)
   log_dbg_med "reconstruct $_urm_path: parent gitdir = $_urm_parent_gitdir"
   # A SHADOWED path: this repo tracks <path>/.git.shadow.status, so every
   # commit since the shadow carries it, and the split hands them over as they
@@ -9706,22 +9706,22 @@ _unfl_reconstruct_merge() {
     _urm_bare=$(mktemp -d "${TMPDIR:-/tmp}/${US}.unflsh.XXXXXX") || _urm_bare=""
     if [ -z "$_urm_bare" ] || ! (
          export FILTER_BRANCH_SQUELCH_WARNING=1
-         run git init -q --bare "$_urm_bare" \
-           && run git -C "$_urm_bare" fetch -q "$_urm_parent_gitdir" "$_urm_branch:refs/heads/$_urm_branch" \
-           && run git -C "$_urm_bare" symbolic-ref HEAD "refs/heads/$_urm_branch" \
-           && run git -C "$_urm_bare" filter-branch -f --prune-empty \
+         run_echoed git init -q --bare "$_urm_bare" \
+           && run_echoed git -C "$_urm_bare" fetch -q "$_urm_parent_gitdir" "$_urm_branch:refs/heads/$_urm_branch" \
+           && run_echoed git -C "$_urm_bare" symbolic-ref HEAD "refs/heads/$_urm_branch" \
+           && run_echoed git -C "$_urm_bare" filter-branch -f --prune-empty \
                 --index-filter 'git rm -q --cached --ignore-unmatch -- .git.shadow.status' \
                 -- "refs/heads/$_urm_branch" >/dev/null 2>&1 ); then
       log_error "unflatten: $_urm_path: could not keep the shadow marker out of the reconstructed history"
       [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
-      run git branch -D "$_urm_branch" >/dev/null 2>&1
+      run_echoed git branch -D "$_urm_branch" >/dev/null 2>&1
       return 1
     fi
     _urm_src=$_urm_bare
   fi
-  if ! run git init -q "$_urm_path"; then
+  if ! run_echoed git init -q "$_urm_path"; then
     log_error "unflatten: $_urm_path: git init failed"
-    run git branch -D "$_urm_branch" >/dev/null 2>&1
+    run_echoed git branch -D "$_urm_branch" >/dev/null 2>&1
     return 1
   fi
   give_to_owner "$_urm_path/.git"
@@ -9731,21 +9731,21 @@ _unfl_reconstruct_merge() {
   # 'reset --hard' onto an unborn branch is exactly how first-checkout
   # normally happens, just from a specific commit instead of an empty tree.
   if ! ( cd "$_urm_path" \
-         && run git fetch -q "$_urm_src" "$_urm_branch" \
-         && run git reset -q --hard FETCH_HEAD ); then
+         && run_echoed git fetch -q "$_urm_src" "$_urm_branch" \
+         && run_echoed git reset -q --hard FETCH_HEAD ); then
     log_error "unflatten: $_urm_path: materializing the reconstructed history failed"
-    run rm -rf -- "$_urm_path/.git"
+    run_echoed rm -rf -- "$_urm_path/.git"
     [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
-    run git branch -D "$_urm_branch" >/dev/null 2>&1
+    run_echoed git branch -D "$_urm_branch" >/dev/null 2>&1
     return 1
   fi
   [ -n "$_urm_bare" ] && command rm -rf -- "$_urm_bare"
-  run git branch -D "$_urm_branch" >/dev/null 2>&1
+  run_echoed git branch -D "$_urm_branch" >/dev/null 2>&1
   if [ -n "$_urm_bare" ]; then
     _shadow_exclude_marker "$_urm_path" "$PWD" || true
     log_medium "$_urm_path: its .git.shadow.status stays this repo's record of the mirror — kept out of the reconstructed history and excluded in the child, as shadow does"
   fi
-  _urm_n_commits=$(run git -C "$_urm_path" rev-list --count HEAD 2>/dev/null)
+  _urm_n_commits=$(run_echoed git -C "$_urm_path" rev-list --count HEAD 2>/dev/null)
   log_dbg_med "reconstruct $_urm_path: materialized live .git, HEAD=$(git -C "$_urm_path" rev-parse --short HEAD 2>/dev/null), $_urm_n_commits commit(s)"
   log_major "$_urm_path: reconstructed — $_urm_n_commits commit(s) recovered, starting from when this path was first merged in"
 
@@ -9953,7 +9953,7 @@ cmd_unflatten() {
         # stays on disk as valid tracked content). --ignore-unmatch keeps this
         # a no-op for a standalone 'gz' archive that was never committed.
         if [ "$_ufl_keep" != 1 ]; then
-          run git rm -q --cached --ignore-unmatch -- \
+          run_echoed git rm -q --cached --ignore-unmatch -- \
             "$_p/.git.zip" "$_p/${GIT_SIDECAR_DIRNAME:-.git.real}.zip" >/dev/null 2>&1 || true
           _ufl_commit_paths="$_ufl_commit_paths $(shell_escape "$_p")"
         fi
@@ -9979,7 +9979,7 @@ cmd_unflatten() {
     _ufl_cmsg_sub="my-git unflatten: restored $_ufl_n_ok nested repo(s) to a live .git"
     [ "$_ufl_n_fail" -gt 0 ] && _ufl_cmsg_sub="$_ufl_cmsg_sub ($_ufl_n_fail failed)"
     _ufl_cmsg_body="Restored each nested repo to a live .git (renamed $GIT_SIDECAR_DIRNAME -> .git, reconstructed merged path(s), and/or unzipped .git.zip archive(s)), then dropped the parent's now-obsolete tracking of the sidecar snapshot(s), the .status marker(s), the .git.merged snapshot(s), and the .git.zip archive(s). Nested repo history is intact in the restored live .git. Committed by my-git so unflatten leaves the parent clean, mirroring how flatten/gz commit their own artifacts."
-    eval "run git commit -q -m \"\$_ufl_cmsg_sub\" -m \"\$_ufl_cmsg_body\" -- $_ufl_commit_paths" >/dev/null 2>&1 || \
+    eval "run_echoed git commit -q -m \"\$_ufl_cmsg_sub\" -m \"\$_ufl_cmsg_body\" -- $_ufl_commit_paths" >/dev/null 2>&1 || \
       log_warn "unflatten: self-contained teardown commit failed — the removed $GIT_SIDECAR_DIRNAME/.status/.git.merged entries are left STAGED for manual commit"
   fi
 
@@ -10398,7 +10398,7 @@ _shadow_install_hook_one() {
     log_warn "shadow: $_sih_hook already exists and is NOT managed by my-git — NOT modifying it. Paste the managed block into it by hand (see '$US --help shadow')."
     return 0
   fi
-  run mkdir -p "$_sih_gd/hooks" 2>/dev/null
+  run_echoed mkdir -p "$_sih_gd/hooks" 2>/dev/null
   { printf '#!/bin/sh\n'; "$_sih_fn"; } > "$_sih_hook" 2>/dev/null \
     && chmod +x "$_sih_hook" 2>/dev/null \
     && log_dbg_med "shadow: installed $_sih_name hook ($_sih_hook)" \
@@ -10793,7 +10793,7 @@ _shadow_one() {
   ( _sho_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.shadow.XXXXXX") || { log_error "shadow: mktemp -d failed"; exit 1; }
     # restore .git on interrupt (contained to this subshell)
     trap 'mv -- "$_sho_tmp/gitdir" "$_sho_gd" 2>/dev/null' INT TERM HUP
-    if ! run mv -- "$_sho_gd" "$_sho_tmp/gitdir"; then
+    if ! run_echoed mv -- "$_sho_gd" "$_sho_tmp/gitdir"; then
       log_error "shadow: $_sho_p: could not move .git aside"; rmdir "$_sho_tmp" 2>/dev/null; exit 1
     fi
     # advice.addEmbeddedRepo=false: a shadowed repo may itself contain nested
@@ -10808,7 +10808,7 @@ _shadow_one() {
     # marker claims a mirror. Clear it first (same reason flatten does).
     if git ls-files -s -- "$_sho_p" 2>/dev/null | awk '{print $1}' | grep -qx 160000; then
       log_medium "shadow: $_sho_p — clearing a stale gitlink so the files can be staged as content"
-      run git update-index --force-remove -- "$_sho_p" 2>/dev/null \
+      run_echoed git update-index --force-remove -- "$_sho_p" 2>/dev/null \
         || log_warn "shadow: $_sho_p — could not clear the gitlink; the mirror may not be created"
     fi
     # Two steps, and neither is a bare 'add -f -- <dir>'. -f on a DIRECTORY
@@ -10820,7 +10820,7 @@ _shadow_one() {
     #     rules have no say over a tracked path, so this works even though
     #     shadow's own managed block in this repo's .git/info/exclude names
     #     this very directory.
-    run git add -u -- "$_sho_p" >/dev/null 2>&1 || true
+    run_echoed git add -u -- "$_sho_p" >/dev/null 2>&1 || true
     # (2) Everything the child itself would commit, named explicitly. Plain
     #     'add -- <dir>' was used here once and FAILED on every already-
     #     shadowed repo: the exclusion shadow wrote for this path blocks it,
@@ -10830,13 +10830,13 @@ _shadow_one() {
     #     ls-files honours its .gitignore exactly and cannot be blocked.
     _sho_rc=0
     if [ -s "$_sho_keep" ]; then
-      run git -c advice.addEmbeddedRepo=false add -f --pathspec-from-file="$_sho_keep"
+      run_echoed git -c advice.addEmbeddedRepo=false add -f --pathspec-from-file="$_sho_keep"
       _sho_rc=$?
     fi
     # The marker is ours and must be tracked by the parent regardless of what
     # any .gitignore says, so it keeps the force.
-    run git add -f -- "$_sho_p/.git.shadow.status" >/dev/null 2>&1 || true
-    if ! run mv -- "$_sho_tmp/gitdir" "$_sho_gd"; then
+    run_echoed git add -f -- "$_sho_p/.git.shadow.status" >/dev/null 2>&1 || true
+    if ! run_echoed mv -- "$_sho_tmp/gitdir" "$_sho_gd"; then
       log_error "shadow: $_sho_p: FAILED to restore .git! It is at $_sho_tmp/gitdir — move it back to $_sho_gd BY HAND."; exit 2
     fi
     rmdir "$_sho_tmp" 2>/dev/null
@@ -10965,7 +10965,7 @@ cmd_shadow() {
       _sh_fail=$((_sh_fail + 1))
     fi
   done
-  if [ -n "$_sh_commit" ] && ! eval "run git diff --cached --quiet -- $_sh_commit" 2>/dev/null; then
+  if [ -n "$_sh_commit" ] && ! eval "run_echoed git diff --cached --quiet -- $_sh_commit" 2>/dev/null; then
     # run_as_owner, NOT a plain 'git commit': the parent repo is frequently
     # owned by someone other than the invoker (root running my-git over a
     # user-owned tree), and a plain git then refuses it as dubiously-owned.
@@ -11107,7 +11107,7 @@ cmd_unshadow() {
   # route and the stale-marker route below.
   _unshadow_clean_marker() {
     _ucm_p=$1
-    run rm -f -- "$_ucm_p/.git.shadow.status" 2>/dev/null
+    run_echoed rm -f -- "$_ucm_p/.git.shadow.status" 2>/dev/null
     rm -f -- "$_ucm_p"/.git.shadow.status.* 2>/dev/null || true
     if [ -f "$_ucm_p/.git/info/exclude" ] && grep -qE '^\.git\.shadow\.status' "$_ucm_p/.git/info/exclude" 2>/dev/null; then
       _ucm_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.unshadow.XXXXXX" 2>/dev/null) \
@@ -11158,7 +11158,7 @@ cmd_unshadow() {
       log_ok "unshadow: $_p — STALE marker removed (no repo was mirroring it; nothing to untrack)"
       continue
     fi
-    if run git rm -r --cached -q -- "$_p" >/dev/null 2>&1; then
+    if run_echoed git rm -r --cached -q -- "$_p" >/dev/null 2>&1; then
       _ush_ok=$((_ush_ok + 1))
       _unshadow_clean_marker "$_p"
       if [ -e "$_p/.git" ]; then
@@ -11179,7 +11179,7 @@ cmd_unshadow() {
       : # only stale markers were cleaned -- nothing was staged, nothing to commit
     elif [ -n "$_ush_pre_staged" ]; then
       log_warn "unshadow: your index already had staged changes before this ran — NOT committing the removal automatically (it would sweep them in). Commit/reset your index, the removal is staged and ready."
-    elif run git commit -q -m "my-git unshadow: stop mirroring into the parent (live .git kept)" >/dev/null 2>&1; then
+    elif run_echoed git commit -q -m "my-git unshadow: stop mirroring into the parent (live .git kept)" >/dev/null 2>&1; then
       :
     else
       log_warn "unshadow: commit failed — staged removal left for manual commit"
@@ -11472,7 +11472,7 @@ _Z_EOF
   _z_hist=$(_zip_history "$_z_root" "$_z_path" "$_z_owner")
   log_medium "zip: history: $_z_hist"
 
-  if ! ( cd "$_z_stage" && run zip -qr "$_z_out" "$_z_name" ); then
+  if ! ( cd "$_z_stage" && run_echoed zip -qr "$_z_out" "$_z_name" ); then
     rm -rf "$_z_stage"
     fatal "zip: could not write '$_z_out'" 1
   fi
@@ -11630,11 +11630,11 @@ cmd_purge() {
   _pg_rc=0
   if command -v git-filter-repo >/dev/null 2>&1; then
     log_medium "using git-filter-repo"
-    ( cd "$_pg_tmp/rw.git" && run git filter-repo --force --invert-paths --path "$_pg_rel" ) || _pg_rc=1
+    ( cd "$_pg_tmp/rw.git" && run_echoed git filter-repo --force --invert-paths --path "$_pg_rel" ) || _pg_rc=1
   else
     log_medium "using git filter-branch (git-filter-repo not installed; slower)"
     ( cd "$_pg_tmp/rw.git" \
-      && FILTER_BRANCH_SQUELCH_WARNING=1 run git filter-branch --force \
+      && FILTER_BRANCH_SQUELCH_WARNING=1 run_echoed git filter-branch --force \
            --index-filter "git rm -r --cached --ignore-unmatch -- $(shell_escape "$_pg_rel")" \
            --prune-empty --tag-name-filter cat -- --all ) || _pg_rc=1
     log_medium "dropping refs/original/ and expiring the reflog so the old objects become unreferenced"
@@ -11645,7 +11645,7 @@ cmd_purge() {
       git for-each-ref --format='%(refname)' refs/original/ 2>/dev/null | while IFS= read -r _pg_r; do
         [ -n "$_pg_r" ] && git update-ref -d "$_pg_r" 2>/dev/null
       done
-      run git reflog expire --expire=now --all >/dev/null 2>&1 )
+      run_echoed git reflog expire --expire=now --all >/dev/null 2>&1 )
   fi
 
   # --prune-empty drops commits that become empty. If EVERY commit touched
@@ -11671,11 +11671,11 @@ cmd_purge() {
   mv "$_pg_tmp/rw.git" "$_pg_repo/.git" \
     || fatal "purge: could not move the rewritten gitdir into place — the original is at $_pg_backup" 1
   rm -rf "$_pg_tmp"
-  ( cd "$_pg_repo" && run git reset -q --mixed >/dev/null 2>&1 ) \
+  ( cd "$_pg_repo" && run_echoed git reset -q --mixed >/dev/null 2>&1 ) \
     || log_warn "purge: index rebuild reported a problem — run 'git -C $_pg_repo reset' by hand"
 
   log_medium "repacking to actually reclaim the space"
-  ( cd "$_pg_repo" && run git gc --prune=now --aggressive >/dev/null 2>&1 ) \
+  ( cd "$_pg_repo" && run_echoed git gc --prune=now --aggressive >/dev/null 2>&1 ) \
     || log_warn "purge: gc reported a problem — the rewrite itself succeeded; re-run 'git gc --prune=now' by hand"
 
   _pg_after=$(du -sm "$_pg_repo/.git" 2>/dev/null | awk '{print $1}')
@@ -12019,11 +12019,11 @@ cmd_stamp_version() {
      || ! grep -q "^SCRIPT_RELEASE=\"$_sv_desc\"\$" "$_sv_tmp" 2>/dev/null; then
     rm -f "$_sv_tmp"; fatal "stamp-version: the rewritten file carries no stamp -- refusing to install it" 1
   fi
-  run mv -f "$_sv_tmp" "$_sv_self" \
+  run_echoed mv -f "$_sv_tmp" "$_sv_self" \
     || { rm -f "$_sv_tmp"; fatal "stamp-version: could not move the stamped file into place" 1; }
-  run git -c safe.directory='*' -C "$_sv_top" add -- "$_sv_rel" \
+  run_echoed git -c safe.directory='*' -C "$_sv_top" add -- "$_sv_rel" \
     || fatal "stamp-version: could not stage $_sv_rel" 1
-  run git -c safe.directory='*' -C "$_sv_top" commit -q --amend --no-edit \
+  run_echoed git -c safe.directory='*' -C "$_sv_top" commit -q --amend --no-edit \
     || fatal "stamp-version: could not amend the release commit" 1
   _sv_new=$(git -c safe.directory='*' -C "$_sv_top" rev-parse --short HEAD 2>/dev/null)
   log_ok "stamp-version: $_sv_rel stamped $_sv_sha${_sv_desc:+ ($_sv_desc)} -- HEAD is now $_sv_new"
@@ -12141,7 +12141,7 @@ cmd_rehydrate() {
         # the outside, and discarding the error turned a root-owned
         # .git/objects -- so 'me' could not unpack what it had just
         # downloaded -- into a silent "nothing to repair" on a whole machine.
-        if ! _rh_ferr=$(run git -C "$_rh_p" fetch -q --all --prune </dev/null 2>&1); then
+        if ! _rh_ferr=$(run_echoed git -C "$_rh_p" fetch -q --all --prune </dev/null 2>&1); then
           log_warn "rehydrate: $_rh_p — fetch FAILED, so a matching commit may exist that cannot be seen from here: $(printf '%s' "$_rh_ferr" | tail -n 2 | tr '\n' ' ')"
         fi
         _rh_m=$(wt_matches_commit "$_rh_p" 2>/dev/null </dev/null) || _rh_m=""
@@ -12216,10 +12216,10 @@ _RH_EOF
         # live only there (a fork branch upstream has never heard of), which
         # is why fetching from whatever the repo already had found nothing.
         if [ -n "$_al_u" ]; then
-          run git -C "$_al_p" remote set-url origin "$_al_u" >/dev/null 2>&1 </dev/null \
+          run_echoed git -C "$_al_p" remote set-url origin "$_al_u" >/dev/null 2>&1 </dev/null \
             || log_warn "rehydrate: $_al_p — could not point origin at $_al_u"
         fi
-        if ! _al_err=$(run git -C "$_al_p" fetch -q --all --prune </dev/null 2>&1); then
+        if ! _al_err=$(run_echoed git -C "$_al_p" fetch -q --all --prune </dev/null 2>&1); then
           log_warn "rehydrate: $_al_p — fetch FAILED, so the recorded branch may exist but be unreachable from here: $(printf '%s' "$_al_err" | tail -n 2 | tr '\n' ' ')"
           continue
         fi
@@ -12235,11 +12235,11 @@ _RH_EOF
         # the same primitive the wrong-commit repair uses, which is what makes
         # this safe on a worktree the container also tracks.
         if [ -n "$_al_b" ]; then
-          run git -C "$_al_p" symbolic-ref HEAD "refs/heads/$_al_b" >/dev/null 2>&1 </dev/null \
+          run_echoed git -C "$_al_p" symbolic-ref HEAD "refs/heads/$_al_b" >/dev/null 2>&1 </dev/null \
             || { log_fail "rehydrate: $_al_p — could not switch to branch $_al_b"; continue; }
         fi
-        if run git -C "$_al_p" reset -q --mixed "$_al_c" >/dev/null 2>&1 </dev/null; then
-          run git -C "$_al_p" branch --set-upstream-to="origin/$_al_b" "$_al_b" >/dev/null 2>&1 </dev/null || true
+        if run_echoed git -C "$_al_p" reset -q --mixed "$_al_c" >/dev/null 2>&1 </dev/null; then
+          run_echoed git -C "$_al_p" branch --set-upstream-to="origin/$_al_b" "$_al_b" >/dev/null 2>&1 </dev/null || true
           log_ok "rehydrate: $_al_p — now on ${_al_b:-its recorded branch} at the commit its files are ($(printf '%s' "$_al_c" | cut -c1-9))"
           _rh_naligned=$((${_rh_naligned:-0}+1))
         else
@@ -12260,7 +12260,7 @@ _RH_EOF
     if [ "$_rh_mode" = go ]; then
       while IFS="$(printf '\t')" read -r _rf_p _rf_c <&8; do
         [ -n "$_rf_p" ] || continue
-        if run git -C "$_rf_p" reset -q --mixed "$_rf_c" >/dev/null 2>&1; then
+        if run_echoed git -C "$_rf_p" reset -q --mixed "$_rf_c" >/dev/null 2>&1; then
           log_ok "rehydrate: $_rf_p — HEAD moved to the commit its files are ($(printf '%s' "$_rf_c" | cut -c1-9))"
         else
           log_fail "rehydrate: $_rf_p — could not move HEAD to $_rf_c"
@@ -12289,7 +12289,7 @@ _RH_EOF
     if [ "$_rh_mode" = go ]; then
       while IFS="$(printf '\t')" read -r _rp_p _rp_ref _rp_br <&8; do
         [ -n "$_rp_p" ] || continue
-        if ! run git init -q "$_rp_p" >/dev/null 2>&1 </dev/null; then
+        if ! run_echoed git init -q "$_rp_p" >/dev/null 2>&1 </dev/null; then
           log_fail "rehydrate: $_rp_p — could not start a repo there"; _rh_fail=$((${_rh_fail:-0}+1)); continue
         fi
         give_to_owner "$_rp_p/.git"
@@ -12297,12 +12297,12 @@ _RH_EOF
         # Park HEAD before fetching: git refuses to fetch into the branch
         # HEAD points at, and 'git init' points it at the default name --
         # which is usually the very branch being restored.
-        run git -C "$_rp_p" symbolic-ref HEAD refs/heads/__my-git-rehydrate >/dev/null 2>&1 </dev/null
-        if ! run git -C "$_rp_p" fetch -q "$_rh_top" "$_rp_ref:refs/heads/$_rp_br" >/dev/null 2>&1 </dev/null; then
+        run_echoed git -C "$_rp_p" symbolic-ref HEAD refs/heads/__my-git-rehydrate >/dev/null 2>&1 </dev/null
+        if ! run_echoed git -C "$_rp_p" fetch -q "$_rh_top" "$_rp_ref:refs/heads/$_rp_br" >/dev/null 2>&1 </dev/null; then
           log_fail "rehydrate: $_rp_p — could not take $_rp_ref out of $_rh_top"
           rm -rf "$_rp_p/.git"; _rh_fail=$((${_rh_fail:-0}+1)); continue
         fi
-        run git -C "$_rp_p" symbolic-ref HEAD "refs/heads/$_rp_br" >/dev/null 2>&1 </dev/null
+        run_echoed git -C "$_rp_p" symbolic-ref HEAD "refs/heads/$_rp_br" >/dev/null 2>&1 </dev/null
         # The marker is the container's record, not this repo's: exclude it
         # before anything hashes the worktree, or no commit can ever match.
         _shadow_exclude_marker "$_rp_p" "$_rh_top" || true
@@ -12311,7 +12311,7 @@ _RH_EOF
         # than showing its whole content as uncommitted.
         _rp_at=$(wt_matches_commit "$_rp_p" 2>/dev/null </dev/null) || _rp_at=""
         [ -n "$_rp_at" ] || _rp_at="refs/heads/$_rp_br"
-        if run git -C "$_rp_p" reset -q --mixed "$_rp_at" >/dev/null 2>&1 </dev/null; then
+        if run_echoed git -C "$_rp_p" reset -q --mixed "$_rp_at" >/dev/null 2>&1 </dev/null; then
           log_ok "rehydrate: $_rp_p — history restored from $_rh_top ($(run_as_owner_capture "$_rp_p" git rev-list --count HEAD 2>/dev/null || echo '?') commit(s), on $_rp_br)"
           _rh_ok=$((${_rh_ok:-0}+1))
         else
@@ -12349,11 +12349,11 @@ _RH_EOF
     _rh_work=$(mktemp -d "${TMPDIR:-/tmp}/${US}.rhclone.XXXXXX") || { log_error "$_rh_p: mktemp -d failed"; _rh_fail=$((_rh_fail+1)); continue; }
     # --no-checkout: we want the HISTORY, never the files. The container's
     # copy of the worktree is the one to keep.
-    if ! run git clone -q --no-checkout "$_rh_url" "$_rh_work/c" 2>/dev/null; then
+    if ! run_echoed git clone -q --no-checkout "$_rh_url" "$_rh_work/c" 2>/dev/null; then
       log_fail "rehydrate: $_rh_p — could not clone $_rh_url (unreachable or no access); files left untouched"
       rm -rf "$_rh_work"; _rh_fail=$((_rh_fail+1)); continue
     fi
-    if ! run mv -- "$_rh_work/c/.git" "$_rh_p/.git"; then
+    if ! run_echoed mv -- "$_rh_work/c/.git" "$_rh_p/.git"; then
       log_fail "rehydrate: $_rh_p — could not move the cloned .git into place"
       rm -rf "$_rh_work"; _rh_fail=$((_rh_fail+1)); continue
     fi
@@ -12364,7 +12364,7 @@ _RH_EOF
     # sync the index to it -- so the files stay as the container had them
     # and any difference from upstream reads as uncommitted changes.
     if [ -n "$_rh_br" ] && git -C "$_rh_p" rev-parse -q --verify "refs/heads/$_rh_br" >/dev/null 2>&1; then
-      run git -C "$_rh_p" symbolic-ref HEAD "refs/heads/$_rh_br" 2>/dev/null || true
+      run_echoed git -C "$_rh_p" symbolic-ref HEAD "refs/heads/$_rh_br" 2>/dev/null || true
     fi
     # The clone brought no .git/info/exclude, so re-apply the marker
     # exclusion FIRST: it keeps .git.shadow.status out of the drift count,
@@ -12394,9 +12394,9 @@ _RH_EOF
     # worktree measured against a 2026 HEAD.
     _rh_at=$(wt_matches_commit "$_rh_p" 2>/dev/null) || _rh_at=""
     if [ -n "$_rh_at" ]; then
-      run git -C "$_rh_p" reset -q --mixed "$_rh_at" >/dev/null 2>&1 || true
+      run_echoed git -C "$_rh_p" reset -q --mixed "$_rh_at" >/dev/null 2>&1 || true
     else
-      run git -C "$_rh_p" reset -q --mixed >/dev/null 2>&1 || true
+      run_echoed git -C "$_rh_p" reset -q --mixed >/dev/null 2>&1 || true
     fi
     _rh_drift=$(git -C "$_rh_p" status --porcelain 2>/dev/null | grep -c .)
     log_ok "rehydrate: $_rh_p — repo restored ($(git -C "$_rh_p" rev-list --count HEAD 2>/dev/null) commits, branch $(git -C "$_rh_p" symbolic-ref --short -q HEAD 2>/dev/null); $_rh_drift file(s) differ from upstream)"
@@ -12888,7 +12888,7 @@ cmd_install() {
       _install_line "$_in_r" "NEEDS YOU -- missing, and GIT_REPOS_REMOTES names no URL to clone it from"
       _in_you=$((_in_you + 1))
     elif [ "$_in_mode" = go ]; then
-      if _in_err=$(run git clone -q "$_in_u" "$_in_r" 2>&1 </dev/null); then
+      if _in_err=$(run_echoed git clone -q "$_in_u" "$_in_r" 2>&1 </dev/null); then
         _install_line "$_in_r" "cloned from $_in_u$(_install_into "$_in_r")"
         give_to_owner "$_in_r"
         setup_mode_for "$_in_r"
@@ -13310,11 +13310,11 @@ _do_sidecar_audit() {
             IFS=$_sa_oifs
             for _bd in "$@"; do
               [ -n "$_bd" ] || continue
-              run git rm -r --cached -q -- "$_bd" >/dev/null 2>&1 || true
+              run_echoed git rm -r --cached -q -- "$_bd" >/dev/null 2>&1 || true
             done
             # plain commit: index holds ONLY our staged removals (verified
             # clean above), so nothing unrelated can ride along.
-            run git commit -q -m "my-git repair: stop tracking sidecar internals as content" >/dev/null 2>&1 || true )
+            run_echoed git commit -q -m "my-git repair: stop tracking sidecar internals as content" >/dev/null 2>&1 || true )
           log_major "  fixed: untracked $_sa_bd sidecar object-DB dir(s) from the parent index (committed; files kept on disk)"
         fi
       else
@@ -13339,7 +13339,7 @@ _do_sidecar_audit() {
       /*)
         _SA_ISSUES=$((_SA_ISSUES + 1))
         if [ "$_sa_apply" = 1 ]; then
-          run git config --file "$_sa_gd/config" core.worktree ".." 2>/dev/null \
+          run_echoed git config --file "$_sa_gd/config" core.worktree ".." 2>/dev/null \
             && log_major "  fixed: $_sc core.worktree '$_sa_cw' -> '..' (portable)"
         else
           log_major "  ISSUE: $_sc core.worktree is absolute ('$_sa_cw') — not portable; repair sets it to '..'"
@@ -13377,8 +13377,8 @@ _do_sidecar_audit() {
           && _sa_status_note=" (including its $_sa_grd.status)"
         if [ "$_sa_apply" = 1 ]; then
           ( cd "$_sa_top" 2>/dev/null || exit 0
-            run git add -- "$_sc" >/dev/null 2>&1
-            run git commit -q -m "my-git repair: track sidecar content in the parent" -- "$_sc" >/dev/null 2>&1 || true )
+            run_echoed git add -- "$_sc" >/dev/null 2>&1
+            run_echoed git commit -q -m "my-git repair: track sidecar content in the parent" -- "$_sc" >/dev/null 2>&1 || true )
           log_major "  fixed: $_sc: staged+committed $_sa_untracked_n untracked sidecar file(s)$_sa_status_note"
         else
           log_major "  ISSUE: $_sc: $_sa_untracked_n file(s) under it NOT tracked by the parent$_sa_status_note — sidecar content not fully captured (repair 'git add's them)"
@@ -15917,7 +15917,7 @@ _mc_reject_paths() {
 _sm_safe_git() {
   _repo=$1; shift
   _sg_log=$(mktemp "${TMPDIR:-/tmp}/safegit.XXXXXX")
-  run git "$@" 2>"$_sg_log"
+  run_echoed git "$@" 2>"$_sg_log"
   _sg_rc=$?
   if [ "$_sg_rc" -ne 0 ] && [ "$SM_AUTO_SAFE_DIRECTORY" -eq 1 ] \
      && grep -q 'detected dubious ownership' "$_sg_log" 2>/dev/null; then
@@ -15931,7 +15931,7 @@ _sm_safe_git() {
     # permission and leaves nothing behind, which is what the rest of this file
     # already does (see the -c safe.directory calls in the worktree helpers).
     printf 'INFO   retrying with a one-shot safe.directory for %s\n' "$_abs" >&2
-    run git -c safe.directory="$_abs" "$@" 2>"$_sg_log"
+    run_echoed git -c safe.directory="$_abs" "$@" 2>"$_sg_log"
     _sg_rc=$?
   fi
   cat "$_sg_log" >&2
@@ -16082,7 +16082,7 @@ _sm_persist_url_change() {
     return 0
   fi
   if ! git config -f "$_pc_cfg" remote.origin.url "$_pc_new" 2>/dev/null; then
-    run git config -f "$_pc_cfg" --add remote.origin.url "$_pc_new" 2>/dev/null || {
+    run_echoed git config -f "$_pc_cfg" --add remote.origin.url "$_pc_new" 2>/dev/null || {
       printf 'WARN  could not write remote.origin.url to %s\n' "$_pc_cfg" >&2
       return 1
     }
@@ -16104,7 +16104,7 @@ _sm_remove_gitmodules_entry() {
       /^\[/ { skip = ($0 == want) ? 1 : 0 }
       skip == 0 { print }
   ' .gitmodules > "$_rge_tmp"; then
-    run mv -- "$_rge_tmp" .gitmodules
+    run_echoed mv -- "$_rge_tmp" .gitmodules
   else
     rm -f "$_rge_tmp"
     return 1
@@ -16277,18 +16277,18 @@ _sm_try_preserve_rebind() {
   # Move gitdir to its canonical super-repo location.
   _pr_newdir=${_pr_new_gd%/*}
   mkdir -p "$_pr_newdir" || return 1
-  run mv -- "$_pr_src" "$_pr_new_gd" || return 1
+  run_echoed mv -- "$_pr_src" "$_pr_new_gd" || return 1
   # For the stale/pointer cases the remaining <sp>/.git is an old pointer
   # (or a now-stale pointer file to the place we just emptied). For the
   # embedded case, the mv above already took <sp>/.git away.
   [ -e "$_pr_sp/.git" ] && rm -rf -- "$_pr_sp/.git" 2>/dev/null
   printf 'gitdir: %s.git/modules/%s\n' "$_pr_up" "$_pr_sp" > "$_pr_sp/.git" || {
     # Roll back: move gitdir back where it came from.
-    run mv -- "$_pr_new_gd" "$_pr_src" 2>/dev/null || true
+    run_echoed mv -- "$_pr_new_gd" "$_pr_src" 2>/dev/null || true
     return 1
   }
   # Fix up the moved gitdir's config.
-  run git config -f "$_pr_new_gd/config" core.worktree "${_pr_wt_up}${_pr_sp}" || true
+  run_echoed git config -f "$_pr_new_gd/config" core.worktree "${_pr_wt_up}${_pr_sp}" || true
   [ -n "$_pr_url" ] && git config -f "$_pr_new_gd/config" remote.origin.url "$_pr_url" || true
   # Update .gitmodules: drop old entry, append new.
   if [ -f "$_sm_toplevel/.gitmodules" ]; then
@@ -16301,10 +16301,10 @@ _sm_try_preserve_rebind() {
   } >> "$_sm_toplevel/.gitmodules"
   # Update the superproject index.
   if git ls-files --error-unmatch -- "$_pr_old" >/dev/null 2>&1; then
-    run git update-index --force-remove -- "$_pr_old" 2>/dev/null || true
+    run_echoed git update-index --force-remove -- "$_pr_old" 2>/dev/null || true
     _sm_record_change "$_pr_old"
   fi
-  run git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
+  run_echoed git add -- "$_sm_toplevel/.gitmodules" "$_pr_sp" 2>/dev/null || true
   _sm_record_change ".gitmodules"
   _sm_record_change "$_pr_sp"
   return 0
@@ -16446,14 +16446,14 @@ _unsm_one() {
   elif [ -e "$_uso_gp" ]; then
     # gitfile pointer (absorbed layout): move the real gitdir back into place.
     [ -d "$_uso_absorbed" ] || { log_error "unsm: $_uso_sub: gitfile points away but $_uso_absorbed is missing — history not found, cannot de-absorb"; return 1; }
-    run rm -f -- "$_uso_gp" || { log_error "unsm: $_uso_sub: removing gitfile pointer failed"; return 1; }
-    if ! run mv -- "$_uso_absorbed" "$_uso_gp"; then
+    run_echoed rm -f -- "$_uso_gp" || { log_error "unsm: $_uso_sub: removing gitfile pointer failed"; return 1; }
+    if ! run_echoed mv -- "$_uso_absorbed" "$_uso_gp"; then
       log_error "unsm: $_uso_sub: mv $_uso_absorbed -> $_uso_gp failed"; return 1
     fi
     # A plain <sub>/.git needs no core.worktree/core.bare override (same as
     # unflatten --sidecar) — the old values pointed at the modules/ location.
-    run git config --file "$_uso_gp/config" --unset core.worktree 2>/dev/null || true
-    run git config --file "$_uso_gp/config" --unset core.bare 2>/dev/null || true
+    run_echoed git config --file "$_uso_gp/config" --unset core.worktree 2>/dev/null || true
+    run_echoed git config --file "$_uso_gp/config" --unset core.bare 2>/dev/null || true
     log_medium "unsm  $_uso_sub  (de-absorbed $_uso_absorbed -> $_uso_sub/.git)"
   else
     log_error "unsm: $_uso_sub: no .git present — not a live submodule worktree (run 'git submodule update --init' first?)"; return 1
@@ -16461,16 +16461,16 @@ _unsm_one() {
 
   # ── Remove the registration + gitlink, staged for the caller's commit ──
   ( cd "$_uso_parent" || exit 1
-    run git config -f .gitmodules --remove-section "submodule.$_uso_name" 2>/dev/null || true
-    run git config --remove-section "submodule.$_uso_name" 2>/dev/null || true
+    run_echoed git config -f .gitmodules --remove-section "submodule.$_uso_name" 2>/dev/null || true
+    run_echoed git config --remove-section "submodule.$_uso_name" 2>/dev/null || true
     # Drop the gitlink from the index (worktree keeps its now-live .git).
-    run git rm --cached -q -- "$_uso_sub" >/dev/null 2>&1 \
-      || run git update-index --force-remove -- "$_uso_sub" >/dev/null 2>&1 || true
+    run_echoed git rm --cached -q -- "$_uso_sub" >/dev/null 2>&1 \
+      || run_echoed git update-index --force-remove -- "$_uso_sub" >/dev/null 2>&1 || true
     # If no submodule sections remain, the .gitmodules file itself is cruft.
     if [ -f .gitmodules ] && ! git config -f .gitmodules --get-regexp '^submodule\.' >/dev/null 2>&1; then
-      run git rm -f -q -- .gitmodules >/dev/null 2>&1 || run _rm_user .gitmodules
+      run_echoed git rm -f -q -- .gitmodules >/dev/null 2>&1 || run_echoed _rm_user .gitmodules
     else
-      run git add -- .gitmodules >/dev/null 2>&1 || true
+      run_echoed git add -- .gitmodules >/dev/null 2>&1 || true
     fi
   )
   return 0
@@ -16505,7 +16505,7 @@ _unsm_flush_parent() {
   if [ -n "$_un_cur_pre" ]; then
     log_warn "unsm: $_un_cur had pre-existing staged changes — de-registration left STAGED (commit it yourself so nothing unrelated is swept in)"
   else
-    ( cd "$_un_cur" && run git commit -q -m "my-git unsm: de-registered submodule(s) -> raw-nested-git (dropped .gitmodules + gitlink, de-absorbed .git)" >/dev/null 2>&1 ) \
+    ( cd "$_un_cur" && run_echoed git commit -q -m "my-git unsm: de-registered submodule(s) -> raw-nested-git (dropped .gitmodules + gitlink, de-absorbed .git)" >/dev/null 2>&1 ) \
       || log_warn "unsm: commit in $_un_cur failed — de-registration left staged"
   fi
   _un_cur=""; _un_cur_changed=0
@@ -16842,9 +16842,9 @@ _sm_run_here() {
         esac
       fi
       printf '    removing .gitmodules entry, .git/config entry, index entry, .git/modules/%s\n' "$_cs_name" >&2
-      run git config -f .gitmodules --remove-section "submodule.$_cs_name" 2>/dev/null || true
-      run git config --remove-section "submodule.$_cs_name" 2>/dev/null || true
-      run git update-index --force-remove -- "$_cs_sp" 2>/dev/null || true
+      run_echoed git config -f .gitmodules --remove-section "submodule.$_cs_name" 2>/dev/null || true
+      run_echoed git config --remove-section "submodule.$_cs_name" 2>/dev/null || true
+      run_echoed git update-index --force-remove -- "$_cs_sp" 2>/dev/null || true
       [ -n "$_cs_name" ] && rm -rf -- ".git/modules/$_cs_name" 2>/dev/null || true
       _cs_removed=$((_cs_removed + 1))
     done <<_CS_EOF
@@ -16852,15 +16852,15 @@ $_cs_stale
 _CS_EOF
     if [ "$_cs_removed" -gt 0 ]; then
       if [ -f .gitmodules ] && ! git config -f .gitmodules --get-regexp '^submodule\..*\.path$' >/dev/null 2>&1; then
-        run git update-index --force-remove -- .gitmodules 2>/dev/null || true
-        run _rm_user .gitmodules
+        run_echoed git update-index --force-remove -- .gitmodules 2>/dev/null || true
+        run_echoed _rm_user .gitmodules
       else
-        run git add -- .gitmodules 2>/dev/null || true
+        run_echoed git add -- .gitmodules 2>/dev/null || true
       fi
       if git diff --cached --quiet 2>/dev/null; then
         printf '    nothing to commit in %s (no net diff vs HEAD)\n' "$(pwd -P)" >&2
       else
-        run git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)" || \
+        run_echoed git commit -q -m "my-git sm --clean-stale: removed $_cs_removed stale registration(s)" || \
           { log_error "commit failed in $(pwd -P)"; echo 0; return 1; }
         printf '    committed in %s\n' "$(pwd -P)" >&2
       fi
@@ -16975,7 +16975,7 @@ _CS_EOF
     echo
     printf '%s\n' "$_to_unstage" | while IFS= read -r _p; do
       printf 'UNSTAGE  %s\n' "$_p"
-      run git update-index --force-remove -- "$_p" >/dev/null 2>&1 || {
+      run_echoed git update-index --force-remove -- "$_p" >/dev/null 2>&1 || {
         printf 'WARN  git update-index --force-remove failed for %s\n' "$_p" >&2
       }
     done
@@ -17014,8 +17014,8 @@ _CS_EOF
     _rc=$?
     if [ -n "$INFLIGHT_TMP" ] && [ -e "$INFLIGHT_TMP" ]; then
       printf 'RECOVER  restoring %s <- %s\n' "$INFLIGHT_ORIG" "$INFLIGHT_TMP" >&2
-      run rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
-      run mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
+      run_echoed rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
+      run_echoed mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
     fi
     rm -f "$_sm_tmpfile" "$_sm_plan" 2>/dev/null || true
     trap - EXIT
@@ -17526,7 +17526,7 @@ _CS_EOF
       log_warn "$_sp: kept $_dd_gd, a second gitdir beside $_sp/.git: it holds commits $_sp lacks (on:$_dd_lacks)"
       return 0
     fi
-    run _rm_user "$_dd_gd" || { log_warn "$_sp: the second gitdir $_dd_gd is left in place"; return 0; }
+    run_echoed _rm_user "$_dd_gd" || { log_warn "$_sp: the second gitdir $_dd_gd is left in place"; return 0; }
     printf '    > trashed %s: a second gitdir of the same repo -- %s/.git is the one in use\n' "$_dd_gd" "$_sp"
   }
 
@@ -17844,7 +17844,7 @@ _CS_EOF
           # Its core.worktree names <path>, which is moved aside right now; none
           # of these calls needs a worktree, so the gitdir stands in for one.
           _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
-          if ! run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" fetch -q origin 2>"$_errlog"; then
+          if ! run_echoed git --git-dir="$_sm_gd" --work-tree="$_sm_gd" fetch -q origin 2>"$_errlog"; then
             cat "$_errlog" >&2
             rm -f "$_errlog"
             printf 'ERROR  git submodule add failed for %s (reason: gitdir of the same repo, and fetching into it failed)\n' "$_sp" >&2
@@ -17856,8 +17856,8 @@ _CS_EOF
               | awk '$1 == "ref:" { sub("^refs/heads/", "", $2); print $2; exit }')
             if [ -n "$_sm_gd_br" ] \
                && git --git-dir="$_sm_gd" --work-tree="$_sm_gd" rev-parse -q --verify "refs/remotes/origin/$_sm_gd_br" >/dev/null 2>&1; then
-              run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" update-ref "refs/heads/$_sm_gd_br" "refs/remotes/origin/$_sm_gd_br"
-              run git --git-dir="$_sm_gd" --work-tree="$_sm_gd" symbolic-ref HEAD "refs/heads/$_sm_gd_br"
+              run_echoed git --git-dir="$_sm_gd" --work-tree="$_sm_gd" update-ref "refs/heads/$_sm_gd_br" "refs/remotes/origin/$_sm_gd_br"
+              run_echoed git --git-dir="$_sm_gd" --work-tree="$_sm_gd" symbolic-ref HEAD "refs/heads/$_sm_gd_br"
               printf '    > its HEAD was a branch yet to be born (cloned while the remote was empty): fetched, %s now at origin/%s\n' \
                 "$_sm_gd_br" "$_sm_gd_br"
             fi
@@ -18486,7 +18486,7 @@ _CS_EOF
 cmd_run_tests() {
   # Every test spawns THIS script as a real subprocess for its actual
   # subcommand calls (flatten go, status, ...) — those subprocesses go
-  # through the normal main()/load_config() path and would otherwise
+  # through the normal my_git_main()/load_config() path and would otherwise
   # trigger install_zsh_completions() against the REAL $HOME, breaking
   # --run-tests' own "touches nothing of yours" promise even though the
   # top-level --run-tests entry point itself never reaches that call
@@ -20248,7 +20248,7 @@ test_flatten_sidecar_status_file_fields() {
 }
 
 test_verbose_trace_survives_stderr_redirect() {
-  # Regression: run()'s trace previously went to plain stderr, which
+  # Regression: run_echoed()'s trace previously went to plain stderr, which
   # got silently swallowed whenever a caller redirected stderr to
   # capture a command's own error text (e.g. flatten's git-add /
   # git-commit steps redirect 2> to a temp errlog). Fixed via a
@@ -20489,7 +20489,7 @@ test_zsh_completions_self_install_on_real_subcommand_not_on_run_tests() {
   # completions actually get deployed) but NEVER for --run-tests
   # itself (which promises "touches nothing of yours") or --help /
   # --create-config (neither needs a real repo or config at all) --
-  # it's called from inside main(), deliberately placed AFTER those
+  # it's called from inside my_git_main(), deliberately placed AFTER those
   # early exits, not unconditionally at the very top of the script.
   _rt_repo global
   _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
@@ -26080,7 +26080,7 @@ test_flatten_zip_keep_and_plain_git() {
 
 test_vv_traces_discovery_finds() {
   # -VV must show the discovery 'find' commands (HOW repos are located) —
-  # they run inside subshells/pipelines that run() can't wrap, so they get
+  # they run inside subshells/pipelines that run_echoed() can't wrap, so they get
   # an explicit trace(). Without it, -VV listed repos with no command to
   # explain them. The trace goes to fd 3 (dup of stderr) -> _rt_err.
   _rt_repo top
@@ -28246,7 +28246,7 @@ test_run_list_registers_every_defined_test() {
 }
 
 
-main() {
+my_git_main() {
   # ─── Pre-dispatch: peel globals / --config / --create-config / --help ───
   _want_create_config=0
   _create_config_path=""
@@ -28696,4 +28696,4 @@ COMPLETION_EOF
   fi
 }
 
-main "$@"
+my_git_main "$@"

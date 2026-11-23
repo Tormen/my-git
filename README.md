@@ -846,7 +846,7 @@ green, `DIRTY (...)` / `[ABORT ...]` in yellow, `ERROR`/`FAIL` in red.
 **Grey command trace (`-V`)**: every subprocess my-git runs (git, sudo,
 mv, ln, …) is echoed as `$ <cmd>` in dim grey to stderr **before** it
 executes. Mirrors [my-appleRAID](../my-appleRAID/my-appleRAID)'s
-`run()` helper. Stderr placement keeps `$()` captures clean — pipe
+`run_echoed()` helper. Stderr placement keeps `$()` captures clean — pipe
 stdout anywhere, the trace still shows on your terminal.
 
 Colors are **TTY-gated**: on non-TTY stdout (pipes, redirects, capture
@@ -1591,7 +1591,7 @@ whoever knows the project.
 
 ## Extending
 
-Subcommands are dispatched in `main()` via a single `case` on `cmd_*`
+Subcommands are dispatched in `my_git_main()` via a single `case` on `cmd_*`
 function names. To add one: write a `cmd_foo()` function plus a
 `show_help_foo()` page, then register both in the dispatcher. The logging
 helpers (`log_major`, `log_medium`, `log_minor`, `log_dbg_*`) and the
