@@ -26,6 +26,8 @@ cmd_commit	test_commit_uses_your_message_where_mc_generates_one	runs my-git comm
 cmd_commit	test_commit_without_a_message_names_mc	runs my-git commit
 cmd_diff	test_diff_handles_a_side_that_does_not_exist	runs my-git diff
 cmd_diff	test_diff_writes_both_sides_with_names_that_say_which_is_which	runs my-git diff
+cmd_diff	test_tmp_hygiene_cleans_up_on_interrupt	runs my-git diff
+cmd_diff	test_tmp_hygiene_removes_scratch_on_exit	runs my-git diff
 cmd_flatten	test_audit_and_repair_search_only_where_they_may	runs my-git fl
 cmd_flatten	test_audit_and_repair_sidecar_setup	runs my-git fl
 cmd_flatten	test_audit_repair_sidecar_untracked_content	runs my-git fl
@@ -194,6 +196,7 @@ cmd_rehydrate	test_rehydrate_repairs_a_restored_repo_left_at_the_wrong_commit	ru
 cmd_rehydrate	test_rehydrate_restores_a_local_only_repo_from_what_the_container_kept	runs my-git rehydrate
 cmd_rehydrate	test_rehydrate_restores_an_old_checkout_clean_not_as_phantom_changes	runs my-git rehydrate
 cmd_rehydrate	test_shadow_hook_marker_merges_cleanly_between_two_machines	runs my-git rehydrate
+cmd_rehydrate	test_tmp_hygiene_removes_scratch_on_exit	runs my-git rehydrate
 cmd_remote	test_a_bare_remote_go_made_can_be_cloned	runs my-git rem
 cmd_remote	test_a_repo_my_git_sets_up_gets_the_mode_asked_for	runs my-git rem
 cmd_remote	test_discovered_nesting_needs_permission_but_declared_never_does	runs my-git rem
@@ -377,6 +380,7 @@ cmd_status	test_st_warns_when_a_marker_records_a_stale_remote	runs my-git s
 cmd_status	test_st_warns_when_your_github_remote_is_https	runs my-git s
 cmd_status	test_st_writes_no_tracked_file_while_self_healing	runs my-git s
 cmd_status	test_toplevel_across_a_symlink_into_another_repo	runs my-git s
+cmd_status	test_tmp_hygiene_sweeps_stale_at_start	runs my-git st
 cmd_status	test_unshadow_undoes_a_shadowed_path_whose_repo_is_gone	runs my-git s
 cmd_status	test_unsm_deregisters_submodule_to_raw_nested_git	runs my-git s
 cmd_status	test_verbosity_axes_V_vs_VV_vs_D	runs my-git s
@@ -405,7 +409,9 @@ cmd_submodules	test_sm_searches_only_where_it_may_but_a_named_path_always_works	
 cmd_submodules	test_sm_sidecared_submodule_not_flagged_stale	runs my-git sm
 cmd_submodules	test_sm_untrack_then_add	runs my-git sm
 cmd_submodules	test_target_repo_banner_names_the_receiving_repo	runs my-git sm
+cmd_submodules	test_tmp_hygiene_removes_scratch_on_exit	runs my-git sm
 cmd_sync	test_pp_and_sync_take_the_same_scope	runs my-git syn
+cmd_sync	test_tmp_hygiene_removes_scratch_on_exit	runs my-git sync
 cmd_unflatten	test_flatten_i_zip_choice_archives_via_menu	runs my-git unfl
 cmd_unflatten	test_flatten_merge_unflatten_merge_full_round_trip	runs my-git unfl
 cmd_unflatten	test_flatten_zip_keep_and_plain_git	runs my-git unfl
