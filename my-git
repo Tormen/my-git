@@ -939,19 +939,155 @@ _init_stat_flavour() {
   if stat -c '%U' / >/dev/null 2>&1; then _STAT_OWNER_MODE=gnu; else _STAT_OWNER_MODE=bsd; fi
 }
 
-# ONE scratch file for every run_as_owner_capture stderr, for the whole run.
-# It used to mktemp per call and then grep + cat + rm it -- four processes
-# each, ~1,100 over an 'st' of a big tree, to inspect a file that is empty
-# almost every time. Created here, in the PARENT shell, so the subshells that
-# do the capturing inherit the name instead of each making their own.
-#
-# No truncation needed: every capture redirects with '2>', which truncates.
-# Nothing nests, either -- what runs under the capture is git or find, never
-# my-git -- so one file per run cannot collide with itself.
-_init_raoc_errfile() {
-  _RAOC_ERRFILE=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _RAOC_ERRFILE=""
-  [ -n "$_RAOC_ERRFILE" ] && trap 'rm -f "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+# ─── Temporary-file hygiene ─────────────────────────────────────────────
+# ONE per-run scratch root ($_MG_TMPDIR) for private temp files/dirs and ONE
+# run-wide cleanup trap on EXIT/INT/TERM/HUP, so individual commands never
+# replace or forget each other's cleanup (passthru 'exec git' runs _mg_cleanup
+# before exec'ing). Shared cross-user files live directly in /tmp via
+# mktemp_shared and are also registered in $_MG_SHARED_LIST for cleanup.
+
+# _mg_sweep_dir <dir>
+#   Sweep stale my-git temp entries in <dir> owned by the current user:
+#   PID-tagged leftovers whose owning PID is no longer alive are removed at
+#   once; legacy non-PID entries are removed once older than 1 hour. Never
+#   touches persistent sm-backup archives, another user's files, or live runs.
+_mg_sweep_dir() {
+  _sw_dir=$1
+  [ -d "$_sw_dir" ] || return 0
+  _sw_us=${US:-my-git}
+  _sw_now=""
+  _sw_max_age=${_MG_STALE_AGE_SEC:-3600}
+  for _sw_p in "$_sw_dir/$_sw_us".*; do
+    [ -e "$_sw_p" ] || [ -L "$_sw_p" ] || continue
+    [ -O "$_sw_p" ] || continue
+    _sw_bn=${_sw_p##*/}
+    case "$_sw_bn" in
+      "${_sw_us}.sm-backup."*.tar) continue ;;
+    esac
+    _sw_pid=""
+    case "$_sw_bn" in
+      "${_sw_us}.run."[0-9]*.[!.]*)
+        _sw_rest=${_sw_bn#"${_sw_us}.run."}
+        _sw_pid=${_sw_rest%%.*}
+        ;;
+      "${_sw_us}.shared."[0-9]*.[!.]*)
+        _sw_rest=${_sw_bn#"${_sw_us}.shared."}
+        _sw_pid=${_sw_rest%%.*}
+        ;;
+      "${_sw_us}.selftest."[0-9]*.[!.]*)
+        _sw_rest=${_sw_bn#"${_sw_us}.selftest."}
+        _sw_pid=${_sw_rest%%.*}
+        ;;
+      "${_sw_us}.mixedown."[0-9]*)
+        _sw_pid=${_sw_bn#"${_sw_us}.mixedown."}
+        ;;
+    esac
+    case "$_sw_pid" in
+      ''|*[!0-9]*) _sw_pid="" ;;
+    esac
+    if [ -n "$_sw_pid" ]; then
+      [ "$_sw_pid" = "$$" ] && continue
+      kill -0 "$_sw_pid" 2>/dev/null && continue
+      rm -rf -- "$_sw_p" 2>/dev/null || true
+      continue
+    fi
+    [ -n "$_sw_now" ] || _sw_now=$(date +%s 2>/dev/null) || _sw_now=""
+    [ -n "$_sw_now" ] || continue
+    if [ "${_STAT_OWNER_MODE:-bsd}" = gnu ]; then
+      _sw_mtime=$(stat -c '%Y' "$_sw_p" 2>/dev/null) || continue
+    else
+      _sw_mtime=$(stat -f '%m' "$_sw_p" 2>/dev/null) || continue
+    fi
+    case "$_sw_mtime" in ''|*[!0-9]*) continue ;; esac
+    if [ $((_sw_now - _sw_mtime)) -ge "$_sw_max_age" ]; then
+      rm -rf -- "$_sw_p" 2>/dev/null || true
+    fi
+  done
+}
+
+_mg_sweep_stale_tmp() {
+  _sw_t1=$(CDPATH= cd -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) || _sw_t1=""
+  [ -n "$_sw_t1" ] && _mg_sweep_dir "$_sw_t1"
+  # Outside selftest, also sweep /tmp (shared files, cron/ssh runs where
+  # $TMPDIR differed or was unset). Under --run-tests keep the sweep scoped
+  # to the test's own $TMPDIR so real /tmp is never touched.
+  if [ -z "${MY_GIT_SELFTEST:-}" ]; then
+    _sw_t2=$(CDPATH= cd -- "/tmp" 2>/dev/null && pwd -P) || _sw_t2=""
+    if [ -n "$_sw_t2" ] && [ "$_sw_t2" != "$_sw_t1" ]; then
+      _mg_sweep_dir "$_sw_t2"
+    fi
+  fi
+}
+
+_mg_cleanup() {
+  [ "${_MG_CLEANED:-0}" = 1 ] && return 0
+  _MG_CLEANED=1
+  if [ -n "${_MG_ROLLBACK_FN:-}" ]; then
+    "$_MG_ROLLBACK_FN" || true
+  fi
+  _disc_cache_clear 2>/dev/null || true
+  if [ -n "${_MG_SHARED_LIST:-}" ] && [ -f "$_MG_SHARED_LIST" ]; then
+    while IFS= read -r _mg_sf; do
+      [ -n "$_mg_sf" ] && rm -f -- "$_mg_sf" 2>/dev/null || true
+    done < "$_MG_SHARED_LIST"
+  fi
+  if [ -n "${_MG_TMPDIR:-}" ] && [ -d "$_MG_TMPDIR" ]; then
+    rm -rf -- "$_MG_TMPDIR" 2>/dev/null || true
+  fi
+  rm -f "${_RAOC_ERRFILE:-}" "${_MOW_SEEN:-}" 2>/dev/null || true
+}
+
+_mg_on_exit() {
+  _mg_rc=$?
+  _mg_cleanup
+  return "$_mg_rc"
+}
+
+_mg_on_sig() {
+  _mg_sig_rc=$1
+  trap - EXIT INT TERM HUP
+  _mg_cleanup
+  exit "$_mg_sig_rc"
+}
+
+# _init_tmp_hygiene
+#   Sweep own stale temp entries, allocate one per-run $_MG_TMPDIR (and inside
+#   it the run-wide $_RAOC_ERRFILE and $_MOW_SEEN dedup file), and arm the
+#   single EXIT/INT/TERM/HUP cleanup handler.
+_init_tmp_hygiene() {
+  _mg_sweep_stale_tmp
+  _MG_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/${US:-my-git}.run.$$.XXXXXX" 2>/dev/null) || _MG_TMPDIR=""
+  _MG_SHARED_LIST="${_MG_TMPDIR:+$_MG_TMPDIR/.shared}"
+  _MG_CLEANED=0
+  _MG_ROLLBACK_FN=""
+  if [ -n "$_MG_TMPDIR" ] && [ -d "$_MG_TMPDIR" ]; then
+    _RAOC_ERRFILE=$(mktemp "$_MG_TMPDIR/raoc.XXXXXX" 2>/dev/null) || _RAOC_ERRFILE=""
+    _MOW_SEEN="$_MG_TMPDIR/mixedown"
+  else
+    _RAOC_ERRFILE=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _RAOC_ERRFILE=""
+    _MOW_SEEN="${TMPDIR:-/tmp}/${US:-my-git}.mixedown.$$"
+  fi
+  trap '_mg_on_exit' EXIT
+  trap '_mg_on_sig 130' INT
+  trap '_mg_on_sig 143' TERM
+  trap '_mg_on_sig 129' HUP
   return 0
+}
+
+# mg_mktemp [-d] <tag>
+#   Create a private temp file (or dir with -d) inside $_MG_TMPDIR so the
+#   run's EXIT/signal handler cleans it up even on early exit or interrupt.
+mg_mktemp() {
+  _mt_dirflag=""
+  if [ "${1:-}" = "-d" ]; then
+    _mt_dirflag="-d"; shift
+  fi
+  _mt_tag=${1:-tmp}
+  if [ -n "${_MG_TMPDIR:-}" ] && [ -d "$_MG_TMPDIR" ]; then
+    mktemp $_mt_dirflag "$_MG_TMPDIR/${_mt_tag}.XXXXXX"
+  else
+    mktemp $_mt_dirflag "${TMPDIR:-/tmp}/${US:-my-git}.${_mt_tag}.XXXXXX"
+  fi
 }
 
 # mktemp_shared <tag>
@@ -964,8 +1100,11 @@ _init_raoc_errfile() {
 #   add". /tmp is world-traversable and sticky. Only pathnames and commit
 #   messages ever travel this way; nothing secret goes in one.
 mktemp_shared() {
-  _mts_f=$(mktemp "/tmp/${US:-my-git}.$1.XXXXXX") || return 1
+  _mts_f=$(mktemp "/tmp/${US:-my-git}.shared.$$.$1.XXXXXX") || return 1
   chmod 644 "$_mts_f" 2>/dev/null || true
+  if [ -n "${_MG_SHARED_LIST:-}" ] && [ -n "${_MG_TMPDIR:-}" ] && [ -d "$_MG_TMPDIR" ]; then
+    printf '%s\n' "$_mts_f" >> "$_MG_SHARED_LIST" 2>/dev/null || true
+  fi
   printf '%s\n' "$_mts_f"
 }
 
@@ -1462,7 +1601,7 @@ run_as_owner() {
 # shell's PID — stable across the $(...) subshells this runs inside.
 _mixed_ownership_warn() {
   _mow_repo=$1; _mow_owner=$2
-  _mow_seen="${TMPDIR:-/tmp}/${US:-my-git}.mixedown.$$"
+  _mow_seen=${_MOW_SEEN:-"${TMPDIR:-/tmp}/${US:-my-git}.mixedown.$$"}
   if [ -f "$_mow_seen" ] && grep -qxF "$_mow_repo" "$_mow_seen" 2>/dev/null; then
     return 0
   fi
@@ -1483,13 +1622,13 @@ run_as_owner_capture() {
   # Route stderr through a temp so an ACCESS failure (mixed ownership) is
   # detected and warned about loudly instead of vanishing into an empty
   # result. stdout still flows straight to the caller's $() unchanged.
-  # Normally the run-wide file, made once by _init_raoc_errfile. Fall back to
+  # Normally the run-wide file, made once by _init_tmp_hygiene. Fall back to
   # a per-call one if we got here without that init (--run-tests, a future
   # entry point): losing the capture would silently disable the loud
   # mixed-ownership warning, which is the whole reason stderr is captured.
   _raoc_err=${_RAOC_ERRFILE:-}; _raoc_own=0
   if [ -z "$_raoc_err" ]; then
-    _raoc_err=$(mktemp "${TMPDIR:-/tmp}/${US:-my-git}.raoc.XXXXXX" 2>/dev/null) || _raoc_err=""
+    _raoc_err=$(mg_mktemp raoc 2>/dev/null) || _raoc_err=""
     _raoc_own=1
   fi
   if [ -z "$_owner" ] || [ "$_owner" = "$ME" ]; then
@@ -2338,7 +2477,7 @@ _unzip_gitdir() {
 list_unregistered_nested() {
   _r=$1
   [ -d "$_r" ] || return 0
-  _regtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.reg.XXXXXX")
+  _regtmp=$(mg_mktemp reg)
   # No .gitmodules, no registrations -- and asking git anyway is not free:
   # as root this call is launchctl + sudo + git, three processes per repo,
   # to read a file that is absent in every repo of a tree with no
@@ -2350,7 +2489,7 @@ list_unregistered_nested() {
   else
     : > "$_regtmp"
   fi
-  _realtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.real.XXXXXX")
+  _realtmp=$(mg_mktemp real)
   # The caller may already hold this list -- walk_tree_lines computes it a
   # few lines before calling us, and recomputing meant a SECOND full
   # recursive walk of the same tree for every repo (82 walks for 41 repos).
@@ -2491,10 +2630,10 @@ list_live_repos_tree() {
   # all shadowed is the normal case here, and treating its markers as
   # "discovered" made 'mc -R' reach 2 repos out of 35.
   _llr_may=0; _may_discover "$1" && _llr_may=1
-  _llr_q=$(mktemp "${TMPDIR:-/tmp}/${US}.llrq.XXXXXX") || return 1
-  _llr_k=$(mktemp "${TMPDIR:-/tmp}/${US}.llrk.XXXXXX") || { rm -f "$_llr_q"; return 1; }
+  _llr_q=$(mg_mktemp llrq) || return 1
+  _llr_k=$(mg_mktemp llrk) || { rm -f "$_llr_q"; return 1; }
   printf '%s\n' "$1" > "$_llr_q"
-  _llr_seen=$(mktemp "${TMPDIR:-/tmp}/${US}.llrs.XXXXXX") || { rm -f "$_llr_q" "$_llr_k"; return 1; }
+  _llr_seen=$(mg_mktemp llrs) || { rm -f "$_llr_q" "$_llr_k"; return 1; }
   # A worklist, not recursion, and fd 9 rather than stdin. Both matter: the
   # discovery helpers run git through run_as_owner_capture -- su/sudo --
   # which READ STDIN, so a "| while read" walk loses every remaining entry
@@ -3285,7 +3424,7 @@ _st_dead_kept() {
 #   remote get-url', which applies url.<base>.insteadOf -- a rule that
 #   already rewrites the URL to ssh leaves nothing to warn about.
 _st_https_origins() {
-  _swh_map=$(mktemp "${TMPDIR:-/tmp}/${US}.sthttps.XXXXXX") || return 0
+  _swh_map=$(mg_mktemp sthttps) || return 0
   while IFS= read -r _swh_r; do
     if [ -d "$_swh_r/.git" ]; then
       _swh_c=$_swh_r/.git/config
@@ -3348,7 +3487,7 @@ _SWH_EOF
 wt_matches_commit() {
   _wmc_r=$1
   [ -e "$_wmc_r/.git" ] || return 1
-  _wmc_idx=$(mktemp "${TMPDIR:-/tmp}/${US}.wtidx.XXXXXX" 2>/dev/null) || return 1
+  _wmc_idx=$(mg_mktemp wtidx 2>/dev/null) || return 1
   rm -f "$_wmc_idx"
   # </dev/null on every git here: callers legitimately run this inside a
   # "while read" loop, and git reads stdin -- it will swallow the caller's
@@ -3397,7 +3536,7 @@ wt_matches_commit() {
   if [ -n "$_wmc_rec" ]; then
     _wmc_rtree=$(git -c safe.directory='*' -C "$_wmc_r" rev-parse -q --verify "$_wmc_rec^{tree}" 2>/dev/null </dev/null)
     if [ -n "$_wmc_rtree" ] && [ "$_wmc_rtree" != "$_wmc_tree" ]; then
-      _wmc_idx2=$(mktemp "${TMPDIR:-/tmp}/${US}.wtidx.XXXXXX" 2>/dev/null) || _wmc_idx2=""
+      _wmc_idx2=$(mg_mktemp wtidx 2>/dev/null) || _wmc_idx2=""
       if [ -n "$_wmc_idx2" ]; then
         rm -f "$_wmc_idx2"
         _wmc_t2=$(
@@ -3927,28 +4066,24 @@ cmd_status() {
 
   # Iterate roots in the PARENT shell (via a for-loop over a tmpfile) so
   # that priv_gate's fatal() actually aborts the whole run on policy=fail.
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
+  _rtmp=$(mg_mktemp roots)
   # Per-repo state counts are collected into a separate tmp (one char
   # per repo: C=clean, A=ahead, B=behind, V=diverged, D=dirty, E=error/skip).
-  _stcounts_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stcounts.XXXXXX")
+  _stcounts_tmp=$(mg_mktemp stcounts)
   # KIND is a separate axis from STATE. A shadowed repo has both: it is
   # shadowed AND it is clean or dirty. Counting them in one list made the
   # summary read as a partition of the total when it was not -- 25 rows
   # displayed DIRTY while the summary said DIRTY=1.
-  _stkind_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stkind.XXXXXX")
-  _sturl_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.sturl.XXXXXX")
+  _stkind_tmp=$(mg_mktemp stkind)
+  _sturl_tmp=$(mg_mktemp sturl)
   # Parallel tallies for the flag column: publish state (L=local-only ⌂,
   # R=has-remote ↑) and the my-git.ignore marker (I). Counted in
   # the Summary. Only the default tree path fills these (the -V per-node view
   # renders no flag column).
-  _stflag_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stflag.XXXXXX")
-  _stign_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stign.XXXXXX")
+  _stflag_tmp=$(mg_mktemp stflag)
+  _stign_tmp=$(mg_mktemp stign)
   # Footnote numbers used by the rows, so only those are printed.
-  _stfoot_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stfoot.XXXXXX")
-  # $_RAOC_ERRFILE rides along in every EXIT trap: POSIX sh has no trap
-  # stacking, so installing one here REPLACES the global one that would
-  # otherwise clean it up.
-  trap 'rm -f "$_rtmp" "$_stcounts_tmp" "$_stkind_tmp" "$_sturl_tmp" "$_stflag_tmp" "$_stign_tmp" "$_stfoot_tmp" "$_RAOC_ERRFILE"; _disc_cache_clear' EXIT INT TERM HUP
+  _stfoot_tmp=$(mg_mktemp stfoot)
   printf '%s\n' "$_roots" > "$_rtmp"
   _first=1
   while IFS= read -r _root; do
@@ -4048,8 +4183,8 @@ cmd_status() {
       #   for each row call status_summary (the expensive git call)
       #   and print '<padded-left>  <state>' immediately. User sees
       #   the tree fill in as status completes per repo.
-      _rawtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.raw.XXXXXX")
-      _padtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.tree.pad.XXXXXX")
+      _rawtmp=$(mg_mktemp tree.raw)
+      _padtmp=$(mg_mktemp tree.pad)
 
       # Phase A.  walk_tree_lines emits: <pfx+display>\t<abs>\t<tag>
       # Tag the ROOT itself if it's a sidecar/merged path (so 'st <sidecar>'
@@ -5493,7 +5628,7 @@ cmd_masscommits() {
   # nothing. Each rewritten marker is recorded as a my-git-caused change, so
   # the commit carrying it is never one the user is asked to confirm.
   if [ "$_mc_mode" = "go" ]; then
-    _ahm_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.ahmark.XXXXXX")
+    _ahm_tmp=$(mg_mktemp ahmark)
     for _mdr_r in $_roots; do autoheal_shadow_marker "$_mdr_r" "$_ahm_tmp"; done
     while IFS= read -r _ahm_l; do
       [ -n "$_ahm_l" ] && _mc_record_change "$_ahm_l"
@@ -5542,8 +5677,7 @@ cmd_masscommits() {
   _rc_total=0
   # File-redirected while keeps us in the parent shell so root-level
   # priv_gate fail aborts the whole run.
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
-  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  _rtmp=$(mg_mktemp roots)
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
@@ -5567,7 +5701,7 @@ cmd_masscommits() {
     fi
     # File-redirected while keeps this in the parent shell so an abort
     # signal from commit_one (via return 77) actually propagates.
-    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
+    _ntmp=$(mg_mktemp nodes)
     printf '%s\n' "$_nodes" > "$_ntmp"
     _abort_requested=0
     # fd 9, not stdin: commit_one runs git through run_as_owner_capture
@@ -6022,8 +6156,7 @@ cmd_push() {
   PS_N_REFUSED=0; PIN_REJECTED_N=0
 
   _rc_total=0
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.psroots.XXXXXX")
-  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  _rtmp=$(mg_mktemp psroots)
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root <&8; do
     [ -n "$_root" ] || continue
@@ -6040,7 +6173,7 @@ cmd_push() {
     else
       _nodes=$_root
     fi
-    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.psnodes.XXXXXX")
+    _ntmp=$(mg_mktemp psnodes)
     printf '%s\n' "$_nodes" > "$_ntmp"
     # fd 9: git push through su/sudo reads stdin (see the pull loop).
     _abort_requested=0
@@ -6147,7 +6280,7 @@ _pl_prefetch() {
   _pf_list=$1
   _pf_max=${PULL_FETCH_JOBS:-8}
   case "$_pf_max" in ''|*[!0-9]*|0) _pf_max=8 ;; esac
-  PL_FETCHDIR=$(mktemp -d "${TMPDIR:-/tmp}/${US}.fetch.XXXXXX") || { PL_FETCHDIR=""; return 0; }
+  PL_FETCHDIR=$(mg_mktemp -d fetch) || { PL_FETCHDIR=""; return 0; }
   _pf_n=0
   while IFS= read -r _pf_r; do
     [ -n "$_pf_r" ] || continue
@@ -6367,7 +6500,7 @@ pull_one() {
   # git's stderr is the ONLY place the reason lives -- it names the exact
   # paths that stopped the merge. Discarding it leaves "merge failed" and a
   # tree nobody can diagnose without re-running by hand.
-  _pl_err=$(mktemp "${TMPDIR:-/tmp}/${US}.merge.XXXXXX")
+  _pl_err=$(mg_mktemp merge)
   _pl_mt=""
   _pl_ok=0
   _pl_mt_conflict=0
@@ -6383,7 +6516,7 @@ pull_one() {
         # non-ff 'git merge' runs stash create + read-tree --reset -u HEAD +
         # stash apply whenever it refuses (e.g. any staged change anywhere),
         # rolling back the whole tree and risking work across concurrent gits.
-        _pl_mt=$(mktemp "${TMPDIR:-/tmp}/${US}.mt.XXXXXX")
+        _pl_mt=$(mg_mktemp mt)
         run_as_owner "$_r" git merge-tree --write-tree --name-only HEAD "$_rem_ref" > "$_pl_mt" 2>"$_pl_err"
         _pl_mtrc=$?
         if [ "$_pl_mtrc" -eq 0 ]; then
@@ -6424,7 +6557,7 @@ pull_one() {
   # It stopped. Which of the two ways, and which paths need the user? Both
   # are answerable, and answering them is the difference between "resolve
   # these two files" and sixty lines of raw git nobody reads.
-  _pl_lst=$(mktemp "${TMPDIR:-/tmp}/${US}.paths.XXXXXX")
+  _pl_lst=$(mg_mktemp paths)
 
   if [ "$_pl_mt_conflict" = 1 ]; then
     awk 'NR==1 { next } /^$/ { exit } { print }' "$_pl_mt" > "$_pl_lst"
@@ -6462,7 +6595,7 @@ pull_one() {
   # write that hold uncommitted or untracked work. Nothing was touched.
   # The two lists are kept apart because the fix differs: commit the first
   # (that is what 'mc go' is for), move the second out of the way.
-  _pl_lst2=$(mktemp "${TMPDIR:-/tmp}/${US}.paths.XXXXXX")
+  _pl_lst2=$(mg_mktemp paths)
   _pl_blocked_paths "$_pl_err" local     > "$_pl_lst"
   _pl_blocked_paths "$_pl_err" untracked > "$_pl_lst2"
   _pl_nm=$(awk 'END { print NR + 0 }' "$_pl_lst")
@@ -6540,8 +6673,7 @@ cmd_pull() {
   PL_N_CONFLICT=0; PL_N_BLOCKED=0; PL_NEEDS=""
 
   _rc_total=0
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.roots.XXXXXX")
-  trap 'rm -f "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  _rtmp=$(mg_mktemp roots)
   printf '%s\n' "$_roots" > "$_rtmp"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
@@ -6563,7 +6695,7 @@ cmd_pull() {
     else
       _nodes=$_root
     fi
-    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.nodes.XXXXXX")
+    _ntmp=$(mg_mktemp nodes)
     printf '%s\n' "$_nodes" > "$_ntmp"
     _pl_prefetch "$_ntmp"
     _abort_requested=0
@@ -6668,7 +6800,7 @@ cmd_flatten() {
   #                     iteration in error-restore and empty-dir filter)
   #   $_fl_argv       — shell-escaped argv string for 'eval git ...'
   _fl_build_paths_argv() {
-    _fl_paths_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flpaths.XXXXXX") || return 1
+    _fl_paths_tmp=$(mg_mktemp flpaths) || return 1
     {
       printf '%s\n' "$_fl_nested" | sed 's|/\.git$||'
       printf '%s\n' "$_fl_orphan"
@@ -6727,8 +6859,8 @@ _EOF
   # successfully, for the rest of the flow (_fl_filter_to_staged,
   # commit) to use. Returns 1 only if EVERY path failed.
   _fl_add_paths_robust() {
-    _fl_add_ok_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.fladdok.XXXXXX") || return 1
-    _fl_add_failed_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.fladdfail.XXXXXX") || return 1
+    _fl_add_ok_tmp=$(mg_mktemp fladdok) || return 1
+    _fl_add_failed_tmp=$(mg_mktemp fladdfail) || return 1
     : > "$_fl_add_ok_tmp"; : > "$_fl_add_failed_tmp"
     while IFS= read -r _fap; do
       [ -n "$_fap" ] || continue
@@ -6744,7 +6876,7 @@ _EOF
         # Simply not part of this run's content set — skip silently.
         continue
       fi
-      _fap_errlog=$(mktemp "${TMPDIR:-/tmp}/${US}.fladderr.XXXXXX")
+      _fap_errlog=$(mg_mktemp fladderr)
       # CRITICAL: exclude every GIT_SIDECAR_DIRNAME found anywhere under
       # this path before adding. GIT_SIDECAR_DIRNAME isn't literally named
       # '.git', so git does NOT recognize it as a repository boundary —
@@ -6758,7 +6890,7 @@ _EOF
       # not reliably match zero intervening path segments here, so a
       # glob-only exclusion would miss the exact case of $_fap being
       # the realized item itself (the most common case).
-      _fl_realdirs_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flrealdirs.XXXXXX")
+      _fl_realdirs_tmp=$(mg_mktemp flrealdirs)
       find "$_fap" -type d -name "$GIT_SIDECAR_DIRNAME" 2>/dev/null > "$_fl_realdirs_tmp"
       # advice.addEmbeddedRepo=false: the content being added can contain a
       # further nested live repo — silence git's long embedded-repo hint
@@ -6811,7 +6943,7 @@ _FL_ADD_EOF
   # '#'-prefixed body listing the nested repos merged (or deleted) and
   # the orphan gitlinks unstaged. Sets _fl_msgfile to the tmp path.
   _fl_write_msg_file() {
-    _fl_msgfile=$(mktemp "${TMPDIR:-/tmp}/${US}.flmsg.XXXXXX") || return 1
+    _fl_msgfile=$(mg_mktemp flmsg) || return 1
     {
       printf '%s\n\n' "$1"
       if [ -n "${_fl_realized:-}" ]; then
@@ -7081,7 +7213,7 @@ _FL_ADD_EOF
       log_warn "$_ftm_path: sub-submodule scan skipped — parent gitdir did not resolve to an absolute path; cannot safely determine which sub-submodules are at risk"
       return 0
     fi
-    _ftm_list_tmp=$(runq mktemp "${TMPDIR:-/tmp}/${US}.ftmlist.XXXXXX") || { log_warn "$_ftm_path: mktemp failed for sub-submodule scan — skipping"; return 0; }
+    _ftm_list_tmp=$(runq mg_mktemp ftmlist) || { log_warn "$_ftm_path: mktemp failed for sub-submodule scan — skipping"; return 0; }
     _sm_safe_git . config -f "$_ftm_path/.gitmodules" --get-regexp '^submodule\..*\.path$' 2>/dev/null > "$_ftm_list_tmp"
     log_dbg_med "sub-submodule scan: $_ftm_path has $(grep -c . "$_ftm_list_tmp" 2>/dev/null) registered sub-submodule(s) in .gitmodules; checking each against doomed gitdir '$_ftm_gitdir_abs'"
     while IFS=' ' read -r _ftm_key _ftm_subpath; do
@@ -7113,7 +7245,7 @@ _FL_ADD_EOF
     # history-preserving MOVE is far more important than recording it in
     # the snapshot — silently skipping the safety net on a mktemp hiccup
     # would risk exactly the data loss it exists to prevent.
-    _msn_xfer_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.msnxfer.XXXXXX" 2>/dev/null) || _msn_xfer_tmp=""
+    _msn_xfer_tmp=$(mg_mktemp msnxfer 2>/dev/null) || _msn_xfer_tmp=""
     _msn_xfer_out=${_msn_xfer_tmp:-/dev/null}
     log_dbg_med "merge-snapshot: $_msn_path — checking for at-risk sub-submodules (gitdir=$_msn_gitdir_abs)"
     _fl_transfer_sub_submodules "$_msn_path" "$_msn_gitdir_abs" "$_msn_xfer_out"
@@ -7262,14 +7394,14 @@ _FL_ADD_EOF
     _sdn_dir=$1
     _sdn_save=$2
     _sdn_manifest=$3
-    _sdn_raw=$(mktemp "${TMPDIR:-/tmp}/${US}.sdnraw.XXXXXX") || return 1
+    _sdn_raw=$(mg_mktemp sdnraw) || return 1
     find "$_sdn_dir" -mindepth 2 \( -name .git -a \( -type d -o -type f \) \) -print 2>/dev/null \
       | sed 's|/\.git$||' > "$_sdn_raw"
     _sdn_n=$(grep -c . "$_sdn_raw" 2>/dev/null)
     log_dbg_med "shield: $_sdn_dir has $_sdn_n nested repo(s) to move aside before 'git add' (so an embedded/uninitialized one can't fail the add)"
     # Dedup: keep shallowest, drop any entry that's a descendant of one
     # already kept (moving the shallower dir carries its deeper repos too).
-    _sdn_dedup=$(mktemp "${TMPDIR:-/tmp}/${US}.sdndedup.XXXXXX") || { rm -f "$_sdn_raw"; return 1; }
+    _sdn_dedup=$(mg_mktemp sdndedup) || { rm -f "$_sdn_raw"; return 1; }
     sort -u "$_sdn_raw" | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
       | awk 'function under(p,  i){for(i=1;i<=nk;i++)if(index(p,kept[i]"/")==1)return 1;return 0}
              {if(!under($0)){print;kept[++nk]=$0}}' > "$_sdn_dedup"
@@ -8496,7 +8628,7 @@ _FL_EMB_REALIZE_EOF
     # the sub-submodule transfer inside it could resolve pointers first.
     # (Real bug found merging a production sidecar that contained
     # src/,bewerbungen [embedded] and src/py/my-books [no commit].)
-    _fms_shield_save=$(mktemp -d "${TMPDIR:-/tmp}/${US}.dmshield.XXXXXX") \
+    _fms_shield_save=$(mg_mktemp -d dmshield) \
       || fatal "flatten: mktemp -d for shield failed" 1
     _fms_shield_manifest="$_fms_shield_save/.manifest"; : > "$_fms_shield_manifest"
     _fl_shield_dir_nested "$_fl_scope_path" "$_fms_shield_save" "$_fms_shield_manifest"
@@ -8614,8 +8746,8 @@ _FL_EMB_REALIZE_EOF
   _fl_ignored_nested=""
   _fl_ignored_registered=""
   if [ "$_fl_force" != 1 ]; then
-    _fl_ign_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flign.XXXXXX") || fatal "flatten: mktemp failed" 1
-    _fl_keep_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flkeep.XXXXXX") || fatal "flatten: mktemp failed" 1
+    _fl_ign_tmp=$(mg_mktemp flign) || fatal "flatten: mktemp failed" 1
+    _fl_keep_tmp=$(mg_mktemp flkeep) || fatal "flatten: mktemp failed" 1
     : > "$_fl_ign_tmp"; : > "$_fl_keep_tmp"
     while IFS= read -r _n; do
       [ -n "$_n" ] || continue
@@ -8632,8 +8764,8 @@ _FL_IGNCHK_EOF
     _fl_nested=$(cat "$_fl_keep_tmp")
     rm -f "$_fl_ign_tmp" "$_fl_keep_tmp"
 
-    _fl_ignreg_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flignreg.XXXXXX") || fatal "flatten: mktemp failed" 1
-    _fl_keepreg_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flkeepreg.XXXXXX") || fatal "flatten: mktemp failed" 1
+    _fl_ignreg_tmp=$(mg_mktemp flignreg) || fatal "flatten: mktemp failed" 1
+    _fl_keepreg_tmp=$(mg_mktemp flkeepreg) || fatal "flatten: mktemp failed" 1
     : > "$_fl_ignreg_tmp"; : > "$_fl_keepreg_tmp"
     while IFS= read -r _np; do
       [ -n "$_np" ] || continue
@@ -8649,8 +8781,8 @@ _FL_IGNCHK_REG_EOF
     _fl_registered=$(cat "$_fl_keepreg_tmp")
     rm -f "$_fl_ignreg_tmp" "$_fl_keepreg_tmp"
 
-    _fl_ignorph_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flignorph.XXXXXX") || fatal "flatten: mktemp failed" 1
-    _fl_keeporph_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flkeeporph.XXXXXX") || fatal "flatten: mktemp failed" 1
+    _fl_ignorph_tmp=$(mg_mktemp flignorph) || fatal "flatten: mktemp failed" 1
+    _fl_keeporph_tmp=$(mg_mktemp flkeeporph) || fatal "flatten: mktemp failed" 1
     : > "$_fl_ignorph_tmp"; : > "$_fl_keeporph_tmp"
     while IFS= read -r _np; do
       [ -n "$_np" ] || continue
@@ -8906,7 +9038,7 @@ _FL_IGNCHK_ORPH_EOF
   _fl_modules_delete=""   # .git/modules/<name>/ paths to rm -rf after commit (registered+delete)
   _fl_realized=""         # paths successfully realized (self-contained $GIT_SIDECAR_DIRNAME)
   if [ "$_fl_interactive" = 1 ] && [ -z "$_fl_forced_mode" ]; then
-    _fl_choices=$(mktemp "${TMPDIR:-/tmp}/${US}.flchoices.XXXXXX") || \
+    _fl_choices=$(mg_mktemp flchoices) || \
       fatal "flatten -i: mktemp failed" 1
     if ! _fl_interactive_collect "$_fl_choices"; then
       rm -f "$_fl_choices"
@@ -8932,7 +9064,7 @@ _FL_IGNCHK_ORPH_EOF
     # [Y]es/[s]kip/[a]bort per item; --local-only skips items that have a
     # remote (⌂ only) — both handled inside _fl_build_forced_choices.
     log_major "$_fl_top: --$_fl_forced_mode on up to $((_fl_n_registered + _fl_n_nested + _fl_n_orphan)) item(s)$([ "$_fl_interactive" = 1 ] && printf ' (-i: per item)')$([ "$_fl_local_only" = 1 ] && printf ' (--local-only: ⌂ only)')"
-    _fl_choices=$(mktemp "${TMPDIR:-/tmp}/${US}.flchoices.XXXXXX") || \
+    _fl_choices=$(mg_mktemp flchoices) || \
       fatal "flatten --$_fl_forced_mode: mktemp failed" 1
     if ! _fl_build_forced_choices "$_fl_choices" "$_fl_forced_mode"; then
       rm -f "$_fl_choices"
@@ -8962,9 +9094,9 @@ _FL_IGNCHK_ORPH_EOF
       # but keeping the loop in the parent shell (heredoc) matches this
       # script's established convention and avoids relying on that
       # distinction being right by accident.
-      _fl_auto_realized_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flauto.XXXXXX") || \
+      _fl_auto_realized_tmp=$(mg_mktemp flauto) || \
         fatal "AUTO_SIDECAR_SUBMODULES: mktemp failed" 1
-      _fl_auto_failed_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flautofail.XXXXXX") || \
+      _fl_auto_failed_tmp=$(mg_mktemp flautofail) || \
         fatal "AUTO_SIDECAR_SUBMODULES: mktemp failed" 1
       while IFS= read -r _p; do
         [ -n "$_p" ] || continue
@@ -9013,9 +9145,9 @@ _FL_AUTO_EOF
       _fl_did_auto=1
       log_major "AUTO_SIDECAR_EMBEDDED=1: sidecaring $_fl_n_nested embedded nested repo(s) automatically"
       _fl_index_touched=0
-      _fl_auto_realized_emb_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flautoemb.XXXXXX") || \
+      _fl_auto_realized_emb_tmp=$(mg_mktemp flautoemb) || \
         fatal "AUTO_SIDECAR_EMBEDDED: mktemp failed" 1
-      _fl_auto_stay_nested_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flautostay.XXXXXX") || \
+      _fl_auto_stay_nested_tmp=$(mg_mktemp flautostay) || \
         fatal "AUTO_SIDECAR_EMBEDDED: mktemp failed" 1
       : > "$_fl_auto_stay_nested_tmp"
       # Deepest-first (see the comment in _fl_interactive_apply's
@@ -9131,7 +9263,7 @@ _FL_AUTO_EMB_EOF
   # this. _fl_rollback also un-stages index changes for our paths via
   # 'git restore --staged' (NOT 'git reset' — never use git reset
   # implicitly); failure / trap paths use this.
-  _fl_save_root=$(mktemp -d "${TMPDIR:-/tmp}/${US}.flatten.XXXXXX") \
+  _fl_save_root=$(mg_mktemp -d flatten) \
     || { log_error "mktemp failed"; exit 1; }
   _fl_manifest="$_fl_save_root/.manifest"
   : > "$_fl_manifest"
@@ -9206,7 +9338,7 @@ _FL_AUTO_EMB_EOF
   # entire directory (content included) keeps it genuinely invisible,
   # then restores it, .git and all, exactly as it was.
   _fl_shield_nested_within_addpaths() {
-    _fl_shield_raw_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flshieldraw.XXXXXX") || return 1
+    _fl_shield_raw_tmp=$(mg_mktemp flshieldraw) || return 1
     : > "$_fl_shield_raw_tmp"
     while IFS= read -r _fl_ap; do
       [ -n "$_fl_ap" ] || continue
@@ -9228,7 +9360,7 @@ _FL_SHIELD_SCAN_EOF
     # already carries its own deeper nested repos along with it, so
     # trying to separately move those too would fail ("no such file",
     # since they're already gone from their original location).
-    _fl_shield_dedup_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.flshielddedup.XXXXXX") || {
+    _fl_shield_dedup_tmp=$(mg_mktemp flshielddedup) || {
       rm -f "$_fl_shield_raw_tmp"; return 1
     }
     sort -u "$_fl_shield_raw_tmp" | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | cut -d' ' -f2- \
@@ -9269,7 +9401,12 @@ _FL_ROLLBACK_EOF
     # (2) Restore moved .git dirs.
     _fl_restore_dirs
   }
-  trap '_fl_rollback; rm -rf "$_fl_save_root"; exit 1' INT TERM HUP
+  _fl_on_interrupt() {
+    _MG_ROLLBACK_FN=""
+    _fl_rollback
+    rm -rf "$_fl_save_root"
+  }
+  _MG_ROLLBACK_FN=_fl_on_interrupt
 
   # Unstage orphan gitlinks first. Heredoc (not pipe) keeps the loop in
   # the parent shell so _fl_index_touched = 1 actually persists.
@@ -9358,6 +9495,7 @@ $_fl_nested
 _FL_EOF
     if ! _fl_shield_nested_within_addpaths; then
       log_error "shielding nested repos failed"
+      _MG_ROLLBACK_FN=""
       _fl_rollback
       rm -rf "$_fl_save_root"
       exit 1
@@ -9368,12 +9506,13 @@ _FL_EOF
       if [ -n "${_fl_realized:-}" ]; then
         _fl_warn_broken_pointers
         log_major "$_fl_top: sidecared $(printf '%s' "$_fl_realized" | grep -c .) item(s) on disk, but none could be tracked as content yet — each one's enclosing repo needs to be flattened/sidecared too before this scope's index can see it. Re-run flatten later to pick it up."
+        _MG_ROLLBACK_FN=""
         _fl_rollback
-        trap - INT TERM HUP
         rm -rf "$_fl_save_root"
         exit 0
       fi
       log_error "git add failed for every path"
+      _MG_ROLLBACK_FN=""
       _fl_rollback
       rm -rf "$_fl_save_root"
       exit 1
@@ -9382,21 +9521,21 @@ _FL_EOF
     _fl_filter_to_staged
     if [ -z "$_fl_argv" ]; then
       log_major "nothing to commit (all nested dirs were empty after .git removed)"
+      _MG_ROLLBACK_FN=""
       _fl_rollback
       rm -rf "$_fl_save_root"
-      trap - INT TERM HUP
       _fl_warn_registered
       exit 0
     fi
     _fl_n_realized=$(printf '%s' "${_fl_realized:-}" | grep -c .)
     _fl_msg="my-git flatten --rm-git: $_fl_n_nested nested .git removed, $_fl_n_orphan orphan gitlink(s) unstaged, $_fl_n_realized repo(s) sidecared"
-    _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
-    _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
+    _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _MG_ROLLBACK_FN=""; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
+    _fl_commit_log=$(mg_mktemp flcommit)
     # shellcheck disable=SC2086
     if _commit_gate "$_fl_top" && run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
       rm -f "$_fl_commit_log" "$_fl_msgfile"
+      _MG_ROLLBACK_FN=""
       rm -rf "$_fl_save_root"
-      trap - INT TERM HUP
       _fl_warn_broken_pointers
       if [ "$_fl_n_realized" -gt 0 ]; then
         log_major "$_fl_top: $(c_green 'DONE :))') (flattened; $_fl_n_realized repo(s) sidecared into $GIT_SIDECAR_DIRNAME; remaining child .git dirs DELETED; unrelated changes left untouched)"
@@ -9408,6 +9547,7 @@ _FL_EOF
       log_error "flatten commit failed:"
       cat "$_fl_commit_log" >&2
       rm -f "$_fl_commit_log" "$_fl_msgfile"
+      _MG_ROLLBACK_FN=""
       _fl_rollback
       rm -rf "$_fl_save_root"
       exit 1
@@ -9474,12 +9614,13 @@ _FL_EOF
       # The rename stands regardless of git add; don't roll it back.
       _fl_warn_broken_pointers
       log_major "$_fl_top: sidecared $(printf '%s' "$_fl_realized" | grep -c .) item(s) on disk, but none could be tracked as content yet — each one's enclosing repo needs to be flattened/sidecared too before this scope's index can see it. Re-run flatten later to pick it up."
+      _MG_ROLLBACK_FN=""
       _fl_rollback
-      trap - INT TERM HUP
       rm -rf "$_fl_save_root"
       exit 0
     fi
     log_error "git add failed for every path; restoring .git dirs..."
+    _MG_ROLLBACK_FN=""
     _fl_rollback
     rm -rf "$_fl_save_root"
     exit 1
@@ -9490,22 +9631,23 @@ _FL_EOF
   # to proceed when a zip archive was staged even if _fl_argv is otherwise empty.
   if [ -z "$_fl_argv" ] && [ "${_fl_zipped_staged:-0}" != 1 ]; then
     log_major "nothing to commit (all nested dirs were empty after .git move-out)"
+    _MG_ROLLBACK_FN=""
     _fl_rollback
     rm -rf "$_fl_save_root"
-    trap - INT TERM HUP
     _fl_warn_registered
     exit 0
   fi
   _fl_n_realized=$(printf '%s' "${_fl_realized:-}" | grep -c .)
   _fl_n_zip=$(printf '%s' "${_fl_nested_zip:-}" | grep -c .)
   _fl_msg="my-git flatten: $_fl_n_nested nested repo(s) merged as content, $_fl_n_orphan orphan gitlink(s) unstaged, $_fl_n_realized repo(s) sidecared$([ "$_fl_n_zip" -gt 0 ] && printf ', %s zipped' "$_fl_n_zip")"
-  _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
-  _fl_commit_log=$(mktemp "${TMPDIR:-/tmp}/${US}.flcommit.XXXXXX")
+  _fl_write_msg_file "$_fl_msg" || { log_error "mktemp for commit msg failed"; _MG_ROLLBACK_FN=""; _fl_rollback; rm -rf "$_fl_save_root"; exit 1; }
+  _fl_commit_log=$(mg_mktemp flcommit)
   # shellcheck disable=SC2086
   if ! _commit_gate "$_fl_top" || ! run_echoed git commit -q -F "$_fl_msgfile" 2>"$_fl_commit_log"; then
     log_error "flatten commit failed:"
     cat "$_fl_commit_log" >&2
     rm -f "$_fl_commit_log" "$_fl_msgfile"
+    _MG_ROLLBACK_FN=""
     _fl_rollback
     rm -rf "$_fl_save_root"
     exit 1
@@ -9513,9 +9655,9 @@ _FL_EOF
   rm -f "$_fl_commit_log" "$_fl_msgfile"
 
   log_major "restoring nested .git dirs..."
+  _MG_ROLLBACK_FN=""
   _fl_restore_dirs
   rm -rf "$_fl_save_root"
-  trap - INT TERM HUP
   # Per-item delete from -i: rm -rf .git/modules/<name>/ for registered
   # subs the user chose to DELETE (history destruction).
   if [ -n "$_fl_modules_delete" ]; then
@@ -9607,7 +9749,7 @@ _unfl_restore_sidecar() {
 
   # Cosmetic cleanup: drop the self-exclude lines 'flatten --sidecar' added.
   if [ -f "$_urs_dst/info/exclude" ]; then
-    _urs_excl_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.uflexcl.XXXXXX")
+    _urs_excl_tmp=$(mg_mktemp uflexcl)
     grep -vxF -e "$GIT_SIDECAR_DIRNAME" -e "$GIT_SIDECAR_DIRNAME.status" \
       "$_urs_dst/info/exclude" > "$_urs_excl_tmp" 2>/dev/null
     run_echoed mv -f "$_urs_excl_tmp" "$_urs_dst/info/exclude" 2>/dev/null
@@ -9816,7 +9958,7 @@ _unfl_reconstruct_merge() {
   _urm_src=$_urm_parent_gitdir
   _urm_bare=""
   if [ -n "$(git log -n 1 --format=%H -- "$_urm_path/.git.shadow.status" 2>/dev/null)" ]; then
-    _urm_bare=$(mktemp -d "${TMPDIR:-/tmp}/${US}.unflsh.XXXXXX") || _urm_bare=""
+    _urm_bare=$(mg_mktemp -d unflsh) || _urm_bare=""
     if [ -z "$_urm_bare" ] || ! (
          export FILTER_BRANCH_SQUELCH_WARNING=1
          run_echoed git init -q --bare "$_urm_bare" \
@@ -9935,7 +10077,7 @@ cmd_unflatten() {
     "merged paths are restored from history preserved in THIS repo ($MERGED_REFS_ROOT/<path>/)"
 
   # Build the candidate list: <path>\t<mode> lines.
-  _ufl_cand=$(mktemp "${TMPDIR:-/tmp}/${US}.uflcand.XXXXXX") || fatal "unflatten: mktemp failed" 1
+  _ufl_cand=$(mg_mktemp uflcand) || fatal "unflatten: mktemp failed" 1
   : > "$_ufl_cand"
 
   if [ -n "$_ufl_scope_path" ]; then
@@ -10504,7 +10646,7 @@ _shadow_install_hook_one() {
       # restores it rather than reporting a puzzle, and SAYS so: a mode nobody
       # here changed back means something else keeps stripping it.
       _shadow_restore_hook_x "$_sih_hook"
-      _sih_new=$(mktemp "${TMPDIR:-/tmp}/${US}.hook.XXXXXX") || return 0
+      _sih_new=$(mg_mktemp hook) || return 0
       "$_sih_fn" > "$_sih_new"
       if awk -v b="$_sih_b" -v e="$_SHADOW_HOOK_END" \
            'index($0,b){f=1} f{print} f&&index($0,e){exit}' "$_sih_hook" 2>/dev/null \
@@ -10698,7 +10840,7 @@ shadow_sync_excludes() {
     return 0
   fi
   [ -d "$_sse_top" ] || return 0
-  _sse_map=$(mktemp "${TMPDIR:-/tmp}/${US}.ssemap.XXXXXX" 2>/dev/null) || return 0
+  _sse_map=$(mg_mktemp ssemap 2>/dev/null) || return 0
   SSE_TOP_MARKERS=$(cd "$_sse_top" 2>/dev/null \
     && git -c safe.directory='*' ls-files -- '.git.shadow.status' '*/.git.shadow.status' 2>/dev/null)
 
@@ -10781,7 +10923,7 @@ _SSE_EOF
                   '$0==b{f=1;next} $0==e{f=0;next} f' "$_sse_f" 2>/dev/null | sort -u)
     [ "$_sse_want" = "$_sse_have" ] && continue
     mkdir -p "$_sse_gd/info" 2>/dev/null || true
-    _sse_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.sse.XXXXXX" 2>/dev/null) || continue
+    _sse_tmp=$(mg_mktemp sse 2>/dev/null) || continue
     # keep everything outside the managed block verbatim
     awk -v b="$_SHADOW_EXCL_BEGIN" -v e="$_SHADOW_EXCL_END" \
       '$0==b{f=1;next} $0==e{f=0;next} !f' "$_sse_f" 2>/dev/null > "$_sse_tmp"
@@ -10928,9 +11070,9 @@ _shadow_one() {
       printf '%s/%s\n' "$_sho_p" "$_sho_f"
     done > "$_sho_keep"
 
-  ( _sho_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.shadow.XXXXXX") || { log_error "shadow: mktemp -d failed"; exit 1; }
+  ( _sho_tmp=$(mg_mktemp -d shadow) || { log_error "shadow: mktemp -d failed"; exit 1; }
     # restore .git on interrupt (contained to this subshell)
-    trap 'mv -- "$_sho_tmp/gitdir" "$_sho_gd" 2>/dev/null' INT TERM HUP
+    trap 'mv -- "$_sho_tmp/gitdir" "$_sho_gd" 2>/dev/null; rm -rf -- "$_sho_tmp" 2>/dev/null; exit 130' INT TERM HUP
     if ! run_echoed mv -- "$_sho_gd" "$_sho_tmp/gitdir"; then
       log_error "shadow: $_sho_p: could not move .git aside"; rmdir "$_sho_tmp" 2>/dev/null; exit 1
     fi
@@ -11250,7 +11392,7 @@ cmd_unshadow() {
     run_echoed rm -f -- "$_ucm_p/.git.shadow.status" 2>/dev/null
     rm -f -- "$_ucm_p"/.git.shadow.status.* 2>/dev/null || true
     if [ -f "$_ucm_p/.git/info/exclude" ] && grep -qE '^\.git\.shadow\.status' "$_ucm_p/.git/info/exclude" 2>/dev/null; then
-      _ucm_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.unshadow.XXXXXX" 2>/dev/null) \
+      _ucm_tmp=$(mg_mktemp unshadow 2>/dev/null) \
         && grep -vxF -e '.git.shadow.status' -e '.git.shadow.status.*' "$_ucm_p/.git/info/exclude" > "$_ucm_tmp" 2>/dev/null \
         && cat "$_ucm_tmp" > "$_ucm_p/.git/info/exclude" 2>/dev/null
       rm -f "$_ucm_tmp" 2>/dev/null
@@ -11523,7 +11665,7 @@ _zip_history() {
   # branch name, and the fetch of that branch copies real objects into the
   # staged repo. '--shared' keeps the clone cheap -- no object is copied
   # until the fetch, which packs them properly.
-  _zh_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.zipsplit.XXXXXX" 2>/dev/null) || _zh_tmp=""
+  _zh_tmp=$(mg_mktemp -d zipsplit 2>/dev/null) || _zh_tmp=""
   # Each step says why it failed, on stderr: a zip whose history is silently
   # 'none' is the kind of hole this command refuses to report as complete.
   if [ -n "$_zh_tmp" ] \
@@ -11580,7 +11722,7 @@ cmd_zip() {
   [ -e "$_z_path/.git" ] && { _z_self=1; _z_owner=$(git_toplevel_of "$_z_path" 2>/dev/null); }
 
   ZIP_FILES=0; ZIP_LINKS=0; ZIP_LINKDIRS=0; ZIP_WARNED=0; ZIP_SKIPPED=0
-  _z_stage=$(mktemp -d "${TMPDIR:-/tmp}/${US}.zip.XXXXXX") || fatal "zip: mktemp -d failed" 1
+  _z_stage=$(mg_mktemp -d zip) || fatal "zip: mktemp -d failed" 1
   _z_root="$_z_stage/$_z_name"
   mkdir "$_z_root"
 
@@ -11693,7 +11835,7 @@ cmd_purge() {
   # ── Facts before the gate ──────────────────────────────────────────
   _pg_commits=$( cd "$_pg_repo" && git -c safe.directory='*' log --oneline --all -- "$_pg_rel" 2>/dev/null | grep -c . )
   _pg_total=$( cd "$_pg_repo" && git -c safe.directory='*' rev-list --count --all 2>/dev/null )
-  _pg_objtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.purgeobj.XXXXXX")
+  _pg_objtmp=$(mg_mktemp purgeobj)
   ( cd "$_pg_repo" && git -c safe.directory='*' rev-list --objects --all -- "$_pg_rel" 2>/dev/null ) \
     | awk '{print $1}' | sort -u > "$_pg_objtmp"
   _pg_mb=$( cd "$_pg_repo" && git -c safe.directory='*' cat-file --batch-check='%(objectsize:disk)' < "$_pg_objtmp" 2>/dev/null \
@@ -11758,7 +11900,7 @@ cmd_purge() {
   # worktree look dirty instead. Operating on a detached bare copy sizes
   # the problem correctly: history is a property of the gitdir, so the
   # worktree has no business being involved at all.
-  _pg_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.purge.XXXXXX") || fatal "purge: mktemp -d failed" 1
+  _pg_tmp=$(mg_mktemp -d purge) || fatal "purge: mktemp -d failed" 1
   log_medium "copying the gitdir to $_pg_tmp/rw.git and rewriting THERE (the worktree is never touched)"
   cp -a "$_pg_repo/.git" "$_pg_tmp/rw.git" || { rm -rf "$_pg_tmp"; fatal "purge: could not copy the gitdir" 1; }
   # A bare gitdir has no worktree to check out or complain about.
@@ -11980,7 +12122,7 @@ cmd_diff() {
   _df_n=$(printf '%s\n' "$_df_list" | grep -c .)
   log_major "$_df_top: $_df_n conflicted file(s); left=$_df_ours  right=$_df_theirs"
 
-  _df_tmp=$(mktemp -d "${TMPDIR:-/tmp}/${US}.diff.XXXXXX") || fatal "diff: mktemp -d failed" 1
+  _df_tmp=$(mg_mktemp -d diff) || fatal "diff: mktemp -d failed" 1
   _df_i=0
   while IFS= read -r _df_f; do
     [ -n "$_df_f" ] || continue
@@ -12024,8 +12166,9 @@ cmd_diff() {
 $_df_list
 _DF_EOF
 
-  log_major "$_df_top: done — the temp copies are in $_df_tmp"
-  printf '    > they are COPIES: resolve by editing the real file, then '\''git add'\'' it\n'
+  rm -rf -- "$_df_tmp"
+  log_major "$_df_top: done"
+  printf '    > they are COPIES (removed on exit): resolve by editing the real file, then '\''git add'\'' it\n'
   printf '    > still conflicted: %s\n' "$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
   return 0
 }
@@ -12149,7 +12292,7 @@ cmd_stamp_version() {
   # the running copy's inode untouched; a rewrite would corrupt it mid-run.
   # 'cp -p' first so the temp carries the file's mode, which the redirect
   # then keeps -- it truncates rather than creates.
-  _sv_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.stamp.XXXXXX") || fatal "stamp-version: mktemp failed" 1
+  _sv_tmp=$(mg_mktemp stamp) || fatal "stamp-version: mktemp failed" 1
   cp -p "$_sv_self" "$_sv_tmp" 2>/dev/null \
     || { rm -f "$_sv_tmp"; fatal "stamp-version: could not copy $_sv_self" 1; }
   sed -e "s/^SCRIPT_COMMIT=.*/SCRIPT_COMMIT=\"$_sv_sha\"/" \
@@ -12203,7 +12346,7 @@ cmd_rehydrate() {
     "the files already here win: upstream history is attached UNDER them, and any difference shows as uncommitted changes"
 
   # Candidates: a marker, no live .git, and a remote to clone from.
-  _rh_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rehyd.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  _rh_tmp=$(mg_mktemp rehyd) || fatal "rehydrate: mktemp failed" 1
   : > "$_rh_tmp"
   # Second list: repos that DO have a .git but sit at the wrong commit.
   # A machine rehydrated before the tree-match existed got HEAD at the
@@ -12211,7 +12354,7 @@ cmd_rehydrate() {
   # reads as modified under plain git. The repair needs no network at all --
   # a full clone already contains the right commit, so this is a local
   # reset, not a re-clone.
-  _rh_fix=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydfix.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  _rh_fix=$(mg_mktemp rehydfix) || fatal "rehydrate: mktemp failed" 1
   : > "$_rh_fix"
   # A repo that EXISTS but does not match what the marker records. rehydrate
   # used to look at the commit only, and fetch from whatever remote the repo
@@ -12219,18 +12362,18 @@ cmd_rehydrate() {
   # at upstream instead of the fork, could never be repaired: the commit its
   # files are was on a remote nobody fetched. The marker records the remote
   # AND the branch precisely so this is answerable; it just was not asked.
-  _rh_align=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydaln.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  _rh_align=$(mg_mktemp rehydaln) || fatal "rehydrate: mktemp failed" 1
   : > "$_rh_align"
   # Third list: repos rehydrate looked at and could NOT place. The align path
   # says so; this one used to 'continue' in silence, so a repo whose files
   # match no commit vanished from the output entirely while 'st' went on
   # calling it DIRTY -- the one state where the two commands disagreed
   # without either explaining why.
-  _rh_nomatch=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydnm.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  _rh_nomatch=$(mg_mktemp rehydnm) || fatal "rehydrate: mktemp failed" 1
   # Repos with NO remote whose history THIS container kept (the shadow
   # pre-commit hook writes it under $SHADOWED_REFS_ROOT). They are restored
   # from here, byte for byte -- same commits, same shas, on every machine.
-  _rh_pres=$(mktemp "${TMPDIR:-/tmp}/${US}.rehydpres.XXXXXX") || fatal "rehydrate: mktemp failed" 1
+  _rh_pres=$(mg_mktemp rehydpres) || fatal "rehydrate: mktemp failed" 1
   # A CLONE fetches refs/heads/* and nothing else, so the preserved branches
   # are on the remote and not here -- which is exactly the machine rehydrate
   # runs on. 'go' configures the refspec pair and fetches them once; analyze
@@ -12391,6 +12534,7 @@ _RH_EOF
         && log_ok "rehydrate: ${_rh_naligned} project(s) realigned to what the marker records"
     fi
   fi
+  rm -f "$_rh_align"
 
   if [ "${_rh_nfix:-0}" -gt 0 ]; then
     log_major "$_rh_top: $_rh_nfix restored project(s) sit at the WRONG commit (files unchanged; HEAD moves)"
@@ -12487,7 +12631,7 @@ _RH_EOF
   _rh_ok=0; _rh_fail=0
   while IFS="$(printf '\t')" read -r _rh_p _rh_url _rh_br; do
     [ -n "$_rh_p" ] || continue
-    _rh_work=$(mktemp -d "${TMPDIR:-/tmp}/${US}.rhclone.XXXXXX") || { log_error "$_rh_p: mktemp -d failed"; _rh_fail=$((_rh_fail+1)); continue; }
+    _rh_work=$(mg_mktemp -d rhclone) || { log_error "$_rh_p: mktemp -d failed"; _rh_fail=$((_rh_fail+1)); continue; }
     # --no-checkout: we want the HISTORY, never the files. The container's
     # copy of the worktree is the one to keep.
     if ! run_echoed git clone -q --no-checkout "$_rh_url" "$_rh_work/c" 2>/dev/null; then
@@ -12617,8 +12761,7 @@ cmd_branch() {
   _roots=$(resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "no repositories to inspect"; exit 1; }
 
-  _br_ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.brnodes.XXXXXX")
-  trap 'rm -f "$_br_ntmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  _br_ntmp=$(mg_mktemp brnodes)
   _br_total=0
   for _br_root in $_roots; do
     priv_gate "$_br_root"
@@ -12866,9 +13009,8 @@ cmd_remote() {
   [ -z "$_roots" ] && { log_error "no repositories to inspect"; exit 1; }
 
   RM_N_TOTAL=0; RM_N_NOREMOTE=0; RM_N_IGNORED=0; RM_N_SUS=0
-  _rm_sus_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmsus.XXXXXX")
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmroots.XXXXXX")
-  trap 'rm -f "$_rm_sus_tmp" "$_rtmp" "$_RAOC_ERRFILE"' EXIT INT TERM HUP
+  _rm_sus_tmp=$(mg_mktemp rmsus)
+  _rtmp=$(mg_mktemp rmroots)
   printf '%s\n' "$_roots" > "$_rtmp"
 
   while IFS= read -r _rm_root; do
@@ -12886,7 +13028,7 @@ cmd_remote() {
     # read from .git.real / .git.merged inside remote_one.
     # MAY_DISCOVER_NESTED: may we go looking here? (GIT_REPOS tree, or --discover)
     # you cd'd into.
-    _ntmp=$(mktemp "${TMPDIR:-/tmp}/${US}.rmnodes.XXXXXX")
+    _ntmp=$(mg_mktemp rmnodes)
     _rm_may=0; _may_discover "$_rm_root" && _rm_may=1
     MAY_DISCOVER_NESTED=$_rm_may walk_tree_lines "$_rm_root" "$_rm_root" "" "" "" 2>/dev/null \
       | awk -F'\t' 'NF>=2 && $2!="" {print $2}' > "$_ntmp"
@@ -13122,13 +13264,13 @@ cmd_sync() {
   _rs_walks=0; _walks_tree 0 0 && _rs_walks=1
   _roots=$(SCOPE_WALKS=$_rs_walks resolve_scope "$@") || exit 1
   [ -z "$_roots" ] && { log_error "sync: no repositories to process"; exit 1; }
-  _rtmp=$(mktemp "${TMPDIR:-/tmp}/${US}.sync.roots.XXXXXX")
-  printf '%s\n' "$_roots" > "$_rtmp"
+  _sy_rtmp=$(mg_mktemp sync.roots)
+  printf '%s\n' "$_roots" > "$_sy_rtmp"
 
   _worst=0
   # NOTE: use a distinct loop variable name. cmd_pull / cmd_masscommits
-  # internally use their own 'while read _root' loops which would clobber
-  # an outer '_root' mid-iteration.
+  # internally use their own 'while read _root' / '_rtmp' which would clobber
+  # outer state mid-iteration.
   while IFS= read -r _sy_root; do
     [ -n "$_sy_root" ] || continue
     echo
@@ -13141,7 +13283,7 @@ cmd_sync() {
     # shellcheck disable=SC2086
     ( cd "$_sy_root" && cmd_submodules $_phase_flags )
     _rc1=$?
-    [ "$_rc1" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in sm phase."; return 77; }
+    [ "$_rc1" = 77 ] && { rm -f "$_sy_rtmp"; log_major "sync: aborted in sm phase."; return 77; }
 
     echo
     log_major "sync: phase 2/3 — pull (fetch + merge)"
@@ -13149,7 +13291,7 @@ cmd_sync() {
     # shellcheck disable=SC2086
     cmd_pull $_phase_flags "$_sy_root"
     _rc2=$?
-    [ "$_rc2" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in pull phase."; return 77; }
+    [ "$_rc2" = 77 ] && { rm -f "$_sy_rtmp"; log_major "sync: aborted in pull phase."; return 77; }
 
     echo
     log_major "sync: phase 3/3 — mc (commit + push)"
@@ -13157,13 +13299,13 @@ cmd_sync() {
     # shellcheck disable=SC2086
     cmd_masscommits $_phase_flags "$_sy_root"
     _rc3=$?
-    [ "$_rc3" = 77 ] && { rm -f "$_rtmp"; log_major "sync: aborted in mc phase."; return 77; }
+    [ "$_rc3" = 77 ] && { rm -f "$_sy_rtmp"; log_major "sync: aborted in mc phase."; return 77; }
 
     for _rcx in "$_rc1" "$_rc2" "$_rc3"; do
       [ "$_rcx" -gt "$_worst" ] && _worst=$_rcx
     done
-  done < "$_rtmp"
-  rm -f "$_rtmp"
+  done < "$_sy_rtmp"
+  rm -f "$_sy_rtmp"
 
   echo
   log_major "sync: all phases complete"
@@ -13327,7 +13469,7 @@ container_force_add() {
   _cfa_r=$1; _cfa_apply=${2:-0}; _cfa_scope=${3:-.}
   _cfa_pats=$(_force_add_patterns "$_cfa_r") || return 0
   [ -n "$_cfa_pats" ] || return 0
-  _cfa_all=$(mktemp "${TMPDIR:-/tmp}/${US}.fapall.XXXXXX" 2>/dev/null) || return 0
+  _cfa_all=$(mg_mktemp fapall 2>/dev/null) || return 0
   # Shared tmp: this list is read by git running as the repo OWNER, who
   # cannot reach the invoking user's private $TMPDIR (see mktemp_shared).
   _cfa_hit=$(mktemp_shared faphit 2>/dev/null) || { rm -f "$_cfa_all"; return 0; }
@@ -16065,7 +16207,7 @@ _mc_reject_paths() {
 
 _sm_safe_git() {
   _repo=$1; shift
-  _sg_log=$(mktemp "${TMPDIR:-/tmp}/safegit.XXXXXX")
+  _sg_log=$(mg_mktemp safegit)
   run_echoed git "$@" 2>"$_sg_log"
   _sg_rc=$?
   if [ "$_sg_rc" -ne 0 ] && [ "$SM_AUTO_SAFE_DIRECTORY" -eq 1 ] \
@@ -16248,7 +16390,7 @@ _sm_persist_url_change() {
 _sm_remove_gitmodules_entry() {
   _rge_name=$1
   [ -f .gitmodules ] || return 0
-  _rge_tmp=$(mktemp "${TMPDIR:-/tmp}/gitmodules.XXXXXX")
+  _rge_tmp=$(mg_mktemp gitmodules)
   if awk -v want="[submodule \"$_rge_name\"]" '
       /^\[/ { skip = ($0 == want) ? 1 : 0 }
       skip == 0 { print }
@@ -16297,7 +16439,7 @@ _sm_autocommit_if_safe() {
 #   one `/path/` line per match on stdout. Callers use this to build the
 #   .git/info/exclude block or to emit to the terminal. Returns 1 if none.
 _sm_collect_ignore_patterns() {
-  _cip_tmp=$(mktemp "${TMPDIR:-/tmp}/syncignfind.XXXXXX")
+  _cip_tmp=$(mg_mktemp syncignfind)
   trace "find . -mindepth 2 -name .git   # discover nested repos (ignore-pattern collection)"
   find . -mindepth 2 -name .git \( -type d -o -type f \) \
        -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_cip_tmp"
@@ -16346,7 +16488,7 @@ _sm_sync_ignore_exclude() {
   if [ -z "$_sie_pats" ]; then
     # No ignored repos — strip any existing block.
     if printf '%s\n' "$_sie_existing" | grep -Fxq "$_sie_header"; then
-      _sie_new=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
+      _sie_new=$(mg_mktemp exclude)
       [ -n "$_sie_clean" ] && printf '%s\n' "$_sie_clean" > "$_sie_new" || : > "$_sie_new"
       if mv -- "$_sie_new" "$_sie_exclude"; then
         [ "$_sie_quiet" = quiet ] || printf 'Removed stale ignored-block from %s\n' "$_sie_exclude"
@@ -16369,7 +16511,7 @@ _sm_sync_ignore_exclude() {
     [ "$_sie_quiet" = quiet ] || echo ".git/info/exclude already up to date."
     return 0
   fi
-  _sie_new=$(mktemp "${TMPDIR:-/tmp}/exclude.XXXXXX")
+  _sie_new=$(mg_mktemp exclude)
   printf '%s\n' "$_sie_would" > "$_sie_new"
   if mv -- "$_sie_new" "$_sie_exclude"; then
     _sie_count=$(printf '%s\n' "$_sie_pats" | wc -l | tr -d ' ')
@@ -16524,7 +16666,7 @@ cmd_submodules() {
   # at the parent level settle before we look inside.
   if _sm_mode_wants_recursion "$@"; then
     _sm_cwd_abs=$(pwd -P)
-    _sm_rec_list=$(mktemp "${TMPDIR:-/tmp}/smrec.XXXXXX")
+    _sm_rec_list=$(mg_mktemp smrec)
     list_direct_submodules "$_sm_cwd_abs" > "$_sm_rec_list" 2>/dev/null || :
     while IFS= read -r _sm_sub; do
       [ -n "$_sm_sub" ] || continue
@@ -16693,7 +16835,7 @@ cmd_unsm() {
   fi
 
   _un_tab=$(printf '\t')
-  _un_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.unsm.XXXXXX"); : > "$_un_tmp"
+  _un_tmp=$(mg_mktemp unsm); : > "$_un_tmp"
   _un_where=""
   if [ -n "$_un_scope_raw" ]; then
     _un_abs=$(cd "$_un_scope_raw" 2>/dev/null && pwd -P) || { rm -f "$_un_tmp"; fatal "unsm: '$_un_scope_raw': no such directory" 1; }
@@ -17018,7 +17160,7 @@ _CS_EOF
   }
 
   if [ "$_sm_clean_stale" -eq 1 ]; then
-    _cs_repos_tmp=$(mktemp "${TMPDIR:-/tmp}/${US}.csrepos.XXXXXX")
+    _cs_repos_tmp=$(mg_mktemp csrepos)
     trace "find . -mindepth 2 -name .git   # discover nested repos (stale-registration scan)"
     {
       echo "."
@@ -17062,7 +17204,7 @@ _CS_EOF
   if [ "$_sm_list_ignored" -eq 1 ]; then
     echo "Ignored nested repos under $_sm_toplevel (marker: .git/$_sm_IGNORE_MARKER):"
     _n=0; _n_conflict=0
-    _tmp=$(mktemp "${TMPDIR:-/tmp}/listign.XXXXXX")
+    _tmp=$(mg_mktemp listign)
     trace "find . -mindepth 2 -name .git   # discover nested repos (--list-ignored)"
     find . -mindepth 2 -name .git \( -type d -o -type f \) \
          -not -path "*${_sm_PREEXISTING_SUFFIX}*" | sort > "$_tmp"
@@ -17155,22 +17297,26 @@ _CS_EOF
 
   log_dbg_med "sm mode=$_sm_mode debug=$DBG verbose=$_sm_verbose interactive=$_sm_interactive force=$_sm_force"
 
-  _sm_tmpfile=$(mktemp "${TMPDIR:-/tmp}/submodscan.XXXXXX")
-  _sm_plan=$(mktemp "${TMPDIR:-/tmp}/submodplan.XXXXXX")
+  _sm_tmpfile=$(mg_mktemp submodscan)
+  _sm_plan=$(mg_mktemp submodplan)
 
   INFLIGHT_ORIG=""; INFLIGHT_TMP=""
   _sm_cleanup() {
-    _rc=$?
+    _rc=${1:-$?}
+    trap - EXIT INT TERM HUP
     if [ -n "$INFLIGHT_TMP" ] && [ -e "$INFLIGHT_TMP" ]; then
       printf 'RECOVER  restoring %s <- %s\n' "$INFLIGHT_ORIG" "$INFLIGHT_TMP" >&2
       run_echoed rm -rf -- "$INFLIGHT_ORIG" 2>/dev/null || true
       run_echoed mv -- "$INFLIGHT_TMP" "$INFLIGHT_ORIG" 2>/dev/null || true
+      INFLIGHT_ORIG=""; INFLIGHT_TMP=""
     fi
     rm -f "$_sm_tmpfile" "$_sm_plan" 2>/dev/null || true
-    trap - EXIT
     exit "$_rc"
   }
-  trap _sm_cleanup EXIT INT TERM HUP
+  trap '_sm_cleanup $?' EXIT
+  trap '_sm_cleanup 130' INT
+  trap '_sm_cleanup 143' TERM
+  trap '_sm_cleanup 129' HUP
 
   # ─── Sidecar → submodule pre-conversion ───
   # A sidecar (GIT_SIDECAR_DIRNAME) is normally "plain content, nothing
@@ -17527,7 +17673,7 @@ _CS_EOF
   # INSIDE registered submodules (sm can't register them from here — they
   # belong to their parent submodule — but it MUST mention them so the user
   # isn't left wondering why 'st' shows [raw-nested-git] that 'sm go' ignores).
-  _sm_cross_tmp=$(mktemp "${TMPDIR:-/tmp}/smcross.XXXXXX")
+  _sm_cross_tmp=$(mg_mktemp smcross)
   find_cross_submodule_unregistered "$(pwd -P)" > "$_sm_cross_tmp" 2>/dev/null || : > "$_sm_cross_tmp"
   _sm_c_cross=$(awk 'NF' "$_sm_cross_tmp" 2>/dev/null | wc -l | tr -d ' ')
   [ -z "$_sm_c_cross" ] && _sm_c_cross=0
@@ -17573,7 +17719,7 @@ _CS_EOF
   # any nested candidate below it belongs to the parent, not the super-repo.
   # (This is the OPPOSITE order from 'mc', which is bottom-up so child commits
   # bubble up into the parent's gitlink.)
-  _sm_plan_sorted=$(mktemp "${TMPDIR:-/tmp}/submodplansort.XXXXXX")
+  _sm_plan_sorted=$(mg_mktemp submodplansort)
   awk -F'\t' -v OFS='\t' '{
     n = gsub(/\//, "/", $2)
     printf "%04d\t%s\n", n, $0
@@ -17941,7 +18087,7 @@ _CS_EOF
 
     while : ; do
       printf 'ADD      %s  <-  %s\n' "$_sp" "$_url"
-      _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+      _errlog=$(mg_mktemp submoderr)
       if [ "$_ignpath_force" = 1 ]; then
         _sm_safe_git "$_sm_toplevel" submodule add -f "$_url" "$_sp" 2>"$_errlog"
       else
@@ -17992,7 +18138,7 @@ _CS_EOF
           # HEAD at the remote's default branch.
           # Its core.worktree names <path>, which is moved aside right now; none
           # of these calls needs a worktree, so the gitdir stands in for one.
-          _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+          _errlog=$(mg_mktemp submoderr)
           if ! run_echoed git --git-dir="$_sm_gd" --work-tree="$_sm_gd" fetch -q origin 2>"$_errlog"; then
             cat "$_errlog" >&2
             rm -f "$_errlog"
@@ -18104,7 +18250,7 @@ _CS_EOF
         case "$_ans" in
           r|R)
             printf 'ADD      %s  <-  %s   [--force reusing stale gitdir]\n' "$_sp" "$_url"
-            _errlog=$(mktemp "${TMPDIR:-/tmp}/submoderr.XXXXXX")
+            _errlog=$(mg_mktemp submoderr)
             _sm_safe_git "$_sm_toplevel" submodule add --force "$_url" "$_sp" 2>"$_errlog"
             _rc=$?
             if [ "$_rc" -eq 0 ]; then
@@ -18456,7 +18602,7 @@ _CS_EOF
         # index entry in place and causing the NEXT step (add) to fail
         # with a confusing, unrelated-looking "already exists in the
         # index" error instead of surfacing the real cause.
-        _sm_untrack_errlog=$(mktemp "${TMPDIR:-/tmp}/${US}.smuntrack.XXXXXX")
+        _sm_untrack_errlog=$(mg_mktemp smuntrack)
         if ! git ls-files -z -- "$sp" | git update-index -z --force-remove --stdin 2>"$_sm_untrack_errlog"; then
           log_error "sm: failed to untrack $sp from the index:"
           cat "$_sm_untrack_errlog" >&2
@@ -18572,8 +18718,8 @@ _CS_EOF
         esac
       fi
       if [ "$_do_commit" -eq 1 ]; then
-        _cmlog=$(mktemp "${TMPDIR:-/tmp}/sm-commit.XXXXXX")
-        _cmmsg=$(mktemp "${TMPDIR:-/tmp}/sm-msg.XXXXXX")
+        _cmlog=$(mg_mktemp sm-commit)
+        _cmmsg=$(mg_mktemp sm-msg)
         {
           printf '%s\n\n' "$_cm_subject"
           printf '# Counts:\n'
@@ -18671,7 +18817,21 @@ cmd_run_tests() {
   esac
   [ -n "$_rt_self" ] && [ -x "$_rt_self" ] || { log_error "--run-tests: could not resolve an executable path to myself (\$0='$0')"; return 1; }
 
-  _rt_workdir=$(mktemp -d "${TMPDIR:-/tmp}/${US}.selftest.XXXXXX") || { log_error "--run-tests: mktemp -d failed"; return 1; }
+  _rt_workdir=$(mktemp -d "${TMPDIR:-/tmp}/${US}.selftest.$$.XXXXXX") || { log_error "--run-tests: mktemp -d failed"; return 1; }
+  _rt_pids=""
+  _rt_cleanup() {
+    for _rt_kp in ${_rt_pids:-}; do
+      kill "$_rt_kp" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    [ -n "${_rt_workdir:-}" ] && rm -rf -- "$_rt_workdir" 2>/dev/null || true
+  }
+  _rt_on_exit() { _rt_erc=$?; trap - EXIT; _rt_cleanup; return "$_rt_erc"; }
+  _rt_on_sig()  { _rt_src=$1; trap - EXIT INT TERM HUP; _rt_cleanup; exit "$_rt_src"; }
+  trap '_rt_on_exit' EXIT
+  trap '_rt_on_sig 130' INT
+  trap '_rt_on_sig 143' TERM
+  trap '_rt_on_sig 129' HUP
   # The banner is printed after the plan line '1..N' (see the run loop
   # at the end): the plan must be the FIRST line of the output.
 
@@ -18839,6 +18999,10 @@ _rt_run_one() {
   _rt_err="$_rt_casedir/.rterr"
   _rt_reason_file="$_rt_casedir/.rtreason"
   : > "$_rt_reason_file"
+  TMPDIR="$_rt_casedir/.tmp"
+  mkdir -p "$TMPDIR"
+  export TMPDIR
+  _MOW_SEEN="$TMPDIR/mixedown"
   if cp "$GIT_CONFIG_GLOBAL" "$_rt_casedir/gitconfig.global" 2>/dev/null; then
     GIT_CONFIG_GLOBAL="$_rt_casedir/gitconfig.global"
     export GIT_CONFIG_GLOBAL
@@ -18878,6 +19042,9 @@ _rt_list() {
   test_a_commit_that_changes_no_gated_code_runs_no_gate test_commit_gate_leaves_the_commit_to_the_hook_without_my_rollout
   test_shadow_go_gates_a_gated_tool_before_its_mirror_commit test_a_tools_own_repository_is_not_gated
   test_my_git_never_commits_past_a_hook
+  test_tmp_hygiene_removes_scratch_on_exit
+  test_tmp_hygiene_cleans_up_on_interrupt
+  test_tmp_hygiene_sweeps_stale_at_start
   test_run_tests_titles_runs_exactly_the_tests_it_names
   test_run_list_registers_every_defined_test"
   for _rl_fn in $_rl_all; do
@@ -24076,19 +24243,28 @@ test_diff_writes_both_sides_with_names_that_say_which_is_which() {
   printf 'a\nMASTER\nc\n' > f.py; echo y-master > g.txt; git commit -q -am mainline
   git merge feature >/dev/null 2>&1
 
-  _rt_ok "diff over all conflicts" _rt_my_git diff --tool 'diff -u' || return 1
+  mkdir -p captured
+  cat > capture_diff.sh <<'CAPDIFF'
+#!/bin/sh
+cp "$1" "$2" ./captured/
+diff -u "$1" "$2"
+CAPDIFF
+  chmod +x capture_diff.sh
+  _rt_ok "diff over all conflicts" _rt_my_git diff --tool "$PWD/capture_diff.sh" || return 1
   _rt_contains "labels the sides in the header" "$_rt_out" "left=LOCAL_ours_$_rt_br" || return 1
   _rt_contains "names the incoming branch" "$_rt_out" "REMOTE_theirs_feature" || return 1
   _rt_contains "keeps the extension for syntax" "$_rt_out" "f.LOCAL_ours_$_rt_br.py" || return 1
   _rt_contains "does both files" "$_rt_out" "[2 of 2]" || return 1
   _rt_contains "says the copies are not the real file" "$_rt_out" "they are COPIES" || return 1
 
-  # The two sides must hold the two VERSIONS -- not the conflicted file.
-  _rt_dir=$(printf '%s\n' "$(cat "$_rt_out")" | sed -n 's|.*left : \(.*/my-git\.diff\.[^/]*\)/.*|\1|p' | head -n 1)
+  # The two sides must hold the two VERSIONS -- not the conflicted file -- and
+  # the temporary diff directory must be removed once diff exits.
+  _rt_dir=$(printf '%s\n' "$(cat "$_rt_out")" | sed -n 's|.*left : \(.*/diff\.[^/]*\)/.*|\1|p' | head -n 1)
   [ -n "$_rt_dir" ] || { _rt_fail "could not find the temp dir in the output"; return 1; }
-  grep -q MASTER  "$_rt_dir/f.LOCAL_ours_$_rt_br.py"    || { _rt_fail "ours side lacks our content"; return 1; }
-  grep -q FEATURE "$_rt_dir/f.REMOTE_theirs_feature.py" || { _rt_fail "theirs side lacks their content"; return 1; }
-  grep -q '<<<<' "$_rt_dir/f.LOCAL_ours_$_rt_br.py" \
+  _rt_absent "diff cleans up its temp dir on exit" "$_rt_dir" || return 1
+  grep -q MASTER  "captured/f.LOCAL_ours_$_rt_br.py"    || { _rt_fail "ours side lacks our content"; return 1; }
+  grep -q FEATURE "captured/f.REMOTE_theirs_feature.py" || { _rt_fail "theirs side lacks their content"; return 1; }
+  grep -q '<<<<' "captured/f.LOCAL_ours_$_rt_br.py" \
     && { _rt_fail "the ours side still has conflict markers -- it is the merged file, not a side"; return 1; }
 
   # A path that is not conflicted must be refused, not silently ignored.
@@ -28752,6 +28928,168 @@ test_run_list_registers_every_defined_test() {
   return 0
 }
 
+test_tmp_hygiene_removes_scratch_on_exit() {
+  # Every real code path (rehydrate with align/fix/nomatch, sync, diff, sm,
+  # passthrough exec git, mixed-ownership warning) must leave its $TMPDIR
+  # empty once the invocation returns.
+  _rt_t="$PWD/my_tmp"; mkdir -p "$_rt_t"
+  TMPDIR="$_rt_t"; export TMPDIR
+
+  # 1) sync (outer _sy_rtmp + sm subshell + pull + mc)
+  _rt_repo_file up_sync s.txt
+  git clone -q --bare up_sync up_sync.git >/dev/null 2>&1
+  _rt_repo top
+  _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+  ( cd top && git clone -q ../up_sync.git kid >/dev/null 2>&1 )
+  _rt_ok "sync leaves no tmp" _rt_my_git sync -R --discover "$PWD/top" || return 1
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "sync left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+
+  # 2) sm (whose _sm_cleanup subshell runs alongside parent _MG_TMPDIR)
+  ( cd top && _rt_ok "sm leaves no tmp" _rt_my_git sm ) || return 1
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "sm left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+
+  # 3) passthrough 'exec git' (must run _mg_cleanup before replacing the shell)
+  ( cd top && _rt_ok "passthrough exec git leaves no tmp" _rt_my_git rev-parse --git-dir ) || return 1
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "passthrough exec git left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+
+  # 4) rehydrate align/nomatch path (where rehydaln used to remain unlinked)
+  _rt_repo cont
+  ( cd cont && git clone -q ../up_sync.git proj >/dev/null 2>&1 )
+  ( cd cont && _rt_ok "shadow proj" _rt_my_git shadow go proj ) || return 1
+  git -C cont/proj remote set-url origin "$PWD/does_not_exist.git"
+  ( cd cont && _rt_ok "rehydrate analyze leaves no tmp" _rt_my_git rehydrate ) || return 1
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "rehydrate left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+
+  # 5) diff removes its stage dir on exit
+  _rt_repo drep
+  ( cd drep && printf 'a\n' > c.txt && git add c.txt && git commit -qm base \
+      && git checkout -q -b feat && printf 'theirs\n' > c.txt && git commit -qam theirs \
+      && git checkout -q - && printf 'ours\n' > c.txt && git commit -qam ours \
+      && { git merge feat >/dev/null 2>&1 || true; } )
+  ( cd drep && _rt_ok "diff leaves no tmp" _rt_my_git diff --tool 'diff -u' ) || return 1
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "diff left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+
+  # 6) _mixed_ownership_warn inside an initialized run removes mixedown on exit
+  ( _init_stat_flavour
+    _init_tmp_hygiene
+    _mixed_ownership_warn "$PWD/top" me 2>/dev/null
+    [ -f "$_MOW_SEEN" ] ) || { _rt_fail "_MOW_SEEN was not created under _MG_TMPDIR"; return 1; }
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "mixedown left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+  return 0
+}
+
+test_tmp_hygiene_cleans_up_on_interrupt() {
+  # SIGINT (delivered to the foreground process group, as Ctrl-C does; in a
+  # non-interactive shell '&' inherits SIG_IGN so we launch a fresh session via
+  # python3 when available, else verify SIGTERM cleanup). Must exit 130 (143
+  # for SIGTERM) and leave $TMPDIR empty (removing run dir, raoc, diff dir).
+  _rt_case=$PWD
+  _rt_t="$_rt_case/sig_tmp"; mkdir -p "$_rt_t"
+  _rt_repo drep
+  _rt_conf_path="$_rt_case/conf.ini"; _rt_conf "$_rt_conf_path"
+  ( cd drep && printf 'a\n' > c.txt && git add c.txt && git commit -qm base \
+      && git checkout -q -b feat && printf 'theirs\n' > c.txt && git commit -qam theirs \
+      && git checkout -q - && printf 'ours\n' > c.txt && git commit -qam ours \
+      && { git merge feat >/dev/null 2>&1 || true; } )
+  _rt_tool="$_rt_case/hang_tool.sh"
+  cat > "$_rt_tool" <<EOF
+#!/bin/sh
+: > "$_rt_case/tool_ready"
+sleep 15
+EOF
+  chmod +x "$_rt_tool"
+  if command -v python3 >/dev/null 2>&1; then
+    _sig_rc=$(python3 - "$_rt_self" "$_rt_conf_path" "$_rt_case/drep" "$_rt_t" "$_rt_tool" "$_rt_case/tool_ready" <<'PYEOF'
+import os, signal, subprocess, sys, time
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+mygit, conf, cwd, tmpd, tool, ready = sys.argv[1:7]
+env = os.environ.copy()
+env["TMPDIR"] = tmpd
+p = subprocess.Popen(
+    [mygit, "--config", conf, "diff", "--tool", tool],
+    cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+for _ in range(100):
+    if os.path.exists(ready):
+        break
+    time.sleep(0.05)
+os.killpg(p.pid, signal.SIGINT)
+print(p.wait())
+PYEOF
+    )
+    [ "$_sig_rc" = 130 ] || { _rt_fail "expected exit 130 on SIGINT, got $_sig_rc"; return 1; }
+  else
+    ( cd drep && TMPDIR="$_rt_t" "$_rt_self" --config "$_rt_conf_path" diff --tool "$_rt_tool" ) >"$_rt_out" 2>"$_rt_err" &
+    _mg_pid=$!
+    _w=0
+    while [ ! -f "$_rt_case/tool_ready" ] && [ "$_w" -lt 100 ]; do
+      sleep 0.05; _w=$((_w + 1))
+    done
+    kill -TERM "$_mg_pid" 2>/dev/null
+    wait "$_mg_pid" 2>/dev/null
+    _sig_rc=$?
+    [ "$_sig_rc" = 143 ] || { _rt_fail "expected exit 143 on SIGTERM, got $_sig_rc"; return 1; }
+  fi
+  [ -z "$(ls -A "$_rt_t")" ] || { _rt_fail "signal left scratch in TMPDIR: $(ls -A "$_rt_t" | tr '\n' ' ')"; return 1; }
+  return 0
+}
+
+test_tmp_hygiene_sweeps_stale_at_start() {
+  # On startup, my-git must sweep dead-PID and aged legacy my-git.* leftovers
+  # owned by this user, while sparing live PIDs, sm-backup tarballs, and
+  # other tools' files.
+  _rt_repo r
+  _rt_conf_path="$PWD/conf.ini"; _rt_conf "$_rt_conf_path"
+  _rt_t="$PWD/sweep_tmp"; mkdir -p "$_rt_t"
+  TMPDIR="$_rt_t"; export TMPDIR
+
+  # Dead-PID entries (even with fresh timestamps -> swept immediately).
+  mkdir -p "$_rt_t/my-git.run.999999.dead01"
+  : > "$_rt_t/my-git.run.999999.dead01/leftover"
+  : > "$_rt_t/my-git.mixedown.999999"
+  : > "$_rt_t/my-git.shared.999999.commit-msg.dead02"
+
+  # Aged legacy non-PID entries (>1h old -> swept).
+  : > "$_rt_t/my-git.rehydaln.old01"
+  mkdir -p "$_rt_t/my-git.diff.old02"
+  : > "$_rt_t/my-git.diff.old02/file"
+  : > "$_rt_t/my-git.raoc.old03"
+  : > "$_rt_t/my-git.sync.roots.old04"
+  touch -t 202001010000 \
+    "$_rt_t/my-git.rehydaln.old01" \
+    "$_rt_t/my-git.diff.old02" \
+    "$_rt_t/my-git.raoc.old03" \
+    "$_rt_t/my-git.sync.roots.old04"
+
+  # Live-PID entry, persistent sm-backup, and foreign file (must be kept).
+  sleep 15 &
+  _live_pid=$!
+  mkdir -p "$_rt_t/my-git.run.${_live_pid}.live01"
+  : > "$_rt_t/my-git.sm-backup._tmp_proj.keep01.tar"
+  : > "$_rt_t/other-tool.tmp"
+  touch -t 202001010000 \
+    "$_rt_t/my-git.sm-backup._tmp_proj.keep01.tar" \
+    "$_rt_t/other-tool.tmp"
+
+  _rt_ok "st runs and sweeps stale" _rt_my_git st "$PWD/r"
+  _ok_st=$?
+  kill "$_live_pid" 2>/dev/null; wait "$_live_pid" 2>/dev/null || true
+  [ "$_ok_st" = 0 ] || return 1
+
+  _rt_absent "dead run dir swept"      "$_rt_t/my-git.run.999999.dead01" || return 1
+  _rt_absent "dead mixedown swept"     "$_rt_t/my-git.mixedown.999999" || return 1
+  _rt_absent "dead shared file swept"  "$_rt_t/my-git.shared.999999.commit-msg.dead02" || return 1
+  _rt_absent "aged rehydaln swept"     "$_rt_t/my-git.rehydaln.old01" || return 1
+  _rt_absent "aged diff dir swept"     "$_rt_t/my-git.diff.old02" || return 1
+  _rt_absent "aged raoc swept"         "$_rt_t/my-git.raoc.old03" || return 1
+  _rt_absent "aged sync.roots swept"   "$_rt_t/my-git.sync.roots.old04" || return 1
+  _rt_isdir  "live run dir kept"       "$_rt_t/my-git.run.${_live_pid}.live01" || return 1
+  _rt_exists "persistent backup kept"  "$_rt_t/my-git.sm-backup._tmp_proj.keep01.tar" || return 1
+  _rt_exists "foreign file kept"       "$_rt_t/other-tool.tmp" || return 1
+  return 0
+}
+
 
 my_git_main() {
   # ─── Pre-dispatch: peel globals / --config / --create-config / --help ───
@@ -28832,6 +29170,10 @@ my_git_main() {
   load_config
   git_ssh_setup
 
+  _init_stat_flavour
+  _xu_init_session
+  _init_tmp_hygiene
+
   # Self-deploying zsh completions (mirrors my-appleRAID's own
   # install_zsh_completions() pattern) — deliberately placed AFTER the
   # --run-tests/--help/--create-config early exits above, not
@@ -28848,7 +29190,6 @@ my_git_main() {
 
   # '--install' takes what follows it ('go', '--mode') as its own words.
   if [ "$_want_install" = 1 ]; then
-    _init_stat_flavour; _xu_init_session; _init_raoc_errfile
     cmd_install "$@"
     exit $?
   fi
@@ -28856,10 +29197,8 @@ my_git_main() {
   # ─── No subcommand → legacy default: status (piped through less if TTY) ───
   if [ $# -eq 0 ]; then
     if [ -t 1 ]; then
-      _init_stat_flavour; _xu_init_session; _init_raoc_errfile
       cmd_status #| less -R
     else
-      _init_stat_flavour; _xu_init_session; _init_raoc_errfile
       cmd_status
     fi
     exit $?
@@ -28872,9 +29211,6 @@ my_git_main() {
   [ "$DISCOVER" = 1 ] && RECURSIVE=1
 
   _sub=$1; shift
-  _init_stat_flavour
-  _xu_init_session
-  _init_raoc_errfile
   case "$_sub" in
     status|st|s)                cmd_status "$@" ;;
     masscommits|mc|c)           _mc_reject_paths "$@"; cmd_masscommits "$@" ;;
@@ -28919,6 +29255,7 @@ my_git_main() {
     clean|stash|rm|mv)
       # Guarded passthrough: refused only when it would actually break a rule.
       _guard_write_verb "$_sub" "$@"
+      _mg_cleanup
       exec git "$_sub" "$@"
       ;;
     *)
@@ -28929,6 +29266,7 @@ my_git_main() {
       # NOT is a git replacement -- the verbs my-git owns behave differently
       # from git's, which is what --help is for, and the case above refuses
       # the ones where a my-git rule applies but is not implemented yet.
+      _mg_cleanup
       exec git "$_sub" "$@"
       ;;
   esac
@@ -28949,7 +29287,7 @@ install_zsh_completions() {
   _comp_dir="$HOME/.zsh/completions"
   _comp_file="$_comp_dir/_my-git"
 
-  _tmp=$(mktemp 2>/dev/null) || return 0
+  _tmp=$(mg_mktemp comp 2>/dev/null) || return 0
   cat >"$_tmp" <<'COMPLETION_EOF'
 #compdef my-git
 
@@ -29183,7 +29521,7 @@ COMPLETION_EOF
   # compinit (run by oh-my-zsh) picks up the new path. Otherwise append
   # fpath + compinit at the end.
   if grep -q 'oh-my-zsh\.sh' "$_zshrc" 2>/dev/null; then
-    _tmp_rc=$(mktemp 2>/dev/null) || return 0
+    _tmp_rc=$(mg_mktemp zshrc 2>/dev/null) || return 0
     awk -v cdir="$_comp_dir" '
       !inserted && /oh-my-zsh\.sh/ {
         print "# my-git zsh completions"
